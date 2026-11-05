@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Real pointer input for a headless run, through the compositor (sway's
+# wlr-virtual-pointer protocol), so events take GTK's real path: wl_pointer
+# -> GDK -> gesture, motion and scroll controllers. The control socket's
+# `mouse` and the areas' click/drag commands enter below that layer and
+# cannot see gesture bugs; use this for anything a user does with a mouse.
+#
+#   webmux-dev/realpointer DIR [--size WxH] COMMAND...
+#   webmux-dev/realpointer DIR -          (commands on stdin, one per line)
+#
+# Commands (coordinates are output pixels; the window is at 0,0 unless the
+# compositor placed it elsewhere: see `in-session DIR swaymsg -t get_tree`):
+#   abs X Y          move to X,Y
+#   down [BTN]       press (default left, 0x110; 0x111 right, 0x112 middle)
+#   up [BTN]         release
+#   scroll DX DY     wheel notches (discrete)
+#   wscroll DX DY    wheel, continuous value
+#   fscroll DX DY    finger (touchpad) scroll, continuous; then `fstop`
+#   fstop            finger lifted
+#   sleep MS
+# Every command is followed by a compositor roundtrip and a 20 ms pause (a
+# press sent in the same burst as the motion before it can land before the
+# surface has the pointer), so this tool cannot produce fast drags: 30
+# motions take about 0.6 s. Do not read drag lag from its timing.
+# Separate commands with commas on the command line:
+#   webmux-dev/realpointer $D abs 400 300, down, sleep 50, abs 400 200, up
+#
+# The client (webmux-dev/virtual-pointer/, by the layout auditor) is built
+# on first use into webmux-dev/.build/.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FORK="$(cd "$here/.." && pwd)"
+dir="${1:?usage: realpointer DIR [--size WxH] COMMAND...}"; shift
+size=""
+if [[ "${1:-}" == "--size" ]]; then size="$2"; shift 2; fi
+
+bin="$here/.build/vptr"
+if [[ ! -x "$bin" || "$here/virtual-pointer/main.c" -nt "$bin" ]]; then
+  mkdir -p "$here/.build"
+  out() { nix build --no-link --print-out-paths --inputs-from "$FORK" "nixpkgs#$1" 2>/dev/null | grep -v -- '-man$' | head -n1; }
+  wl_dev="$(out wayland.dev)"; wl_lib="$(out wayland)"; gcc="$(out gcc)"
+  [[ -n "$wl_dev" && -n "$wl_lib" && -n "$gcc" ]] || { echo "realpointer: cannot fetch build tools" >&2; exit 1; }
+  "$gcc/bin/gcc" -O1 -o "$bin" "$here/virtual-pointer/main.c" "$here/virtual-pointer/vp.c" \
+    -I"$wl_dev/include" -I"$here/virtual-pointer" -L"$wl_lib/lib" -lwayland-client -lm -Wl,-rpath,"$wl_lib/lib"
+fi
+
+if [[ -z "$size" ]]; then
+  size="$("$here/in-session" "$dir" swaymsg -t get_outputs -r 2>/dev/null | python3 -I -c 'import sys,json; o=json.load(sys.stdin)[0]["rect"]; print("%dx%d" % (o["width"], o["height"]))')"
+fi
+w="${size%x*}"; h="${size#*x}"
+
+if [[ "${1:-}" == "-" ]]; then
+  exec "$here/in-session" "$dir" "$bin" "$w" "$h"
+fi
+printf '%s\n' "$*" | tr ',' '\n' | sed 's/^ *//' | "$here/in-session" "$dir" "$bin" "$w" "$h"

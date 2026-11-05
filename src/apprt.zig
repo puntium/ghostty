@@ -43,7 +43,7 @@ pub const SurfaceSize = structs.SurfaceSize;
 pub const runtime = switch (build_config.artifact) {
     .exe => switch (build_config.app_runtime) {
         .none => none,
-        .gtk => gtk,
+        .gtk => if (@hasDecl(@import("build_options"), "webmux")) @import("apprt/webmux.zig") else gtk, // webmux fork
     },
     .lib => embedded,
     .wasm_module => browser,

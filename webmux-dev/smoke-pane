@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+# Terminal-pane features against a real isolated host (headless --host):
+# paste in its three cases (text, image, nothing → ^V) plus Ctrl+Shift+V
+# bracketed and Ctrl+Alt+V; image paste end to end (paste-result toast,
+# file and clipboard slot match); clipboard-image sync with TIFF → PNG
+# conversion; Ctrl+Shift+C copy and PRIMARY on selection; URL and OSC 8
+# link click and Shift+click (through the panels' URL service in record
+# mode: the recorded launch, the copy and its toast) and an inert mailto:
+# OSC 8 link; OSC 52 write (any target lands on
+# CLIPBOARD, toast) and refused OSC 52 read; scroll stickiness; hidden
+# pane; a session the host does not have; then a clean teardown.
+#
+#   webmux-dev/smoke --pane     (build first: webmux-dev/build)
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fail() { echo "smoke-pane: FAIL: $*" >&2; [[ -n "${dir:-}" ]] && "$here/headless" stop "$dir"; exit 1; }
+ok() { echo "smoke-pane: ok  $*"; }
+ctl() { "$here/wmctl" -s "$dir/ctl.sock" "$@"; }
+sess() { "$here/in-session" "$dir" "$@"; }
+field() { ctl dump text:=false --get "$1"; }
+screen() { ctl dump --get panes.0.text; }
+until_field() { # PATH VALUE [tries]
+  for _ in $(seq 1 "${3:-50}"); do
+    [[ "$(field "$1" 2>/dev/null)" == "$2" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+until_log() { # REGEX [tries]: a new matching app.log line since mark
+  for _ in $(seq 1 "${2:-50}"); do
+    tail -n +"$mark" "$dir/app.log" | grep -qE "$1" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+markl() { mark=$(( $(wc -l < "$dir/app.log") + 1 )); }
+type_() { ctl -q text text="$1"; }
+wait_() { ctl -q wait contains="$1" timeout_ms:=8000; }
+# Clear the screen first, so row 0 is the prompt and command, output from row 1.
+fresh() { ctl -q text text=$'clear\n'; sleep 0.3; ctl -q text text="$1"; }
+
+# GTK's simple input method: Ctrl+Shift+U Unicode entry and dead keys
+# (T-14) need an input method, and there is no IBus here.
+dir="$("$here/headless" start --host -- GTK_IM_MODULE=gtk-im-context-simple | tail -n1)"
+echo "smoke-pane: run dir $dir"
+pty1="$(sed -n 's/^ptyname=//p' "$dir/pids")"
+until_field panes.0.link up || fail "pane never attached"
+# One real key through the compositor: Wayland only accepts clipboard and
+# PRIMARY ownership with a serial from real input, and the control
+# socket's synthesized events carry none.
+"$here/realkeys" "$dir" -k Shift_L || fail "realkeys"
+
+# Test images: a PNG and the same picture as an uncompressed TIFF, which
+# the host does not accept (must arrive as PNG).
+python3 -I - "$dir" <<'EOF'
+import struct, sys, zlib
+d = sys.argv[1]; w, h = 8, 6
+px = [(255, 0, 0) if (x + y) % 2 else (0, 0, 255) for y in range(h) for x in range(w)]
+raw = b"".join(b"\0" + b"".join(bytes(px[y * w + x]) for x in range(w)) for y in range(h))
+def chunk(t, b): return struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b))
+open(f"{d}/t.png", "wb").write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+data = b"".join(bytes(p) for p in px)
+tags = [(256, 3, 1, w), (257, 3, 1, h), (258, 3, 3, 0), (259, 3, 1, 1), (262, 3, 1, 2),
+        (273, 4, 1, 0), (277, 3, 1, 3), (278, 3, 1, h), (279, 4, 1, len(data))]
+ifd_off = 8; n = len(tags); bps_off = ifd_off + 2 + n * 12 + 4; data_off = bps_off + 6
+out = b"II*\0" + struct.pack("<I", ifd_off) + struct.pack("<H", n)
+for tag, typ, cnt, val in tags:
+    if tag == 258: val = bps_off
+    if tag == 273: val = data_off
+    out += struct.pack("<HHI", tag, typ, cnt) + (struct.pack("<HH", val, 0) if typ == 3 and tag != 258 else struct.pack("<I", val))
+out += struct.pack("<I", 0) + struct.pack("<HHH", 8, 8, 8) + data
+open(f"{d}/t.tiff", "wb").write(out)
+EOF
+png_sum="$(sha256sum < "$dir/t.png" | cut -d' ' -f1)"
+
+# --- paste: text ------------------------------------------------------
+fresh 'echo A:'
+sess wl-copy -o 'PASTE-TXT'
+ctl -q key key=ctrl+v
+sleep 0.4; ctl -q key key=Return
+wait_ $'\nA:PASTE-TXT' || fail "Ctrl+V text paste"
+ok "Ctrl+V pastes text"
+
+# --- paste: nothing → ^V; Ctrl+Alt+V always ^V; Ctrl+Shift+V bracketed --
+sess wl-copy --clear
+fresh 'stty -iexten; printf "\\e[?2004h"; cat -v\n'; sleep 0.4
+ctl -q key key=ctrl+v; sleep 0.3
+ctl -q key key=ctrl+alt+v
+sess wl-copy -o 'BRK'
+ctl -q key key=ctrl+shift+v; sleep 0.4
+ctl -q key key=Return
+wait_ '^V^V^[[200~BRK^[[201~' || { screen >&2; fail "^V fallback / Ctrl+Alt+V / bracketed Ctrl+Shift+V"; }
+ctl -q key key=ctrl+c; type_ 'stty iexten; printf "\\e[?2004l"\n'
+ok "empty clipboard sends ^V; Ctrl+Alt+V sends ^V; Ctrl+Shift+V is a bracketed paste"
+
+# --- image paste --------------------------------------------------------
+ctl -q text text=$'clear\n'; sleep 0.3
+markl
+sess wl-copy -o -t image/png < "$dir/t.png"
+ctl -q key key=ctrl+v
+until_log 'status: uploading pasted image' || fail "no upload toast"
+until_log 'status: pasted image → ' || fail "no paste-result toast"
+ctl -q key key=ctrl+u
+fresh 'xclip -selection clipboard -t image/png -o | sha256sum\n'
+wait_ "$png_sum" || { screen >&2; fail "clipboard slot does not hold the pasted image"; }
+ok "image paste: toasts, host clipboard slot = pasted PNG"
+
+# --- clipboard sync, TIFF converted to PNG ------------------------------
+markl
+sess wl-copy -o -t image/tiff < "$dir/t.tiff"
+ctl -q clipboard-sync
+until_log 'status: clipboard image synced to sessions' || fail "no sync toast"
+fresh 'cat "$WEBMUX_CLIPBOARD_DIR/clipboard.mime"; echo; xclip -o | head -c 4 | od -An -c\n'
+wait_ $'image/png\n' || { screen >&2; fail "slot mime"; }
+screen | grep -q 'P   N   G' || { screen >&2; fail "slot does not hold a PNG"; }
+ok "clipboard sync: TIFF on the clipboard arrives in the slot as PNG"
+
+# --- copy and PRIMARY -----------------------------------------------------
+fresh 'echo COPY-ME-NOW\n'
+wait_ $'\nCOPY-ME-NOW' || fail "echo"
+ctl -q mouse action=drag col:=0 row:=1 col2:=11 row2:=1
+[[ "$(sess wl-paste --primary -n)" == "COPY-ME-NOW" ]] || fail "selection not on PRIMARY"
+sess wl-copy -o 'something-else'; sleep 0.5
+# A real Ctrl+Shift+C: the compositor only lets a client take the
+# clipboard with an input serial newer than the current owner's (wl-copy's).
+"$here/realkeys-xkb" "$dir" ctrl+shift+c >/dev/null; sleep 0.3
+[[ "$(sess wl-paste -n)" == "COPY-ME-NOW" ]] || fail "Ctrl+Shift+C did not copy"
+ok "selection → PRIMARY; Ctrl+Shift+C → CLIPBOARD"
+
+# --- links ----------------------------------------------------------------
+fresh 'echo https://ex.invalid/p; printf "\\e]8;;https://o8.invalid/x\\e\\\\OSC8-LINK\\e]8;;\\e\\\\\\n"; printf "\\e]8;;mailto:a@b\\e\\\\MAIL-LINK\\e]8;;\\e\\\\\\n"\n'
+wait_ 'MAIL-LINK' || fail "link output"
+# Through the panels' URL service in record mode (nothing is launched).
+copied() { ctl url-sink --get last_copied; }
+markl
+ctl -q mouse action=click col:=4 row:=1
+until_log 'url sink recorded uri: https://ex.invalid/p' || fail "URL click"
+ctl -q mouse action=click col:=4 row:=1 mods=shift
+until_log 'status: link copied' || fail "URL shift-click toast"
+[[ "$(copied)" == "https://ex.invalid/p" ]] || fail "URL shift-click copied $(copied)"
+ctl -q mouse action=click col:=3 row:=2
+until_log 'url sink recorded uri: https://o8.invalid/x' || fail "OSC 8 click"
+ctl -q mouse action=click col:=3 row:=2 mods=shift
+for _ in $(seq 1 30); do [[ "$(copied)" == "https://o8.invalid/x" ]] && break; sleep 0.1; done
+[[ "$(copied)" == "https://o8.invalid/x" ]] || fail "OSC 8 shift-click copied $(copied)"
+markl
+ctl -q mouse action=click col:=3 row:=3; sleep 0.5
+if tail -n +"$mark" "$dir/app.log" | grep -q 'url sink recorded.*mailto'; then fail "mailto link activated"; fi
+ctl -q mouse action=drag col:=0 row:=1 col2:=11 row2:=1
+[[ "$(sess wl-paste --primary -n)" == "https://ex." ]] || fail "a drag starting on a link does not select"
+ok "URL and OSC 8 links: click opens, Shift+click copies, mailto: inert, drag still selects"
+
+# --- OSC 52 ----------------------------------------------------------------
+"$here/realkeys" "$dir" -k Shift_L   # a fresh input serial (see above)
+markl
+fresh 'printf "\\e]52;p;%s\\a" $(printf OSC52-TEXT | base64)\n'
+until_log 'status: clipboard set from terminal' || fail "no OSC 52 toast"
+[[ "$(sess wl-paste -n)" == "OSC52-TEXT" ]] || fail "OSC 52 (target p) did not land on CLIPBOARD"
+fresh 'printf "\\e]52;c;?\\a"; read -t 1 r; echo "reply[$r]"\n'
+wait_ 'reply[]' || { screen >&2; fail "OSC 52 read was answered"; }
+ok "OSC 52 write → CLIPBOARD + toast; OSC 52 read refused"
+
+# --- scrolling: stickiness ---------------------------------------------------
+at_bottom() { python3 -I -c 'import json,sys; s=json.loads(sys.argv[1]); sys.exit(0 if s["offset"]+s["len"]==s["total"] else 1)' "$(field panes.0.scrollbar)"; }
+fresh 'seq 1 300\n'; wait_ $'\n300\n'
+ctl -q mouse action=scroll col:=5 row:=5 dy:=-10
+at_bottom && fail "wheel did not scroll back"
+type_ 'sleep 1; seq 1 5\n'
+at_bottom || fail "typing did not snap to the bottom (T-17)"
+ctl -q mouse action=scroll col:=5 row:=5 dy:=-4        # 12 lines up
+up="$(field panes.0.scrollbar.offset)"; sleep 1.6        # output arrives meanwhile
+[[ "$(field panes.0.scrollbar.offset)" == "$up" ]] || fail "output yanked a scrolled-up viewport (T-29)"
+ctl -q mouse action=scroll col:=5 row:=5 dy:=4         # 12 down: lands within the 8-line band
+at_bottom || fail "a downward scroll into the bottom band did not snap (T-30): $(field panes.0.scrollbar)"
+ok "wheel scrolls; typing snaps down; output never yanks; the bottom band snaps"
+
+# ===========================================================================
+# Fix round (audit gtk/audit/terminal.md): every check below uses real
+# input through the compositor (realkeys-xkb: a US XKB keyboard;
+# realpointer: a virtual pointer), not control-socket input.
+# ===========================================================================
+rk() { "$here/realkeys-xkb" "$dir" "$@" >/dev/null; }
+rp() { "$here/realpointer" "$dir" "$@"; }
+pt() { "$here/pane-point" "$dir" "$@"; }
+connlog() { cat "$dir/home/.local/state/webmux-gtk/logs/webmux.log"; }
+
+# --- geometry: 4 px padding (T-09), xterm's 7 px cell (audit D-09) ----------
+[[ "$(field panes.0.padding_px.left)" == 4 && "$(field panes.0.padding_px.top)" == 4 ]] \
+  || fail "padding is $(field panes.0.padding_px) device px, want 4"
+[[ "$(field panes.0.cell_px.width)" == 7 && "$(field panes.0.cell_px.height)" == 17 ]] \
+  || fail "cell is $(field panes.0.cell_px), want 7x17 (xterm.js WebGL at 13 px)"
+ok "padding 4 px, cell 7x17 px"
+
+# --- scrollback keeps at least 5000 lines (T-03) -----------------------------
+fresh 'seq 1 7000\n'; wait_ $'\n7000\n' || fail "seq 7000"
+kept=$(python3 -I -c 'import json,sys; s=json.loads(sys.argv[1]); print(s["total"]-s["len"])' "$(field panes.0.scrollbar)")
+(( kept >= 5000 )) || fail "scrollback keeps $kept lines, want >= 5000"
+ok "scrollback keeps $kept lines"
+
+# --- xterm.js key encoding (T-12, T-13, D-02, D-03, K-17), real keys ---------
+XTERM_KEYS_MODES=normal XTERM_KEYS_ONLY=shift+Return,ctrl+Return,shift+ctrl+Return,ctrl+Tab,shift+ctrl+Tab,ctrl+Escape,alt+Left,alt+Right,alt+Up,shift+alt+Left,alt+BackSpace,ctrl+BackSpace,shift+Insert,ctrl+Insert,alt+Insert,shift+ctrl+alt+bracketleft,shift+ctrl+alt+f,shift+ctrl+1,shift+ctrl+2,shift+ctrl+minus,ctrl+bracketleft,ctrl+i,ctrl+m,shift+F5,ctrl+Prior,alt+Prior,shift+ctrl+a,alt+a,shift+alt+a,ctrl+alt+a,alt+space,ctrl+space,alt+Return,shift+Tab,KP_Enter,KP_Add,shift+Delete,ctrl+End \
+  "$here/xterm-keys/run" "$dir" > "$dir/xterm-keys.out" 2>&1 || { cat "$dir/xterm-keys.out" >&2; fail "key bytes differ from xterm.js"; }
+ok "$(head -n1 "$dir/xterm-keys.out")"
+
+# --- Shift+PageUp / PageDown scroll by a page (D-01) -------------------------
+fresh 'seq 1 300\n'; wait_ $'\n300\n' || fail "seq 300"
+rows=$(field panes.0.terminal.rows)
+before=$(field panes.0.scrollbar.offset)
+rk shift+Prior
+sleep 0.3
+after=$(field panes.0.scrollbar.offset)
+(( before - after == rows - 1 )) || fail "Shift+PageUp moved $before -> $after, want $((rows - 1)) lines"
+rk shift+Next; sleep 0.3
+[[ "$(field panes.0.scrollbar.offset)" == "$before" ]] || fail "Shift+PageDown did not come back to the bottom"
+screen | grep -q '5;2~\|\^\[\[' && fail "Shift+PageUp sent bytes"
+ok "Shift+PageUp/PageDown scroll $((rows - 1)) lines and send nothing"
+
+# --- Shift+Insert pastes (D-02) ------------------------------------------------
+sess wl-copy 'INS-PASTE'; sleep 0.3
+fresh 'echo '; rk shift+Insert; sleep 0.4; rk Return
+wait_ $'\nINS-PASTE' || { screen >&2; fail "Shift+Insert did not paste"; }
+ok "Shift+Insert pastes"
+
+# --- Ctrl+Shift+U reaches the input method (T-14) ------------------------------
+fresh 'echo X'; rk shift+ctrl+u 2 6 0 3 space; sleep 0.3; rk Return
+wait_ $'\nX☃' || { screen >&2; fail "Ctrl+Shift+U Unicode entry did not reach the input method"; }
+ok "Ctrl+Shift+U 2603 gives ☃ through the input method"
+
+# --- OSC 52 with invalid UTF-8 → U+FFFD (C-01) ---------------------------------
+rk Shift_L
+fresh 'printf "\\033]52;c;/w==\\007"\n'; sleep 0.6
+[[ "$(sess wl-paste -n | od -An -tx1 | tr -d ' \n')" == "efbfbd" ]] || fail "OSC 52 invalid UTF-8 not replaced: $(sess wl-paste -n | od -An -tx1)"
+ok "OSC 52 invalid UTF-8 → U+FFFD"
+
+# --- Edit menu: Copy has no OSC 52 toast (D-04), Paste takes images (C-06) -----
+fresh 'echo MENU-COPY\n'; wait_ $'\nMENU-COPY' || fail "echo"
+ctl -q mouse action=drag col:=0 row:=1 col2:=9 row2:=1
+rk Shift_L; markl
+ctl -q menu action=activate label=Copy; sleep 0.4
+[[ "$(sess wl-paste -n)" == "MENU-COPY" ]] || fail "Edit › Copy did not copy"
+tail -n +"$mark" "$dir/app.log" | grep -q 'clipboard set from terminal' && fail "Edit › Copy showed the OSC 52 toast"
+sess sh -c "wl-copy -t image/png < '$dir/t.png'"; sleep 0.3; markl
+ctl -q menu action=activate label=Paste
+until_log 'uploading pasted image|status: pasted image' 60 || fail "Edit › Paste ignored the image"
+ctl -q key key=ctrl+u
+ok "Edit › Copy copies without a toast; Edit › Paste takes the image-paste flow"
+
+# --- real pointer: selection, clicks, links, middle click, wheel ----------------
+rk Shift_L
+fresh 'echo SELECT-THIS-TEXT word2 https://ex.invalid/q\n'; wait_ $'\nSELECT-THIS' || fail "echo"
+read -r x1 y1 < <(pt 0 1); read -r x2 y2 < <(pt 15 1)
+rp abs "$x1" "$y1", down, sleep 40, abs $((x1 + 20)) "$y1", sleep 40, abs "$x2" "$y2", sleep 40, up; sleep 0.3
+[[ "$(ctl --get text selection)" == "SELECT-THIS-TEXT" ]] || fail "real drag selected [$(ctl --get text selection)]"
+[[ "$(sess wl-paste --primary -n)" == "SELECT-THIS-TEXT" ]] || fail "real drag not on PRIMARY"
+read -r x y < <(pt 18 1)
+rp sleep 600, abs "$x" "$y", down, up, sleep 40, down, up; sleep 0.3
+[[ "$(ctl --get text selection)" == "word2" ]] || fail "double click selected [$(ctl --get text selection)]"
+rp sleep 600, abs "$x" "$y", down, up, sleep 40, down, up, sleep 40, down, up; sleep 0.3
+[[ "$(ctl --get text selection)" == "SELECT-THIS-TEXT word2 https://ex.invalid/q" ]] || fail "triple click selected [$(ctl --get text selection)]"
+read -r x y < <(pt 0 1); read -r xb yb < <(pt 3 1)
+rp sleep 600, abs "$x" "$y", down, sleep 40, abs "$xb" "$yb", sleep 40, up
+read -r x y < <(pt 10 1)
+"$here/with-mods" "$dir" shift -- "$here/realpointer" "$dir" sleep 600, abs "$x" "$y", down, up; sleep 0.3
+[[ "$(ctl --get text selection)" == "SELECT-THI" ]] || fail "shift-click extended to [$(ctl --get text selection)]"
+ctl -q url-sink clear:=true
+read -r x y < <(pt 30 1)
+rp sleep 600, abs "$x" "$y", sleep 100, down, up; sleep 0.3
+"$here/with-mods" "$dir" shift -- "$here/realpointer" "$dir" sleep 600, abs $((x + 7)) "$y", sleep 100, down, up; sleep 0.3
+sinkj="$(ctl url-sink)"
+grep -q '"target": "https://ex.invalid/q"' <<<"$sinkj" || fail "real link click did not open: $sinkj"
+grep -q '"last_copied": "https://ex.invalid/q"' <<<"$sinkj" || fail "real link shift-click did not copy: $sinkj"
+ctl -q text text='echo '
+read -r x y < <(pt 20 10)
+rp abs "$x" "$y", down 0x112, up 0x112; sleep 0.4; ctl -q key key=Return
+wait_ $'\nSELECT-THI\n' || fail "middle click did not paste PRIMARY (the shift-click selection)"
+fresh 'seq 1 300\n'; wait_ $'\n300\n' || fail "seq 300"
+o0=$(field panes.0.scrollbar.offset)
+rp abs "$x" "$y", sleep 50, scroll 0 -2; sleep 0.3
+o1=$(field panes.0.scrollbar.offset); (( o0 - o1 == 6 )) || fail "2 wheel notches moved $((o0 - o1)) lines, want 6"
+"$here/with-mods" "$dir" alt -- "$here/realpointer" "$dir" abs "$x" "$y", sleep 50, scroll 0 -1; sleep 0.3
+o2=$(field panes.0.scrollbar.offset); (( o1 - o2 == 15 )) || fail "Alt+wheel moved $((o1 - o2)) lines, want 15"
+ok "real pointer: drag, double, triple, shift-click, link click/shift-click, middle click, wheel 3, Alt+wheel 15"
+
+# --- scrollbar thumb dragged into the bottom band re-sticks (D-08) ---------------
+read -r tx ty ty2 < <(python3 -I - "$(ctl dump text:=false)" "$(sess swaymsg -t get_tree -r)" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])["result"]; tree = json.loads(sys.argv[2])
+def find(n):
+    if n.get("app_id") == "me.puntium.webmux.gtk": return n
+    for c in n.get("nodes", []) + n.get("floating_nodes", []):
+        r = find(c)
+        if r: return r
+win = find(tree)["rect"]; p = d["panes"][0]; sc = d["window"]["scale"] or 1
+H = p["size_px"]["height"] / sc; Wd = p["size_px"]["width"] / sc
+sb = p["scrollbar"]; total, off, ln = sb["total"], sb["offset"], sb["len"]
+y0 = win["y"] + p["origin"]["y"]
+print(int(win["x"] + p["origin"]["x"] + Wd + 5), int(y0 + H * (off + ln / 2) / total), int(y0 + H * (total - ln - 4 + ln / 2) / total))
+PY
+)
+rp abs "$tx" "$ty", sleep 50, down, sleep 50, abs "$tx" $(((ty + ty2) / 2)), sleep 50, abs "$tx" "$ty2", sleep 50, up; sleep 0.4
+python3 -I -c 'import json,sys; s=json.loads(sys.argv[1]); sys.exit(0 if s["offset"]+s["len"]==s["total"] else 1)' "$(field panes.0.scrollbar)" \
+  || fail "thumb dragged into the bottom band did not re-stick: $(field panes.0.scrollbar)"
+ok "scrollbar thumb drag into the bottom band re-sticks"
+
+# --- first click in an unfocused pane acts (D-07) ---------------------------------
+fresh 'echo https://first.invalid/click\n'; wait_ $'\nhttps://first.invalid' || fail "echo"
+first_session=$(field panes.0.session_id)
+rk shift+ctrl+Return
+until_field panes.1.link up 100 || fail "second pane did not open"
+idx=0; [[ "$(field panes.0.session_id)" == "$first_session" ]] || idx=1
+[[ "$(field panes.$idx.focused)" == false ]] || fail "first pane still focused"
+ctl -q url-sink clear:=true
+read -r x y < <(pt 5 1 "$idx")
+rp sleep 300, abs "$x" "$y", sleep 100, down, up; sleep 0.4
+grep -q '"target": "https://first.invalid/click"' <<<"$(ctl url-sink)" || fail "first click in an unfocused pane did not open the link"
+ok "the click that focuses a pane also opens its link"
+
+# --- closing a terminal logs no "session exited" (S-09); socket lines (G-08) ------
+before_close=$(connlog | wc -l)
+rk shift+ctrl+w; sleep 2.5
+connlog | tail -n +"$((before_close + 1))" | grep -q ': session exited' && fail "closing a pane logged 'session exited'"
+connlog | tail -n +"$((before_close + 1))" | grep -q 'session socket closed (tab closed or session exited)' || fail "no socket-closed line"
+"$here/headless" host-restart "$dir"
+until_field panes.0.snapshots 2 100 || true
+sleep 1.5
+for l in 'session socket dropped — retrying .*code=1006 .*retryInMs=1000' 'session socket reconnecting .*attempt=2' 'session socket reopened .*attempt=2' 'snapshot received .*bytes='; do
+  connlog | grep -q "$l" || fail "connection log lacks: $l"
+done
+ok "closing logs only a socket-closed line; drop/reconnect/reopen/snapshot lines are logged"
+
+# --- a big snapshot replay does not freeze the main loop (panels D1) ---------------
+printf '%s\n' 'import sys' 'for i in range(2000):' '    sys.stdout.write("".join(f"\x1b[3{(i+j)%8};4{(i*3+j)%8}m{chr(65+(i+j)%26)}" for j in range(150)) + "\x1b[0m\n")' > "$dir/host/home/big.py"
+fresh 'python3 ~/big.py; echo BIG-DONE\n'
+"$here/wmctl" -s "$dir/ctl.sock" --timeout 400 -q wait contains=BIG-DONE timeout_ms:=390000 || fail "big output"
+python3 -I - "$dir/ctl.sock" 12 > "$dir/stall.out" <<'PY' &
+import socket, sys, time
+sock, secs = sys.argv[1], float(sys.argv[2])
+end = time.time() + secs; worst = 0
+while time.time() < end:
+    s = socket.socket(socket.AF_UNIX); s.settimeout(300); s.connect(sock)
+    t = time.time(); s.sendall(b'{"cmd":"dump","text":false}\n'); s.makefile().readline()
+    worst = max(worst, time.time() - t); s.close(); time.sleep(0.02)
+print(f"{worst:.3f}")
+PY
+snaps_before=$(field panes.0.snapshots)
+sleep 0.3; "$here/headless" host-restart "$dir"; wait
+until_field panes.0.snapshots $((snaps_before + 1)) 300 || fail "no replay after the restart"
+replay_bytes=$(field panes.0.last_replay.bytes)
+(( replay_bytes >= 100000 )) || fail "no large replay happened ($replay_bytes bytes)"
+worst=$(cat "$dir/stall.out")
+python3 -I -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 0.25 else 1)' "$worst" || fail "main loop stalled ${worst}s during a replay"
+ok "main loop never stalled more than ${worst}s during a replay of $replay_bytes bytes ($(field panes.0.last_replay.ms) ms)"
+grep -q 'invalid C0 character' "$dir/app.log" && fail "replay logged 'invalid C0 character' (D-13)"
+ok "no 'invalid C0' warning at attach (D-13)"
+
+# ===========================================================================
+# Second fix round (gtk/audit/recheck-*.md), real input again.
+# ===========================================================================
+
+# --- scrolling distance (N2): wheel 3 lines/notch, touchpad as Electron -------
+# Electron (Chromium on Wayland, xterm.js): a touchpad pixel is 12 CSS px,
+# a row is 17 CSS px, so 4 x 20 px = 960 px = 56 lines (rounded). Normal
+# screen, alternate screen (arrow keys) and mouse reporting (wheel reports).
+# One distance sliced three ways must give the same result (xterm keeps
+# the fraction: final check, slicing): 85 px = 1020 CSS px = 60 rows.
+slice_cmds() { # N: 85 px up in 1 px, 5 px, or 7 px (+1) events
+  local c="" n step
+  case "$1" in 0) step=1 ;; 1) step=5 ;; 2) step=7 ;; esac
+  for ((n = 0; n + step <= 85; n += step)); do c+=", fscroll 0 -$step"; done
+  (( n < 85 )) && c+=", fscroll 0 -$((85 - n))"
+  echo "$c, fstop"
+}
+scroll_counts() { # SCALE-LABEL: checks on the current run
+  fresh 'seq 1 400\n'; wait_ $'\n400\n' || fail "seq 400"
+  read -r x y < <(pt 20 10)
+  local o0 o1 o2 k got
+  o0=$(field panes.0.scrollbar.offset)
+  rp abs "$x" "$y", sleep 50, scroll 0 -1; sleep 0.3; o1=$(field panes.0.scrollbar.offset)
+  rp abs "$x" "$y", sleep 50, fscroll 0 -20, sleep 16, fscroll 0 -20, sleep 16, fscroll 0 -20, sleep 16, fscroll 0 -20, sleep 16, fstop; sleep 0.3
+  o2=$(field panes.0.scrollbar.offset)
+  (( o0 - o1 == 3 )) || fail "$1: a wheel notch scrolled $((o0 - o1)) lines, want 3"
+  (( o1 - o2 == 56 )) || fail "$1: an 80 px touchpad scroll moved $((o1 - o2)) lines, want 56"
+  got=""
+  for k in 0 1 2; do
+    fresh 'seq 1 400\n'; wait_ $'\n400\n' || fail "seq 400"
+    o0=$(field panes.0.scrollbar.offset)
+    rp abs "$x" "$y$(slice_cmds $k)"; sleep 0.3
+    got="$got $((o0 - $(field panes.0.scrollbar.offset)))"
+  done
+  [[ "$got" == " 60 60 60" ]] || fail "$1: 85 px sliced in 1/5/7 px events moved [$got ] lines, want 60 each"
+  cp "$here/raw-reader.py" "$dir/host/home/raw-reader.py"
+  local mode
+  for mode in alt mouse; do
+    rm -f "$dir/host/home/raw.out"
+    fresh "python3 ~/raw-reader.py $mode ~/raw.out\n"; wait_ RAW-READY || fail "raw reader"
+    rp abs "$x" "$y", sleep 50, scroll 0 -1, sleep 100$(slice_cmds 0 | sed 's/, fstop$//'), fstop, sleep 100$(slice_cmds 1), sleep 100$(slice_cmds 2)
+    for _ in $(seq 1 80); do [[ -s "$dir/host/home/raw.out" ]] && break; sleep 0.1; done
+    local n
+    n=$(python3 -I -c 'import sys,re; b=eval(open(sys.argv[1]).read()); print(b.count(b"\x1b[A")+b.count(b"\x1bOA") if sys.argv[2]=="alt" else len(re.findall(rb"\x1b\[<64;", b)))' "$dir/host/home/raw.out" "$mode")
+    (( n == 183 )) || fail "$1 $mode screen: a notch + 3 x 85 px (sliced 1/5/7 px) gave $n up events, want 3 + 3 x 60"
+  done
+  ok "$1: wheel 3 lines/notch; touchpad 80 px = 56 lines; 85 px = 60 lines however it is sliced, on the normal screen, as arrow keys (alt screen) and as wheel reports"
+}
+scroll_counts "scale 1"
+
+# --- double-click words and click + Shift+click as xterm (D-06) -----------------
+fresh $'echo \'foo ` bar (  ) baz foo(bar)\'\n'; wait_ $'\nfoo `' || fail "echo"
+row=1
+dbl() { local x y; read -r x y < <(pt "$1" "$row"); rp sleep 600, abs "$x" "$y", sleep 30, down, up, sleep 40, down, up; sleep 0.3; ctl --get text selection; }
+for c in "3: " "4:\`" "11:  " "10:(" "13:)" "22:foo(bar" "26:bar)"; do
+  got="$(dbl "${c%%:*}")"; [[ "$got" == "${c#*:}" ]] || fail "double-click at column ${c%%:*} selected [$got], want [${c#*:}] (xterm)"
+done
+read -r x y < <(pt 2 "$row"); rp sleep 600, abs $((x - 3)) "$y", sleep 30, down, up
+read -r x y < <(pt 8 "$row")
+"$here/with-mods" "$dir" shift -- "$here/realpointer" "$dir" sleep 600, abs $((x - 3)) "$y", sleep 30, down, up; sleep 0.3
+[[ "$(ctl --get text selection)" == 'o ` ba' ]] || fail "click then Shift+click selected [$(ctl --get text selection)], want [o \` ba]"
+[[ "$(sess wl-paste --primary -n)" == 'o ` ba' ]] || fail "click + Shift+click selection not on PRIMARY"
+ok "double-click: spaces alone, a separator alone or grown into its word; click + Shift+click selects between them"
+
+# --- a key typed right after Ctrl+V lands after the pasted text (O2) --------------
+rk Shift_L; sess wl-copy 'echo PASTE-ORDER-OK'; sleep 0.3
+fresh ''; rk ctrl+v Return
+wait_ $'\nPASTE-ORDER-OK' || { screen >&2; fail "Return typed 1 ms after Ctrl+V overtook the pasted text"; }
+ok "Ctrl+V then Return at once: the paste runs"
+
+# --- a title with control characters shows as the browser shows it (panels D7) --
+fresh 'printf "\\033]0;  a   b  \\007"\n'; sleep 0.5
+[[ "$(field panes.0.title)" == "a b" ]] || fail "title [$(field panes.0.title)], want [a b]"
+ok "title whitespace collapses as in the browser label"
+
+# --- scale 2: the same distances (N2) --------------------------------------------
+dir1="$dir"
+dir="$("$here/headless" start --host --scale 2 | tail -n1)"
+until_field panes.0.link up || fail "scale 2 pane never attached"
+scroll_counts "scale 2"
+"$here/headless" stop "$dir"; dir="$dir1"
+
+# --- hidden pane (setShown) ------------------------------------------------------
+ctl -q shown value:=false
+[[ "$(field panes.0.visible)" == false ]] || fail "setShown(false)"
+ctl -q shown value:=true
+[[ "$(field panes.0.visible)" == true ]] || fail "setShown(true)"
+ok "setShown toggles rendering"
+
+app="$(sed -n 's/^app=//p' "$dir/pids")"
+ctl -q quit || fail quit
+for _ in $(seq 1 50); do kill -0 "$app" 2>/dev/null || break; sleep 0.1; done
+for _ in $(seq 1 20); do [[ -f "$dir/app.exit" ]] && break; sleep 0.1; done
+[[ "$(cat "$dir/app.exit" 2>/dev/null)" == 0 ]] || fail "app exit status $(cat "$dir/app.exit" 2>/dev/null)"
+if grep -qiE 'panic|segmentation fault|leaked' "$dir/app.log"; then fail "crash or leak in app.log"; fi
+"$here/headless" stop "$dir"
+first="$dir"
+
+# --- a session the host does not have (T-39) --------------------------------------
+# WEBMUX_GTK_DEV_SESSION makes dev mode attach that id in a single pane
+# (the workspace never attaches a session the host does not list).
+dir="$("$here/headless" start --host -- WEBMUX_GTK_DEV_SESSION=no-such-session | tail -n1)"
+for _ in $(seq 1 50); do grep -q 'dev: the session ended\|asked to close' "$dir/app.log" && break; sleep 0.1; done
+grep -q 'session gone on the host — closing its tab' "$dir/app.log" || fail "no T-39 log line"
+until_field panes '[]' || fail "pane for a missing session not removed"
+ok "unknown session: logged and the pane removed"
+pty2="$(sed -n 's/^ptyname=//p' "$dir/pids")"
+"$here/headless" stop "$dir"
+
+left="$(pgrep -af -- "$first/|$dir/|ptyhost --name ($pty1|$pty2)\$" | grep -v pgrep || true)"
+[[ -z "$left" ]] || fail "processes left: $left"
+echo "smoke-pane: OK $first"

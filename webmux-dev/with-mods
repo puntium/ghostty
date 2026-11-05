@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Hold modifiers on a real (virtual) keyboard while running a command, e.g.
+# a realpointer click:  webmux-dev/with-mods DIR shift -- webmux-dev/realpointer DIR abs 10 10, down, up
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+dir="$1"; shift
+mods=()
+while [[ "$1" != "--" ]]; do mods+=("$1"); shift; done
+shift
+fifo="$(mktemp -u "$dir/mods.XXXX")"; mkfifo "$fifo"
+"$here/realkeys-xkb" "$dir" - < "$fifo" >/dev/null &
+pid=$!
+exec 7>"$fifo"
+echo "mods ${mods[*]}" >&7
+sleep 0.3
+rc=0; "$@" || rc=$?
+sleep 0.1
+echo "mods" >&7
+exec 7>&-
+wait "$pid" || true
+rm -f "$fifo"
+exit $rc

@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+# End-to-end check of the application as a user starts it (no dev mode):
+# no config, the connection page, a profile added through the form,
+# Save & Connect through a fake ssh (webmux-dev/fake-ssh) that deploys the
+# real payload into a scratch "remote" HOME and starts the real
+# webmux-host there, the view revealed on first answer, a terminal in it
+# (type, see output; resize, the grid follows; real keystrokes), the
+# tunnel killed and the retry healing it, a wake-from-sleep, host
+# switching by shortcut, disconnect by the pill's ✕, quit; nothing left
+# running. This replaces the walking skeleton's local-shell smoke.
+#
+#   webmux-dev/smoke            (build first: webmux-dev/build)
+#   webmux-dev/smoke-chrome     the same
+set -Eeuo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fail() { echo "smoke-chrome: FAIL: $*" >&2; [[ -n "${dir:-}" ]] && "$here/headless" stop "$dir"; exit 1; }
+ctl() { "$here/wmctl" -s "$dir/ctl.sock" "$@"; }
+conns() { ctl conns --get "$1"; }
+until_conns() { # until_conns PATH VALUE [tries of 0.1 s]
+  for _ in $(seq 1 "${3:-100}"); do
+    [[ "$(conns "$1" 2>/dev/null)" == "$2" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+until_field() {
+  for _ in $(seq 1 "${3:-100}"); do
+    [[ "$(ctl dump text:=false --get "$1" 2>/dev/null)" == "$2" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+connlog() { cat "$dir/home/.local/state/webmux-gtk/logs/webmux.log" 2>/dev/null; }
+
+dir="$("$here/headless" start -- WEBMUX_GTK_SSH="$here/fake-ssh" WEBMUX_GTK_SLEEP_BUS=session | tail -n1)"
+echo "smoke-chrome: run dir $dir"
+trap 'fail "unexpected error at line $LINENO: $BASH_COMMAND"' ERR
+
+# --- startup: connection page, nothing connects (W-04) -----------------
+[[ "$(conns title)" == webmux ]] || fail "title $(conns title)"
+[[ "$(conns front)" == null ]] || fail "not on the connection page"
+[[ "$(conns page.empty)" == true ]] || fail "expected no profiles"
+[[ ! -e "$dir/home/.config/webmux-gtk/config.json" ]] || fail "config.json exists before any save"
+ctl -q screenshot path="$dir/1-empty.png"
+
+# --- add a profile: Save & Connect (W-27, W-28, X-18) --------------------
+# Real pointer and keys: New Profile, type, click Host, type, click Save.
+"$here/chrome-click" "$dir" page.new
+[[ "$(conns page.mode)" == form ]] || fail "form did not open"
+"$here/realkeys" "$dir" devbox
+"$here/chrome-click" "$dir" form.host
+"$here/realkeys" "$dir" me@devbox
+ctl -q screenshot path="$dir/2-form.png"
+"$here/chrome-click" "$dir" form.submit
+until_conns entries.0.state connected 300 || fail "never connected: $(conns entries.0)"
+until_conns front devbox 50 || fail "view not revealed on first answer (front $(conns front))"
+[[ "$(conns title)" == "webmux — 1 host · 1 pane" ]] || until_conns title "webmux — 1 host · 1 pane" 50 || fail "title $(conns title)"
+connlog | grep -q "deploy done: server started" || fail "no fresh deploy in the connection log"
+ls "$dir"/remote/me_devbox/.webmux/dist/payload/*/webmux-host >/dev/null || fail "payload not pushed"
+grep -q '"name": "devbox"' "$dir/home/.config/webmux-gtk/config.json" || fail "profile not saved"
+echo "smoke-chrome: deployed and connected: $(conns entries.0.socket_path)"
+
+# --- the terminal in the host's view -------------------------------------
+until_field panes.0.link up || fail "terminal never attached"
+ctl -q text text='echo chrome-$((6*7))\n' || fail "text"
+ctl -q wait contains=$'\nchrome-42' timeout_ms:=10000 || fail "remote output never appeared"
+ctl -q screenshot path="$dir/3-connected.png"
+before="$(ctl dump --get panes.0.grid)"
+ctl -q resize width:=900 height:=600 || fail "resize"
+for _ in $(seq 1 30); do [[ "$(ctl dump --get panes.0.grid)" != "$before" ]] && break; sleep 0.1; done
+[[ "$(ctl dump --get panes.0.grid)" != "$before" ]] || fail "grid did not follow the resize"
+"$here/realkeys" "$dir" 'echo real-keys-ok' -k Return || fail "realkeys"
+ctl -q wait contains=$'\nreal-keys-ok' || fail "real keystrokes did not arrive"
+ctl -q resize width:=1400 height:=900
+
+# --- N1: the ☰ menu gives keyboard focus back, its Edit items act on it --
+X() { "$here/realkeys-xkb" "$dir" "$@" >/dev/null; }
+read -r mx my < <("$here/chrome-click" "$dir" --where header.menu)
+menu_item() { # menu_item DY_SUBMENU DY_ITEM: ☰ → submenu → item, real pointer
+  "$here/chrome-click" "$dir" header.menu; sleep 0.4
+  "$here/realpointer" "$dir" "abs $((mx - 120)) $((my + $1)), sleep 80, down, sleep 60, up, sleep 300"
+  "$here/realpointer" "$dir" "abs $((mx - 120)) $((my + $2)), sleep 80, down, sleep 60, up, sleep 300"
+}
+pane_has_focus() { [[ "$(ctl workspace --get has_keyboard_focus_in)" != null ]]; }
+for how in escape button elsewhere item; do
+  "$here/chrome-click" "$dir" header.menu; sleep 0.4
+  [[ "$(conns focus)" == popover:* ]] || fail "menu did not take focus ($how)"
+  case $how in
+    escape) X Escape ;;
+    button) "$here/chrome-click" "$dir" header.menu ;;
+    elsewhere) "$here/chrome-click" "$dir" --at 700 18 ;;
+    item) "$here/realpointer" "$dir" "abs $((mx - 120)) $((my + 117)), sleep 80, down, sleep 60, up, sleep 300"   # View
+          "$here/realpointer" "$dir" "abs $((mx - 120)) $((my + 85)), sleep 80, down, sleep 60, up, sleep 300" ;; # Reset Zoom
+  esac
+  sleep 0.4
+  pane_has_focus || fail "no keyboard focus after closing the menu by $how (focus $(conns focus))"
+  "$here/realkeys" "$dir" "echo menu-$how-ok" -k Return
+  ctl -q wait contains=$'\nmenu-'"$how"'-ok' timeout_ms:=5000 || fail "typing after closing the menu by $how went nowhere"
+done
+# Edit > Copy / Paste / Select All from the real menu act on the terminal.
+ctl -q text text=$'echo COPY-THIS\n'; ctl -q wait contains=$'\nCOPY-THIS'
+row="$(ctl dump --get panes.0.text | grep -n '^COPY-THIS' | head -n1 | cut -d: -f1)"
+ctl -q mouse action=drag col:=0 row:=$((row - 1)) col2:=9 row2:=$((row - 1))
+"$here/in-session" "$dir" wl-copy -o old; sleep 0.3
+menu_item 85 194                                   # Edit > Copy
+[[ "$("$here/in-session" "$dir" wl-paste -n)" == COPY-THIS ]] || fail "Edit > Copy did not copy the terminal selection"
+"$here/in-session" "$dir" wl-copy 'PASTED-BY-MENU'; sleep 0.4
+menu_item 85 226                                   # Edit > Paste
+ctl -q wait contains='PASTED-BY-MENU' timeout_ms:=5000 || fail "Edit > Paste did not paste into the terminal"
+X ctrl+u
+menu_item 85 303                                   # Edit > Select All
+[[ "$(ctl selection --get text)" == *COPY-THIS* ]] || fail "Edit > Select All did not select in the terminal"
+pane_has_focus || fail "focus lost after the Edit items"
+echo "smoke-chrome: N1 the menu returns focus however it closes; Edit > Copy, Paste, Select All act on the terminal"
+
+# --- kill the tunnel: retry, then healed in place (X-21, X-29) -----------
+session="$(ctl dump text:=false --get panes.0.session_id)"
+pkill -f "UNIX-LISTEN:$dir/run/webmux-gtk/" || fail "no tunnel process to kill"
+until_conns entries.0.state retry 50 || fail "no retry after the tunnel died ($(conns entries.0.state))"
+[[ "$(conns front)" == devbox ]] || fail "view switched on a tunnel blip"
+ctl -q screenshot path="$dir/4-retry.png"
+until_conns entries.0.state connected 200 || fail "retry never healed"
+until_field panes.0.link up 200 || fail "terminal did not come back"
+[[ "$(ctl dump text:=false --get panes.0.session_id)" == "$session" ]] || fail "different session after the retry"
+ctl -q text text='echo healed\n'
+ctl -q wait contains=$'\nhealed' timeout_ms:=10000 || fail "no output after the retry"
+connlog | grep -q "interrupted — retry in" || fail "no interruption in the log"
+echo "smoke-chrome: tunnel killed, retried, healed (same session $session)"
+
+# --- wake from sleep: tunnels restarted at once (X-27) -------------------
+glib="$(nix build --no-link --print-out-paths --inputs-from "$here/.." nixpkgs#glib 2>/dev/null | grep -v -- '-man$' | head -n1)"
+env -i DBUS_SESSION_BUS_ADDRESS="unix:path=$dir/run/bus" "$glib/bin/gdbus" emit --session \
+  --object-path /org/freedesktop/login1 --signal org.freedesktop.login1.Manager.PrepareForSleep false \
+  >/dev/null || fail "cannot emit PrepareForSleep"
+for _ in $(seq 1 50); do connlog | grep -q "system resumed from sleep" && break; sleep 0.1; done
+connlog | grep -q "system resumed from sleep tunnelsKilled=1" || fail "resume not handled: $(connlog | grep -a resumed)"
+until_conns entries.0.state connected 200 || fail "not reconnected after resume"
+echo "smoke-chrome: resume from sleep restarted the tunnel"
+
+# --- shortcuts: connection page and back (K-20, K-24) --------------------
+ctl -q key key=ctrl+shift+o
+[[ "$(conns front)" == null && "$(conns header.connections_active)" == true ]] || fail "Ctrl+Shift+O"
+[[ "$(conns header.new_terminal_enabled)" == false ]] || fail "header buttons enabled on the page"
+ctl -q screenshot path="$dir/5-page-connected.png"
+ctl -q key key=ctrl+1
+[[ "$(conns front)" == devbox ]] || fail "Ctrl+1"
+ctl -q key key=ctrl+Page_Down
+[[ "$(conns front)" == devbox ]] || fail "Ctrl+PageDown with one host"
+
+# --- disconnect from the pill (X-23, W-15): real pointer on its ✕ ---------
+"$here/chrome-click" "$dir" --hover pill.devbox
+"$here/chrome-click" "$dir" pill.devbox.x
+[[ "$(conns entries)" == "[]" ]] || fail "still connected"
+[[ "$(conns front)" == null && "$(conns title)" == webmux ]] || fail "not back on the page"
+[[ "$(ctl dump text:=false --get panes)" == "[]" ]] || fail "terminal not torn down"
+for _ in $(seq 1 30); do pgrep -f "UNIX-LISTEN:$dir/run/webmux-gtk/" >/dev/null || break; sleep 0.1; done
+pgrep -f "UNIX-LISTEN:$dir/run/webmux-gtk/" >/dev/null && fail "tunnel still running after disconnect"
+echo "smoke-chrome: disconnected"
+
+# =========================================================================
+# Fix-round regression checks (gtk/audit/connections.md). Real keys and the
+# real pointer wherever a user would act.
+# =========================================================================
+mk() { # mk NAME HOST: New Profile → type → Save & Connect, all real input
+  ctl -q key key=ctrl+shift+o
+  "$here/chrome-click" "$dir" page.new
+  "$here/realkeys" "$dir" "$1"
+  "$here/chrome-click" "$dir" form.host
+  "$here/realkeys" "$dir" "$2"
+  "$here/chrome-click" "$dir" form.submit
+}
+edit_host() { # edit_host NAME NEWHOST (real input)
+  ctl -q key key=ctrl+shift+o
+  "$here/chrome-click" "$dir" "card.$1.Edit"
+  "$here/chrome-click" "$dir" form.host
+  "$here/realkeys-xkb" "$dir" ctrl+a >/dev/null
+  "$here/realkeys" "$dir" "$2" -k Return
+}
+state_of() { ctl conns | python3 -I -c 'import json,sys; v=[e for e in json.load(sys.stdin)["result"]["entries"] if e["name"]==sys.argv[1]]; print(v[0]["state"] if v else "none")' "$1"; }
+until_state() { for _ in $(seq 1 "${3:-200}"); do [[ "$(state_of "$1")" == "$2" ]] && return 0; sleep 0.1; done; return 1; }
+sock_of() { ctl conns | python3 -I -c 'import json,sys; v=[e for e in json.load(sys.stdin)["result"]["entries"] if e["name"]==sys.argv[1]]; print(v[0]["socket_path"])' "$1"; }
+
+# --- C-1: an edited live profile keeps its socket; no sharing -------------
+mk a me@hosta
+until_state a connected || fail "a never connected"
+edit_host a me@hostc
+[[ "$(conns page.mode)" == list ]] || fail "edit form did not close: $(conns page.form)"
+sa="$(sock_of a)"
+[[ "$sa" == *hosta* ]] || fail "a moved off its live socket after an edit ($sa)"
+mk b me@hosta
+sleep 0.5
+[[ "$(state_of b)" == none ]] || fail "b was allowed onto a's live socket (C-1)"
+grep -q 'is already connected to this host and instance' <<<"$(conns page.status_text)" || fail "no refusal notice: $(conns page.status_text)"
+# Ctrl+Shift+R (real keys) on a: adopts the edit (a new host: a new
+# workspace for it).
+"$here/chrome-click" "$dir" pill.a
+"$here/realkeys-xkb" "$dir" ctrl+shift+r >/dev/null   # chords: realkeys-xkb (physical keys, real modifiers), not realkeys
+until_state a connecting 50 || until_state a connected 1 || true
+until_state a connected 200 || fail "a did not come back after Ctrl+Shift+R"
+[[ "$(sock_of a)" == *hostc* ]] || fail "reconnect did not adopt the edited host ($(sock_of a))"
+ctl -q key key=ctrl+shift+o
+"$here/chrome-click" "$dir" card.b.Connect
+until_state b connected || fail "b could not take the released host"
+[[ "$(sock_of a)" != "$(sock_of b)" ]] || fail "a and b share a socket"
+echo "smoke-chrome: C-1 edit keeps the live socket, refusal shown, Ctrl+Shift+R adopts the edit"
+
+# --- pills in the title bar: a real drag reorders them (W-16) --------------
+# The header is the window's title bar (deviation 66), whose own drag moves
+# the window: a press on a pill has to stay the pill's.
+[[ "$(conns header.pills.0.name)" == a && "$(conns header.pills.1.name)" == b ]] || fail "pill order before the drag: $(conns header.pills.0.name) $(conns header.pills.1.name)"
+"$here/chrome-click" "$dir" --drag pill.a 140
+until_conns header.pills.0.name b 30 || fail "dragging pill a right did not reorder the pills"
+"$here/chrome-click" "$dir" --drag pill.a -140
+until_conns header.pills.0.name a 30 || fail "dragging pill a back did not reorder the pills"
+"$here/chrome-click" "$dir" pill.b
+until_conns front b 30 || fail "a click on pill b did not show b"
+echo "smoke-chrome: a real drag reorders the pills in the title bar; a click still shows the host"
+
+# --- Third round 1: focus coming back to a text field keeps its content ----
+# (New Profile, type, ☰, Escape, type: GTK selected the whole field, so the
+# next key replaced it; same after ⚙ and Connections, and Edit › Paste.)
+fval() { ctl conns --get "page.form.fields.$1"; }
+ctl -q key key=ctrl+shift+o
+"$here/chrome-click" "$dir" page.new
+"$here/realkeys" "$dir" hello
+"$here/chrome-click" "$dir" header.menu; sleep 0.4; X Escape; sleep 0.4
+"$here/realkeys" "$dir" X
+[[ "$(fval name)" == helloX ]] || fail "☰ + Escape: the name field holds '$(fval name)', not helloX"
+"$here/chrome-click" "$dir" form.password; "$here/realkeys" "$dir" abc
+"$here/chrome-click" "$dir" header.menu; sleep 0.4; X Escape; sleep 0.4
+"$here/realkeys" "$dir" def
+[[ "$(fval password_len)" == 6 ]] || fail "☰ + Escape: the password field holds $(fval password_len) characters, not 6 (abcdef)"
+"$here/chrome-click" "$dir" form.host; "$here/realkeys" "$dir" hostx
+"$here/chrome-click" "$dir" header.settings; sleep 0.6; X Escape; sleep 0.6
+"$here/realkeys" "$dir" Y
+[[ "$(fval host)" == hostxY ]] || fail "⚙ + Escape: the host field holds '$(fval host)'"
+"$here/chrome-click" "$dir" header.connections; sleep 0.4
+"$here/realkeys" "$dir" Z
+[[ "$(fval host)" == hostxYZ ]] || fail "Connections: the host field holds '$(fval host)'"
+"$here/in-session" "$dir" wl-copy PP; sleep 0.3
+menu_item 85 226                                   # Edit > Paste into the field
+"$here/realkeys" "$dir" W
+[[ "$(fval host)" == hostxYZPPW ]] || fail "Edit > Paste: the host field holds '$(fval host)'"
+ctl -q page action=cancel
+echo "smoke-chrome: focus returns to text fields as they were (☰, ⚙, Connections, Edit › Paste; visible and password)"
+
+# --- N8: the card says what a live connection is on while an edit waits ----
+card_live() { ctl conns | python3 -I -c 'import json,sys; print([c["live"] for c in json.load(sys.stdin)["result"]["page"]["cards"] if c["name"]==sys.argv[1]][0])' "$1"; }
+edit_host b me@hostd
+[[ "$(card_live b)" == "on me@hosta until Reconnect (Ctrl+Shift+R) applies the edit" ]] || fail "no pending-edit line on b's card: $(card_live b)"
+edit_host b me@hosta
+[[ "$(card_live b)" == None ]] || fail "pending-edit line stayed after the edit was undone: $(card_live b)"
+echo "smoke-chrome: N8 a pending edit is shown on the card"
+
+# --- N1 for the card ⋯ menu: every way of closing leaves focus usable -------
+for how in escape button elsewhere; do
+  "$here/chrome-click" "$dir" card.b.menu; sleep 0.3
+  [[ "$(conns focus)" == popover:* ]] || fail "⋯ menu did not take focus"
+  case $how in
+    escape) X Escape ;;
+    button) "$here/chrome-click" "$dir" card.b.menu ;;
+    elsewhere) "$here/chrome-click" "$dir" --at 60 600 ;;
+  esac
+  sleep 0.4
+  f="$(conns focus)"
+  [[ "$f" != null && "$f" != popover:* ]] || fail "focus after closing the ⋯ menu by $how: $f"
+done
+echo "smoke-chrome: N1 the card ⋯ menu leaves focus on the page however it closes"
+
+# --- N7: the port field takes 1-65535 in decimal or blank (real typing) -----
+ctl -q key key=ctrl+shift+o
+"$here/chrome-click" "$dir" card.b.Edit
+for bad in 0 0x16 22.0 70000 abc; do
+  "$here/chrome-click" "$dir" form.ssh_port; X ctrl+a; "$here/realkeys" "$dir" "$bad"
+  "$here/chrome-click" "$dir" form.submit
+  [[ "$(conns page.form.error_text)" == "SSH port must be a whole number from 1 to 65535 (blank = ssh's default)" ]] || fail "port '$bad' accepted"
+done
+"$here/chrome-click" "$dir" form.cancel
+echo "smoke-chrome: N7 ports 0, 0x16, 22.0, 70000, abc refused"
+
+# --- N3: long names and hosts never widen the window -------------------------
+long="$(printf 'verylongprofilename%.0s' $(seq 1 15))"
+ctl -q key key=ctrl+shift+o; ctl -q page action=new
+ctl -q page action=set field=name value="$long"
+ctl -q page action=set field=host value="badhost$(printf '.averyveryverylonghostname%.0s' $(seq 1 6))"
+ctl -q page action=submit
+until_state "$long" failed 100 || fail "long profile did not fail"
+python3 -I -c 'import json,sys; v=json.load(sys.stdin)["result"]["header"]["pills"]; sys.exit(0 if any(p["name"]==sys.argv[1] for p in v) else 1)' "$long" < <(ctl conns) \
+  || fail "a 285-byte name is not the pill's text (shown as '?')"
+# every wrapping label of the status area is set hyphen-free
+[[ "$(conns page.status_hyphen_free)" == true ]] || fail "status text may get inserted hyphens"
+ctl -q key key=ctrl+shift+o
+ctl -q resize width:=560 height:=700; sleep 0.8
+[[ "$(ctl dump text:=false --get window.width)" == 560 ]] || fail "a long name keeps the window at $(ctl dump text:=false --get window.width) px"
+ctl -q screenshot path="$dir/long-names.png"
+ctl -q page action=edit name="$long"; sleep 0.3
+[[ "$(ctl dump text:=false --get window.width)" == 560 ]] || fail "the form with a long name widened the window"
+ctl -q page action=cancel
+ctl -q page action=delete name="$long"; ctl -q page action=delete name="$long"
+ctl -q resize width:=1400 height:=900; sleep 0.5
+echo "smoke-chrome: N3 a 285-byte name (whole in its pill) and a long failed host keep a 560 px window; status text hyphen-free"
+
+# --- C-5: a live rename reaches every log entry ------------------------------
+ctl -q key key=ctrl+shift+o
+"$here/chrome-click" "$dir" card.a.Edit
+"$here/realkeys-xkb" "$dir" ctrl+a >/dev/null
+"$here/realkeys" "$dir" arenamed -k Return
+until_conns header.pills.0.name arenamed 30 || fail "pill not renamed"
+"$here/chrome-click" "$dir" pill.arenamed
+mark="$(wc -l < "$dir/app.log")"
+"$here/realkeys-xkb" "$dir" ctrl+shift+r >/dev/null   # chords: realkeys-xkb (physical keys, real modifiers), not realkeys
+until_state arenamed connected 200 || fail "arenamed did not reconnect"
+# same host: the workspace re-reads its session list (S-13)
+for _ in $(seq 1 50); do tail -n +"$mark" "$dir/app.log" | grep -q 'arenamed: reload\|a: reload' && break; sleep 0.1; done
+tail -n +"$mark" "$dir/app.log" | grep -q ': reload' || fail "no workspace reload after Ctrl+Shift+R (S-13)"
+# the workspace's own entries (link down/up) after a tunnel drop
+pkill -f "UNIX-LISTEN:$dir/run/webmux-gtk/me-hostc" || fail "no tunnel for arenamed"
+for _ in $(seq 1 100); do connlog | grep -q '\[arenamed\] page: link down' && break; sleep 0.1; done
+connlog | grep -q '\[arenamed\] page: link down' || fail "workspace entries keep the old name (C-5): $(connlog | grep 'page: link down' | tail -n1)"
+until_state arenamed connected 200 || fail "arenamed did not heal"
+echo "smoke-chrome: C-5 a renamed connection's workspace logs under the new name; S-13 reload on Ctrl+Shift+R"
+
+# --- E-10 / C-9: settings from the page, Open Config File recorded ------------
+ctl -q key key=ctrl+shift+o
+[[ "$(conns header.settings_enabled)" == true ]] || fail "settings button disabled on the page (E-10)"
+"$here/chrome-click" "$dir" header.settings
+for _ in $(seq 1 20); do [[ "$(ctl settings-dump --get open)" == true ]] && break; sleep 0.1; done
+[[ "$(ctl settings-dump --get open)" == true ]] || fail "settings did not open from the page"
+ctl -q settings-close
+ctl -q url-sink clear:=true
+ctl -q menu action=activate label="Open Config File"
+[[ "$(ctl url-sink --get recorded.0.target)" == "file://$dir/home/.config/webmux-gtk/config.json" ]] || fail "Open Config File not through the sink: $(ctl url-sink --get recorded)"
+echo "smoke-chrome: settings open from the page; Open Config File goes through the launch sink"
+
+# --- G-04: a huge whole number in log data does not crash ---------------------
+ctl -q log-push msg=bigfloat 'data:={"x":1e20,"y":9.3e18}'
+ctl -q conns >/dev/null || fail "app died on a large float in log data"
+connlog | grep -q 'bigfloat x=100000000000000000000' || fail "large float not logged"
+
+# --- C-2 / C-4: passwords, keyring present, absent, back --------------------
+"$here/chrome-click" "$dir" card.b.Disconnect 2>/dev/null || true
+mkdir -p "$dir/remote/me_pwbox"; printf 's3cret' > "$dir/remote/me_pwbox/password"
+before="$(cat "$dir/home/.config/webmux-gtk/config.json")"
+ctl -q key key=ctrl+shift+o
+"$here/chrome-click" "$dir" page.new
+"$here/realkeys" "$dir" pw
+"$here/chrome-click" "$dir" form.host; "$here/realkeys" "$dir" me@pwbox
+"$here/chrome-click" "$dir" form.password; "$here/realkeys" "$dir" s3cret
+"$here/chrome-click" "$dir" form.submit
+for _ in $(seq 1 50); do [[ "$(conns page.form.busy)" == false ]] && break; sleep 0.1; done
+[[ "$(conns page.form.error_text)" == "the system keyring is unavailable — cannot store a password" ]] || fail "no-keyring save: $(conns page.form.error_text)"
+[[ "$(cat "$dir/home/.config/webmux-gtk/config.json")" == "$before" ]] || fail "the profile was half-saved without a keyring (C-4)"
+"$here/keyring" start "$dir" >/dev/null
+"$here/chrome-click" "$dir" form.submit           # the typed password is still there
+until_state pw connected 200 || fail "pw (password from the keyring) never connected: $(conns page.form)"
+grep -q 'password ok' "$dir/remote/ssh.log" || fail "askpass password not used"
+pid_="$(python3 -I -c 'import json,sys; print([p["id"] for p in json.load(open(sys.argv[1]))["profiles"] if p["name"]=="pw"][0])' "$dir/home/.config/webmux-gtk/config.json")"
+# keyring goes away; clear the password (real click on the checkbox)
+"$here/keyring" stop "$dir"; sleep 0.3
+ctl -q key key=ctrl+shift+o
+"$here/chrome-click" "$dir" card.pw.Edit
+"$here/chrome-click" "$dir" form.clear
+"$here/chrome-click" "$dir" form.submit
+[[ "$(conns page.mode)" == list ]] || fail "clear saved with no keyring: $(conns page.form)"
+grep -q "\"$pid_\"" <(python3 -I -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["cleared"]))' "$dir/home/.local/state/webmux-gtk/keyring.json") || fail "clear not recorded"
+# keyring is back with the old item: the cleared password is never used
+"$here/keyring" start "$dir" >/dev/null
+n_ok="$(grep -c 'password ok' "$dir/remote/ssh.log")"
+"$here/chrome-click" "$dir" card.pw.Disconnect
+"$here/chrome-click" "$dir" card.pw.Connect
+until_state pw failed 200 || fail "pw connected without its (cleared) password: $(state_of pw)"
+[[ "$(grep -c 'password ok' "$dir/remote/ssh.log")" == "$n_ok" ]] || fail "the cleared password was given to ssh (C-2)"
+connlog | grep '\[pw\] connect requested' | tail -n1 | grep -q 'auth=key' || fail "auth not key after clearing"
+[[ "$(ctl keyring action=lookup id="$pid_" --get kind)" == none ]] || fail "cleared item still in the keyring"
+# delete a profile with a password while the keyring is down: no orphan
+ctl -q key key=ctrl+shift+o
+"$here/chrome-click" "$dir" card.pw.Edit
+"$here/chrome-click" "$dir" form.password; "$here/realkeys" "$dir" s3cret
+"$here/chrome-click" "$dir" form.submit
+for _ in $(seq 1 50); do [[ "$(conns page.mode)" == list ]] && break; sleep 0.1; done
+[[ "$(ctl keyring action=lookup id="$pid_" --get kind)" == found ]] || fail "password not stored again"
+"$here/keyring" stop "$dir"; sleep 0.3
+"$here/chrome-click" "$dir" card.pw.menu
+"$here/chrome-click" "$dir" card.pw.delete
+"$here/chrome-click" "$dir" card.pw.delete
+"$here/keyring" start "$dir" >/dev/null
+# any lookup purges cleared items once the keyring answers
+[[ "$(ctl keyring action=lookup id=0000000000000000 --get kind)" == none ]] || true
+[[ "$(ctl keyring action=lookup id="$pid_" --get kind)" == none ]] || fail "a deleted profile's password is still in the keyring"
+"$here/keyring" stop "$dir"
+echo "smoke-chrome: C-2/C-4 no half-save without a keyring; cleared and deleted passwords never come back"
+
+# --- Third round 5: a secret no profile can reach is deleted at the next start
+"$here/keyring" start "$dir" >/dev/null
+bid="$(python3 -I -c 'import json,sys; print([p["id"] for p in json.load(open(sys.argv[1]))["profiles"] if p["name"]=="b"][0])' "$dir/home/.config/webmux-gtk/config.json")"
+ctl -q keyring action=store id="$bid" password=bpw
+ctl -q keyring action=store id=deadbeefdeadbeef password=orphan
+[[ "$(ctl keyring action=lookup id=deadbeefdeadbeef --get kind)" == found ]] || fail "orphan not stored"
+app="$(sed -n 's/^app=//p' "$dir/pids" | tail -n1)"
+ctl -q quit
+for _ in $(seq 1 80); do kill -0 "$app" 2>/dev/null || break; sleep 0.1; done
+mv "$dir/app.log" "$dir/app.1.log"; rm -f "$dir/app.exit" "$dir/ctl.sock"
+(
+  source "$dir/env"
+  env -i PATH="$PATH" HOME="$dir/home" XDG_CONFIG_HOME="$dir/home/.config" \
+    XDG_STATE_HOME="$dir/home/.local/state" XDG_DATA_HOME="$dir/home/.local/share" \
+    XDG_CACHE_HOME="$dir/home/.cache" XDG_RUNTIME_DIR="$dir/run" LANG="${LANG:-C.UTF-8}" \
+    TERM=xterm-256color USER="${USER:-$(id -un)}" SHELL="$(command -v bash)" \
+    ${LOCALE_ARCHIVE:+LOCALE_ARCHIVE="$LOCALE_ARCHIVE"} \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$dir/run/bus" NO_AT_BRIDGE=1 GTK_A11Y=none \
+    WAYLAND_DISPLAY="$WAYLAND_DISPLAY" GDK_BACKEND=wayland WEBMUX_GTK_CONTROL="$dir/ctl.sock" \
+    WEBMUX_GTK_SLEEP_BUS=session WEBMUX_GTK_SSH="$here/fake-ssh" \
+    bash -c '"$0" >"$1/app.log" 2>&1; echo $? > "$1/app.exit"' "${WEBMUX_GTK_BIN:-$here/../zig-out/bin/webmux-gtk}" "$dir" \
+    </dev/null >/dev/null 2>&1 &
+  echo "app=$!" >> "$dir/pids"
+)
+for _ in $(seq 1 150); do "$here/wmctl" -s "$dir/ctl.sock" -q help 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 1 50); do [[ "$(ctl keyring action=lookup id=deadbeefdeadbeef --get kind)" == none ]] && break; sleep 0.1; done
+[[ "$(ctl keyring action=lookup id=deadbeefdeadbeef --get kind)" == none ]] || fail "a secret no profile refers to was kept"
+[[ "$(ctl keyring action=lookup id="$bid" --get kind)" == found ]] || fail "a profile's own password was deleted by the clean-up"
+"$here/keyring" stop "$dir"
+echo "smoke-chrome: an orphaned keyring secret is deleted at start; a profile's own is kept"
+
+# --- quit ------------------------------------------------------------------
+ctl -q page action=connect name=devbox
+until_state devbox connected 300 || fail "reconnect for quit"
+app="$(sed -n 's/^app=//p' "$dir/pids" | tail -n1)"
+ctl -q quit || fail "quit"
+for _ in $(seq 1 80); do kill -0 "$app" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$app" 2>/dev/null && fail "app still running after quit"
+for _ in $(seq 1 20); do [[ -f "$dir/app.exit" ]] && break; sleep 0.1; done
+[[ "$(cat "$dir/app.exit" 2>/dev/null)" == 0 ]] || fail "app exit status $(cat "$dir/app.exit" 2>/dev/null)"
+connlog | grep -q "client quitting connections=" || fail "no 'client quitting' line"
+pgrep -f "UNIX-LISTEN:$dir/run/webmux-gtk/" >/dev/null && fail "tunnel outlived the app"
+if grep -qiE 'panic|segmentation fault|leaked' "$dir/app.log"; then fail "crash or leak in app.log"; fi
+"$here/headless" stop "$dir"
+left="$(pgrep -af -- "$dir/" | grep -v pgrep || true)"
+[[ -z "$left" ]] || fail "processes left: $left"
+first="$dir"
+
+# --- C-3: a broken config.json is kept aside, reported, never overwritten ---
+cfg="$(mktemp -d /tmp/wm-cfg-XXXXXX)"
+mkdir -p "$cfg/webmux-gtk"
+printf '{"profiles":[{"name":"keepme","host":"h"}],,,\n' > "$cfg/webmux-gtk/config.json"
+dir="$("$here/headless" start -- WEBMUX_GTK_SSH="$here/fake-ssh" XDG_CONFIG_HOME="$cfg" | tail -n1)"
+[[ "$(conns config_banner)" == true ]] || fail "no banner for a broken config.json"
+[[ "$(conns config_problem)" == *"config.json.broken-"* ]] || fail "config problem: $(conns config_problem)"
+connlog | grep -q 'config.json unreadable error="not valid JSON"' || fail "not in the connection log"
+ctl -q screenshot path="$dir/broken-config.png"
+mk n1 badhost
+aside="$(ls "$cfg"/webmux-gtk/config.json.broken-*)"
+grep -q keepme "$aside" || fail "the broken file was not kept"
+grep -q '"n1"' "$cfg/webmux-gtk/config.json" || fail "new config not written"
+"$here/headless" stop "$dir" >/dev/null
+rm -rf "$cfg"
+left="$(pgrep -af -- "$dir/" | grep -v pgrep || true)"
+[[ -z "$left" ]] || fail "processes left: $left"
+echo "smoke-chrome: C-3 broken config kept aside, banner and log line, new file written"
+second="$dir"
+
+# --- N2 / N9: shared ids and wrong types are repaired and reported -----------
+cfg="$(mktemp -d /tmp/wm-cfg-XXXXXX)"
+mkdir -p "$cfg/webmux-gtk"
+printf '%s\n' '{"profiles":[{"name":"one","host":"hostO","id":"0123456789abcdef"},' \
+  ' {"name":"two","host":"hostT","id":"0123456789abcdef"},' \
+  ' {"name":"three","host":42,"sshPort":"0x16"}],' \
+  ' "settings":{"unfocusedFade":"lots"}}' > "$cfg/webmux-gtk/config.json"
+orig="$(cat "$cfg/webmux-gtk/config.json")"
+dir="$("$here/headless" start -- WEBMUX_GTK_SSH="$here/fake-ssh" XDG_CONFIG_HOME="$cfg" | tail -n1)"
+[[ "$(conns config_banner)" == true ]] || fail "no banner for repaired config"
+prob="$(conns config_problem)"
+[[ "$prob" == *'"one", "two" had the same id'* && "$prob" == *'"three": "host" is not text'* && "$prob" == *'"sshPort" "0x16" is not a port'* ]] || fail "repairs not reported: $prob"
+connlog | grep -q '"three\\" has no id: given one' || fail "a missing id is not reported"
+connlog | grep -q 'config.json repaired repair=' || fail "repairs not in the connection log"
+[[ "$(cat "$cfg/webmux-gtk/config.json")" == "$orig" ]] || fail "config.json rewritten before any save"
+grep -q '"0123456789abcdef"' "$cfg"/webmux-gtk/config.json.before-repair-* || fail "original not kept"
+python3 -I -c 'import json,sys; sys.exit(0 if "0123456789abcdef" in json.load(open(sys.argv[1])).get("cleared", []) else 1)' "$dir/home/.local/state/webmux-gtk/keyring.json" \
+  || fail "the shared id's password was not cleared"
+mk four hostF   # a save writes the repaired file
+ids="$(python3 -I -c 'import json,sys; p=json.load(open(sys.argv[1]))["profiles"]; print(len(p), len({x["id"] for x in p}), any(x["id"]=="0123456789abcdef" for x in p))' "$cfg/webmux-gtk/config.json")"
+[[ "$ids" == "4 4 False" ]] || fail "ids after the repair: $ids"
+"$here/headless" stop "$dir" >/dev/null
+rm -rf "$cfg"
+left="$(pgrep -af -- "$dir/" | grep -v pgrep || true)"
+[[ -z "$left" ]] || fail "processes left: $left"
+echo "smoke-chrome: N2/N9 shared ids re-issued (password cleared), wrong types repaired, reported, original kept"
+echo "smoke-chrome: OK $first $second $dir"

@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# Workspace smoke (dev mode, headless --host): the strip opens a first
+# terminal by itself, runs every pane command through the pane.* actions
+# and the chords through the window's shortcut path, checks the layout
+# after each step, drags a divider, pans, closes panes (sessions deleted
+# on the host), then quits the app, relaunches it in the same run (same
+# host, same state dir) and finds the same layout restored. Ends with
+# nothing left running.
+#
+#   src/apprt/webmux/workspace/smoke     (build first: webmux-dev/build)
+#
+# WEBMUX_HOST_BIN defaults to <webmux>/host/dist/webmux-host-linux-x64.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fork="$(cd "$here/../../../.." && pwd)"
+dev="$fork/webmux-dev"
+if [[ -z "${WEBMUX_HOST_BIN:-}" ]]; then
+  for cand in "$fork/../../host/dist/webmux-host-linux-x64" "$fork/../../../host/dist/webmux-host-linux-x64"; do
+    [[ -x "$cand" ]] && { WEBMUX_HOST_BIN="$(cd "$(dirname "$cand")" && pwd)/$(basename "$cand")"; break; }
+  done
+  export WEBMUX_HOST_BIN
+fi
+
+fail() { echo "workspace-smoke: FAIL: $*" >&2; [[ -n "${dir:-}" ]] && "$dev/headless" stop "$dir" >/dev/null 2>&1; exit 1; }
+ctl() { "$dev/wmctl" -s "$dir/ctl.sock" "$@"; }
+cmd() { ctl -q pane-command name="$1" || fail "pane-command $1"; ctl -q workspace-wait timeout_ms:=8000 || fail "not settled after $1"; }
+key() { ctl -q key key="$1" || fail "key $1"; ctl -q workspace-wait timeout_ms:=8000 || fail "not settled after key $1"; }
+host_sessions() { curl -s --unix-socket "$dir/h.sock" http://x/api/sessions | python3 -I -c 'import json,sys; print(" ".join(sorted(s["id"] for s in json.load(sys.stdin))))'; }
+
+# The layout as letters: columns separated by " | ", panes by ",", the
+# focused one starred, a full column marked "!", e.g. "A | B,C* | F".
+# Letters are assigned in order of first appearance (names file).
+shape() {
+  ctl workspace | python3 -I -c '
+import json, sys, os
+names_path = sys.argv[1]
+names = {}
+if os.path.exists(names_path):
+    for line in open(names_path):
+        k, v = line.split()
+        names[k] = v
+d = json.load(sys.stdin)["result"]
+out = []
+for c in d["columns"]:
+    ps = []
+    for p in c["panes"]:
+        if p["id"] not in names:
+            if p["kind"] == "files":
+                names[p["id"]] = "F%d" % (1 + sum(1 for n in names.values() if n.startswith("F")))
+            else:
+                names[p["id"]] = chr(ord("A") + sum(1 for n in names.values() if not n.startswith("F")))
+        ps.append(names[p["id"]] + ("*" if p["focused"] else ""))
+    out.append(",".join(ps) + ("!" if c["full"] else ""))
+with open(names_path, "w") as f:
+    for k, v in names.items():
+        f.write(k + " " + v + "\n")
+print(" | ".join(out))
+' "$dir/smoke-names"
+}
+expect() { # expect STEP SHAPE
+  local got; got="$(shape)"
+  [[ "$got" == "$2" ]] || fail "$1: expected \"$2\", got \"$got\""
+  echo "workspace-smoke: $1: $got"
+}
+# Columns with ids, weights, full and active, plus focus: what must survive a restart.
+saved_layout() {
+  ctl workspace | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)["result"]
+print(json.dumps({"focused": d["focused"], "columns": [
+  {"panes": [p["id"] for p in c["panes"]], "sizes": [round(p["weight"], 9) for p in c["panes"]],
+   "active": c["active"], "full": c["full"]} for c in d["columns"]]}, sort_keys=True))'
+}
+
+dir="$("$dev/headless" start --host | tail -n1)"
+echo "workspace-smoke: run dir $dir"
+ptyname="$(sed -n 's/^ptyname=//p' "$dir/pids")"
+"$dev/files-fixture" "$dir/host/home" "$dir/local" >/dev/null
+ctl -q resize width:=1900 height:=1150
+ctl -q workspace-wait panes:=1 timeout_ms:=10000 || fail "no first terminal (S-06)"
+# Real input below goes through the compositor: put the window at 0,0 so
+# output coordinates are window coordinates (dev mode: no header).
+"$dev/in-session" "$dir" swaymsg '[app_id="me.puntium.webmux.gtk"] move position 0 0' >/dev/null
+rp() { "$dev/realpointer" "$dir" "$@"; }
+# Real keys from a keyboard with a real XKB layout (realkeys-xkb); LAYOUT picks it.
+key() { "$dev/realkeys-xkb" "$dir" --layout "${LAYOUT:-us}" --group "${GROUP:-0}" "$1" >/dev/null || fail "realkeys-xkb $1"; ctl -q workspace-wait timeout_ms:=8000 || fail "not settled after key $1 ($LAYOUT)"; }
+# Strip box -> window coordinates (x less the scroll).
+sx() { python3 -I -c "import sys; print(int(float(sys.argv[1]) - float(sys.argv[2])))" "$1" "$(ctl workspace --get scroll)"; }
+log_since() { tail -n +"$1" "$dir/app.log"; }
+[[ "$(ctl workspace --get pane_count)" == 1 ]] || fail "expected one pane at start"
+expect "start (S-06)" "A*"
+[[ "$(host_sessions | wc -w)" == 1 ]] || fail "host should have one session"
+
+cmd new-terminal;        expect "new-terminal (L-06)" "A | B*"
+cmd new-terminal-below;  expect "new-terminal-below (L-07)" "A | B,C*"
+cmd new-files;           expect "new-files (L-08)" "A | B,C | F1*"
+[[ "$(ctl workspace --get columns.2.panes.0.placeholder)" == false ]] || fail "files pane should be the real file browser (files feature registered)"
+cmd focus-left;          expect "focus-left (L-12)" "A | B,C* | F1"
+cmd focus-up;            expect "focus-up (L-13)" "A | B*,C | F1"
+cmd focus-up;            expect "focus-up at the top (no-op)" "A | B*,C | F1"
+cmd focus-down;          expect "focus-down" "A | B,C* | F1"
+cmd move-pane-up;        expect "move-pane-up (L-17)" "A | C*,B | F1"
+cmd move-pane-up;        expect "move-pane-up at the top (no-op)" "A | C*,B | F1"
+cmd consume-expel-right; expect "consume-expel-right: expel (L-18)" "A | B | C* | F1"
+cmd consume-expel-left;  expect "consume-expel-left: merge" "A | B,C* | F1"
+cmd move-column-left;    expect "move-column-left (L-14)" "B,C* | A | F1"
+cmd move-column-left;    expect "move-column-left at the end (no-op)" "B,C* | A | F1"
+cmd move-column-right;   expect "move-column-right" "A | B,C* | F1"
+cmd move-pane-down;      expect "move-pane-down at the bottom (no-op)" "A | B,C* | F1"
+cmd focus-right;         expect "focus-right" "A | B,C | F1*"
+cmd focus-right;         expect "focus-right at the end (no-op)" "A | B,C | F1*"
+cmd focus-left;          expect "focus-left to the active pane" "A | B,C* | F1"
+cmd toggle-full;         expect "toggle-full: split out, full (L-11)" "A | B | C*! | F1"
+w="$(ctl workspace --get columns.2.width)"; [[ "$w" == 1888 ]] || fail "full column width $w, expected 1888"
+cmd toggle-full;         expect "toggle-full: back" "A | B | C* | F1"
+cmd consume-expel-left;  expect "consume-expel-left: merge" "A | B,C* | F1"
+
+# Chords as real keystrokes (K-01…K-15), matched by physical key (K-16):
+# the same keys under Russian, German (QWERTZ: [ ] are ü +) and French
+# (AZERTY) layouts as under US.
+LAYOUT=ru
+key ctrl+shift+Up;              expect "Ctrl+Shift+Up" "A | B*,C | F1"
+key ctrl+shift+j;               expect "Ctrl+Shift+J" "A | B,C* | F1"
+key ctrl+shift+alt+k;           expect "Ctrl+Shift+Alt+K" "A | C*,B | F1"
+key ctrl+shift+alt+Down;        expect "Ctrl+Shift+Alt+Down" "A | B,C* | F1"
+LAYOUT=de
+key ctrl+shift+bracketright;    expect "Ctrl+Shift+]" "A | B | C* | F1"
+key ctrl+shift+bracketleft;     expect "Ctrl+Shift+[" "A | B,C* | F1"
+key ctrl+shift+alt+l;           expect "Ctrl+Shift+Alt+L" "A | F1 | B,C*"
+key ctrl+shift+alt+Left;        expect "Ctrl+Shift+Alt+Left" "A | B,C* | F1"
+LAYOUT=fr
+key ctrl+shift+h;               expect "Ctrl+Shift+H" "A* | B,C | F1"
+key ctrl+shift+Right;           expect "Ctrl+Shift+Right" "A | B,C* | F1"
+key ctrl+shift+f;               expect "Ctrl+Shift+F" "A | B | C*! | F1"
+key ctrl+shift+f;               expect "Ctrl+Shift+F again" "A | B | C* | F1"
+LAYOUT=us,ru GROUP=1   # Russian as the second group of a US+RU setup
+key ctrl+shift+h;               expect "Ctrl+Shift+H (us,ru group 2)" "A | B* | C | F1"
+key ctrl+shift+l;               expect "Ctrl+Shift+L (us,ru group 2)" "A | B | C* | F1"
+GROUP=0; LAYOUT=fr; key ctrl+1                          # Ctrl+& on AZERTY: still host 1 (K-24)
+# The matched action, through the control socket (no Debug-only log line).
+[[ "$(ctl dump text:=false --get last_shortcut)" == app.host-1 ]] || fail "AZERTY Ctrl+1 not matched as app.host-1 ($(ctl dump text:=false --get last_shortcut))"
+# Nothing of the chords leaked into a shell as CSI-u text (audit: "6u88: command not found").
+ctl dump | grep -qE '[0-9]+;[0-9]+u' && fail "a chord reached a terminal as escape text"
+LAYOUT=us
+c_id="$(ctl workspace --get focused)"
+key ctrl+shift+w
+expect "Ctrl+Shift+W closes (L-09, L-10)" "A | B | F1*"
+for _ in $(seq 1 30); do grep -q "$c_id" <<<"$(host_sessions)" || break; sleep 0.1; done
+grep -q "$c_id" <<<"$(host_sessions)" && fail "closed pane's session still on the host (S-09)"
+key ctrl+shift+Return;          ctl -q workspace-wait panes:=4 timeout_ms:=8000 || fail "Ctrl+Shift+Return"
+expect "Ctrl+Shift+Enter" "A | B | F1 | D*"
+key ctrl+shift+alt+Return;      ctl -q workspace-wait panes:=5 timeout_ms:=8000 || fail "Ctrl+Shift+Alt+Enter"
+expect "Ctrl+Shift+Alt+Enter" "A | B | F1 | D,E*"
+key ctrl+shift+b;               expect "Ctrl+Shift+B" "A | B | F1 | D,E | F2*"
+key ctrl+shift+w;               expect "close a file browser" "A | B | F1 | D,E*"
+# A chord outside the table is not a pane command (K-17).
+key ctrl+shift+alt+w
+expect "Ctrl+Shift+Alt+W does nothing" "A | B | F1 | D,E*"
+
+# ---- Real pointer (realpointer): the gestures themselves, not handlers ----
+
+# Divider drag (L-30): it follows the pointer, holds still while the
+# pointer does (the audit saw half speed and oscillation), clamps at 110 px
+# and is saved on release.
+ctl -q workspace-wait
+dy0="$(ctl workspace --get columns.3.dividers.0.y)"; dh="$(ctl workspace --get columns.3.dividers.0.h)"
+dxs="$(sx "$(ctl workspace --get columns.3.x)")"; dxs=$((dxs + 300))
+py=$(python3 -I -c "import sys; print(int(float(sys.argv[1]) + float(sys.argv[2]) / 2))" "$dy0" "$dh")
+cmds="abs $dxs $py, down"; for i in $(seq 1 15); do cmds="$cmds, abs $dxs $((py - 10 * i))"; done
+rp $cmds
+held=""; for _ in 1 2 3; do rp abs $dxs $((py - 150)); held="$held $(ctl workspace --get columns.3.dividers.0.y)"; done
+rp up
+read -r h1 h2 h3 <<<"$held"
+[[ "$h1" == "$h2" && "$h2" == "$h3" ]] || fail "divider moves while the pointer holds still ($held)"
+python3 -I -c "import sys; sys.exit(0 if abs(float(sys.argv[1]) - (float(sys.argv[2]) - 150)) <= 4 else 1)" "$h1" "$dy0" \
+  || fail "divider did not follow the pointer: was $dy0, pointer moved 150 up, divider at $h1"
+sleep 0.5
+w0="$(ctl workspace --get columns.3.panes.0.weight)"
+grep -q "$w0" "$dir/home/.local/state/webmux-gtk/layout/dev.json" || fail "divider weights not saved on release"
+dy1="$(ctl workspace --get columns.3.dividers.0.y)"
+rp abs $dxs $((dy1 + 3)), down, abs $dxs 200, abs $dxs 20, abs $dxs 10, up
+top="$(ctl workspace --get columns.3.panes.0.box.h)"
+python3 -I -c "import sys; sys.exit(0 if float(sys.argv[1]) >= 110 else 1)" "$top" || fail "divider clamp: top pane $top px"
+echo "workspace-smoke: real divider drag: followed the pointer ($dy0 -> $h1), steady while held, saved, clamped at $top px"
+
+# A real ✕ click (S-09): pane gone, session deleted, and no "session exited"
+# in the connection log for a pane the user closed.
+key ctrl+shift+Return; ctl -q workspace-wait panes:=6 timeout_ms:=8000 || fail "new terminal for the ✕ test"
+g_id="$(ctl workspace --get focused)"
+gx="$(sx "$(ctl workspace --get columns.4.x)")"; gw="$(ctl workspace --get columns.4.width | cut -d. -f1)"
+rp abs $((gx + gw - 17)) 19, down, up
+ctl -q workspace-wait panes:=5 timeout_ms:=8000 || fail "✕ click did not close the pane"
+for _ in $(seq 1 30); do grep -q "$g_id" <<<"$(host_sessions)" || break; sleep 0.1; done
+grep -q "$g_id" <<<"$(host_sessions)" && fail "✕: session still on the host"
+# A session's exit is logged 1.2 s after its exit event (when its pane
+# closes), so wait past that. The socket's own "session socket closed (tab
+# closed or session exited)" line (G-08) is expected; the exit line is not.
+sleep 2
+connlog="$dir/home/.local/state/webmux-gtk/logs/webmux.log"
+grep "session=$g_id" "$connlog" | grep -q 'session socket closed' \
+  || fail "✕: no socket-closed line for the session in the connection log"
+grep "session=$g_id" "$connlog" | grep -q ': session exited ' \
+  && fail "✕ logged a false \"session exited\" (S-09)"
+expect "real ✕ click (S-09, L-20)" "A | B | F1 | D,E*"
+
+# Real clicks (L-20): the body of an unfocused pane, then a title bar.
+ctl -q workspace-wait
+dx="$(sx "$(ctl workspace --get columns.3.x)")"; (( dx >= 0 && dx < 1500 )) || fail "column 3 not on screen (x $dx)"
+rp abs $((dx + 300)) 70, down, up; sleep 0.3
+expect "real body click on D" "A | B | F1 | D*,E"
+[[ "$(ctl workspace --get focused)" == "$(ctl workspace --get has_keyboard_focus_in)" ]] || fail "body click: keyboard focus not in the focused pane"
+ctl -q workspace-wait
+ex="$(sx "$(ctl workspace --get columns.3.x)")"; ey="$(ctl workspace --get columns.3.panes.1.box.y | cut -d. -f1)"
+rp abs $((ex + 200)) $((ey + 12)), down, up; ctl -q workspace-wait
+[[ "$(ctl workspace --get has_keyboard_focus_in)" == "$(ctl workspace --get focused)" ]] || fail "title-bar click: keyboard focus not in the pane"
+expect "real title-bar click" "A | B | F1 | D,E*"
+
+# The strip's scrollbar (section 4: a 10 px scrollbar): the panes leave it
+# room, a real thumb drag scrolls, a click on the track pages.
+[[ "$(ctl workspace --get scrollbar)" != null ]] || fail "no scrollbar on an overflowing strip"
+h="$(ctl workspace --get columns.0.panes.0.box.h)"; [[ "$h" == 1128 ]] || fail "pane height $h with a scrollbar, expected 1150 - 10 - 12"
+s0="$(ctl workspace --get scroll)"; tx="$(ctl workspace --get scrollbar.thumb.x | cut -d. -f1)"
+rp abs $((tx + 20)) 1145, down, abs $((tx - 80)) 1145, abs $((tx - 180)) 1145, up
+s1="$(ctl workspace --get scroll)"
+python3 -I -c "import sys; sys.exit(0 if float(sys.argv[2]) < float(sys.argv[1]) - 100 else 1)" "$s0" "$s1" || fail "thumb drag: scroll $s0 -> $s1"
+rp abs 1890 1145, down, up; sleep 0.6
+s2="$(ctl workspace --get scroll)"
+python3 -I -c "import sys; sys.exit(0 if float(sys.argv[2]) > float(sys.argv[1]) else 1)" "$s1" "$s2" || fail "track click did not page: $s1 -> $s2"
+echo "workspace-smoke: scrollbar: thumb drag $s0 -> $s1, track click -> $s2"
+
+# Real wheel and touchpad (L-27): a horizontal notch pans 53 px, a vertical
+# one stays with the terminal, a two-finger swipe pans by its distance.
+ctl -q workspace-scroll dx:=-9999 dy:=0 >/dev/null
+s0="$(ctl workspace --get scroll)"
+rp abs 400 500, scroll 2 0; s1="$(ctl workspace --get scroll)"
+rp abs 400 500, scroll 0 3; s2="$(ctl workspace --get scroll)"
+rp abs 400 500, fscroll 30 0, fscroll 30 0, fscroll 30 0, fstop; s3="$(ctl workspace --get scroll)"
+python3 -I -c "import sys; a,b,c,d=map(float,sys.argv[1:]); sys.exit(0 if b-a==106 and c==b and d-c==90 else 1)" "$s0" "$s1" "$s2" "$s3" \
+  || fail "real wheel/touchpad: $s0 -> $s1 (2 notches) -> $s2 (vertical) -> $s3 (3x30 swipe)"
+echo "workspace-smoke: real wheel and swipe: $s0 -> $s1 -> $s2 -> $s3"
+
+# ---- Modals (K-18, deviation 31), with real keys ----
+# The file browser's delete confirmation: pane chords swallowed (even with
+# focus elsewhere), app chords run.
+f1="$(ctl workspace --get columns.2.panes.0.id)"
+ctl -q workspace-click id="$f1" part=bar; ctl -q workspace-wait; ctl -q files-wait 2>/dev/null || true
+key j; key d
+[[ "$(ctl files-state pane:=0 entries:=false --get confirm)" != null ]] || fail "no delete confirmation"
+key ctrl+shift+l; key ctrl+shift+Return; key ctrl+shift+w
+sleep 0.3
+[[ "$(ctl workspace --get pane_count)" == 5 ]] || fail "a pane chord ran under the confirmation"
+expect "pane chords under the file browser's confirmation" "A | B | F1* | D,E"
+# Matched (last_shortcut) yet nothing changed: swallowed, not passed on.
+[[ "$(ctl dump text:=false --get last_shortcut)" == pane.close-pane ]] || fail "chords not matched under the confirmation"
+key ctrl+shift+g; sleep 0.5
+[[ "$(ctl log-dump --get open 2>/dev/null)" == true ]] || fail "app chord (Ctrl+Shift+G) did not run under the confirmation"
+ctl -q log-close
+ctl -q files-confirm answer=cancel
+# The settings dialog (an AdwDialog takes a GTK grab): app chords run,
+# pane chords are swallowed.
+key ctrl+comma; sleep 0.5
+[[ "$(ctl settings-dump --get open)" == true ]] || fail "Ctrl+, did not open settings"
+key ctrl+shift+l; key ctrl+shift+g; sleep 0.5
+[[ "$(ctl log-dump --get open 2>/dev/null)" == true ]] || fail "app chord did not run over the settings dialog (deviation 31)"
+expect "pane chord over the settings dialog" "A | B | F1* | D,E"
+ctl -q log-close; ctl -q settings-close; sleep 0.3
+ctl -q workspace-click id="$(ctl workspace --get columns.3.panes.1.id)" part=bar; ctl -q workspace-wait
+expect "back to E" "A | B | F1 | D,E*"
+echo "workspace-smoke: modals: chords swallowed, app chords run (real keys)"
+
+# Persistence (L-40): quit, relaunch in the same run, same layout.
+ctl -q workspace-wait
+want="$(saved_layout)"
+app="$(sed -n 's/^app=//p' "$dir/pids" | tail -n1)"
+ctl -q quit || fail "quit"
+for _ in $(seq 1 50); do kill -0 "$app" 2>/dev/null || break; sleep 0.1; done
+for _ in $(seq 1 20); do [[ -f "$dir/app.exit" ]] && break; sleep 0.1; done
+[[ "$(cat "$dir/app.exit" 2>/dev/null)" == 0 ]] || fail "app exit status $(cat "$dir/app.exit" 2>/dev/null)"
+grep -qiE 'panic|segmentation fault|leaked' "$dir/app.log" && fail "crash or leak in app.log"
+file="$dir/home/.local/state/webmux-gtk/layout/dev.json"
+[[ -s "$file" ]] || fail "no layout file at $file"
+mv "$dir/app.log" "$dir/app.1.log"; rm -f "$dir/app.exit" "$dir/ctl.sock"
+# Relaunch exactly as headless did (its env file has the nested display).
+# shellcheck disable=SC1090,SC1091
+source "$dir/env"
+env -i PATH="$PATH" HOME="$dir/home" XDG_CONFIG_HOME="$dir/home/.config" \
+  XDG_STATE_HOME="$dir/home/.local/state" XDG_DATA_HOME="$dir/home/.local/share" \
+  XDG_CACHE_HOME="$dir/home/.cache" XDG_RUNTIME_DIR="$dir/run" LANG="${LANG:-C.UTF-8}" \
+  TERM=xterm-256color USER="${USER:-$(id -un)}" SHELL="$(command -v bash)" \
+  ${LOCALE_ARCHIVE:+LOCALE_ARCHIVE="$LOCALE_ARCHIVE"} \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=$dir/run/bus" NO_AT_BRIDGE=1 GTK_A11Y=none \
+  WAYLAND_DISPLAY="$WAYLAND_DISPLAY" GDK_BACKEND=wayland WEBMUX_GTK_CONTROL="$dir/ctl.sock" \
+  WEBMUX_GTK_DEV_SOCKET="$dir/h.sock" \
+  bash -c '"$0" >"$1/app.log" 2>&1; echo $? > "$1/app.exit"' "${WEBMUX_GTK_BIN:-$fork/zig-out/bin/webmux-gtk}" "$dir" \
+  </dev/null >/dev/null 2>&1 &
+echo "app=$!" >> "$dir/pids"
+for _ in $(seq 1 150); do "$dev/wmctl" -s "$dir/ctl.sock" -q help 2>/dev/null && break; sleep 0.1; done
+ctl -q resize width:=1900 height:=1150
+ctl -q workspace-wait panes:=5 timeout_ms:=10000 || fail "relaunched app did not restore 5 panes"
+got="$(saved_layout)"
+[[ "$got" == "$want" ]] || { echo "want $want" >&2; echo "got  $got" >&2; fail "layout not restored"; }
+expect "restored after restart (L-40, S-02…S-04)" "A | B | F1 | D,E*"
+[[ "$(ctl workspace --get has_keyboard_focus_in)" == "$(ctl workspace --get focused)" ]] || fail "keyboard focus not in the focused pane after restart"
+ctl -q screenshot path="$dir/restored.png"
+
+app="$(sed -n 's/^app=//p' "$dir/pids" | tail -n1)"
+ctl -q quit || fail "quit"
+for _ in $(seq 1 50); do kill -0 "$app" 2>/dev/null || break; sleep 0.1; done
+for _ in $(seq 1 20); do [[ -f "$dir/app.exit" ]] && break; sleep 0.1; done
+[[ "$(cat "$dir/app.exit" 2>/dev/null)" == 0 ]] || fail "app exit status $(cat "$dir/app.exit" 2>/dev/null) after restart"
+grep -qiE 'panic|segmentation fault|leaked' "$dir/app.log" && fail "crash or leak in app.log"
+"$dev/headless" stop "$dir"
+left="$(pgrep -af -- "$dir/|ptyhost --name $ptyname" | grep -v pgrep || true)"
+[[ -z "$left" ]] || fail "processes left: $left"
+echo "workspace-smoke: OK $dir"

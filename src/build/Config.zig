@@ -35,6 +35,10 @@ simd: bool = true,
 i18n: bool = true,
 wasm_shared: bool = true,
 
+/// webmux fork: build the webmux-gtk shell (src/apprt/webmux) instead of
+/// Ghostty's GTK shell. See WEBMUX.md.
+webmux: bool = false,
+
 /// Ghostty exe properties
 exe_entrypoint: ExeEntrypoint = .ghostty,
 version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
@@ -231,6 +235,13 @@ pub fn init(b: *std.Build, versions: Versions) !Config {
         "app-runtime",
         "The app runtime to use. Not all values supported on all platforms.",
     ) orelse ApprtRuntime.default(target.result);
+
+    // webmux fork: swaps the GTK shell for src/apprt/webmux (see WEBMUX.md).
+    config.webmux = b.option(
+        bool,
+        "webmux",
+        "Build the webmux-gtk shell instead of Ghostty's GTK shell (requires app-runtime=gtk).",
+    ) orelse false;
 
     config.renderer = b.option(
         RendererBackend,
@@ -738,6 +749,8 @@ pub fn addOptions(self: *const Config, step: *std.Build.Step.Options) !void {
     step.addOption(ExeEntrypoint, "exe_entrypoint", self.exe_entrypoint);
     step.addOption(WasmTarget, "wasm_target", self.wasm_target);
     step.addOption(bool, "wasm_shared", self.wasm_shared);
+    // webmux fork: only emitted when enabled so stock builds see identical options.
+    if (self.webmux) step.addOption(bool, "webmux", true);
 
     // Our version. We also add the string version so we don't need
     // to do any allocations at runtime. This has to be long enough to

@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# Cross-area checks of the merged application in its real flow: fake ssh
+# (webmux-dev/fake-ssh) to freshly deployed hosts, the chrome, the
+# workspace, the terminal panes and the panels together. Nothing launches
+# a browser (the URL service records), nothing touches the system bus.
+#
+#   1. connect: the registered workspace fills the host view; header
+#      buttons and the Pane menu drive pane.<command>; summaryChanged
+#      drives the title
+#   2. a second host: its own workspace and layout file; switching calls
+#      setFront both ways and keyboard focus lands in the front pane
+#   3. settings: fade and column widths change the workspace live; zoom
+#      against the width rule; light and dark restyle every area
+#   4. clipboard image synced into the front host on a host switch
+#   5. URLs: click, Shift+click (copy + toast), host-side xdg-open → chooser
+#   6. K-18: pane chords swallowed in the link chooser, a form field, the
+#      log window; app chords still work there
+#   7. tunnel killed → retry → healed; server killed → degraded → retry →
+#      healed; Restart Sessions → Workspace.reload
+#   8. quit with two hosts and three panes: clean exit, layouts saved
+#
+#   webmux-dev/smoke-integration     (build first: webmux-dev/build)
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fail() { echo "smoke-integration: FAIL: $*" >&2; [[ -n "${dir:-}" ]] && "$here/headless" stop "$dir"; exit 1; }
+ok() { echo "smoke-integration: ok  $*"; }
+ctl() { "$here/wmctl" -s "$dir/ctl.sock" "$@"; }
+get() { local cmd="$1" path="$2"; shift 2; ctl "$cmd" "$@" --get "$path"; }
+py() { python3 -I -c "import json,sys; v=json.load(sys.stdin)['result']; print($1)"; }
+until_() { # until_ TRIES CMD... (CMD exits 0)
+  local n="$1"; shift
+  for _ in $(seq 1 "$n"); do "$@" >/dev/null 2>&1 && return 0; sleep 0.2; done
+  return 1
+}
+is() { [[ "$(get "$@" 2>/dev/null | tail -n1)" == "${!#}" ]]; }
+eq() { local want="$1"; shift; [[ "$("$@" 2>/dev/null)" == "$want" ]]; }
+state() { get conns "entries.$1.state"; }
+logl() { cat "$dir/home/.local/state/webmux-gtk/logs/webmux.log"; }
+markl() { mark=$(( $(wc -l < "$dir/app.log") + 1 )); }
+newlog() { tail -n +"$mark" "$dir/app.log" | grep -qE "$1"; }
+ws() { ctl workspace index:="$1" | py "$2"; }
+
+dir="$("$here/headless" start -- WEBMUX_GTK_SSH="$here/fake-ssh" | tail -n1)"
+trap 'fail "unexpected error at line $LINENO"' ERR
+echo "smoke-integration: run dir $dir"
+
+add() { # add NAME HOST
+  ctl -q key key=ctrl+shift+o
+  ctl -q page action=new
+  ctl -q page action=set field=name value="$1"
+  ctl -q page action=set field=host value="$2"
+  ctl -q page action=submit
+}
+
+# --- 1. the workspace in the host view ----------------------------------
+add a me@a
+until_ 150 eq connected state 0 || fail "a never connected"
+until_ 50 eq workspace get conns entries.0.view || fail "host view is $(get conns entries.0.view), not the workspace"
+ctl -q workspace-wait panes:=1 timeout_ms:=10000 || fail "workspace never settled with one pane"
+ctl -q header button=new-terminal
+ctl -q workspace-wait panes:=2 timeout_ms:=10000 || fail "header + New terminal"
+ctl -q menu action=activate label="New Terminal Below"
+ctl -q workspace-wait panes:=3 timeout_ms:=10000 || fail "Pane menu › New Terminal Below"
+ctl -q menu action=activate label="Close Pane"
+ctl -q workspace-wait panes:=2 timeout_ms:=10000 || fail "Pane menu › Close Pane"
+ctl -q header button=new-files
+ctl -q workspace-wait panes:=3 timeout_ms:=10000 || fail "header + Files"
+ctl -q files-wait timeout_ms:=10000 || fail "file browser pane did not come up"
+[[ "$(get files-state home entries:=false)" == "$dir/remote/me_a" ]] || fail "file browser not on a's home"
+until_ 25 eq "webmux — 1 host · 3 panes" get conns title || fail "file browsers count in the title (A-13)"
+ctl -q menu action=activate label="Close Pane"
+ctl -q workspace-wait panes:=2 timeout_ms:=10000 || fail "closing the file browser"
+until_ 25 eq "webmux — 1 host · 2 panes" get conns title || fail "title $(get conns title)"
+ok "workspace fills the view; header and Pane menu drive pane.<command>; title follows summaryChanged"
+
+# --- 2. a second host ---------------------------------------------------------
+add b me@b
+until_ 150 eq connected state 1 || fail "b never connected"
+until_ 50 eq b get conns front || fail "b not revealed"
+ctl -q workspace-wait index:=1 panes:=1 timeout_ms:=10000 || fail "b's workspace"
+[[ "$(ws 0 'v["layout_file"]')" != "$(ws 1 'v["layout_file"]')" ]] || fail "both hosts share a layout file"
+[[ "$(ws 0 'v["front"]') $(ws 1 'v["front"]')" == "False True" ]] || fail "setFront after reveal"
+ctl -q key key=ctrl+1
+[[ "$(ws 0 'v["front"]') $(ws 1 'v["front"]')" == "True False" ]] || fail "setFront after Ctrl+1"
+[[ "$(ws 0 'v["has_keyboard_focus_in"] == v["focused"]')" == True ]] || fail "focus not in a's focused pane"
+[[ "$(ws 1 'v["has_keyboard_focus_in"]')" == None ]] || fail "b kept keyboard focus"
+ctl -q key key=ctrl+shift+o
+[[ "$(ws 0 'v["front"]')" == False ]] || fail "page in front, a still front"
+ctl -q key key=ctrl+1
+[[ "$(ws 0 'v["pane_count"]')" == 2 ]] || fail "a's workspace torn down by a page visit"
+until_ 25 eq "webmux — 2 hosts · 3 panes" get conns title || fail "title $(get conns title)"
+ok "two hosts: own workspaces and layout files; setFront both ways; focus follows; page visits keep the workspace"
+
+# --- 3. settings, zoom, scheme ------------------------------------------------------
+before="$(ws 0 'round(v["col_max"])')"
+ctl -q settings-set fade:=70 min_cols:=60 max_cols:=100
+until_ 25 eq "0.7" ws 0 '[p["fade"] for c in v["columns"] for p in c["panes"] if not p["focused"]][0]' || fail "fade not applied live"
+after="$(ws 0 'round(v["col_max"])')"
+[[ "$after" -lt "$before" ]] || fail "max width did not shrink ($before → $after)"
+cell="$(ws 0 'v["cell_px"]')"
+ctl -q key key=ctrl+equal; ctl -q key key=ctrl+equal
+until_ 25 eval '[[ "$(ws 0 "round(v[\"col_max\"])")" -gt "$after" ]]' || fail "zoom did not widen the columns (cell $cell → $(ws 0 'v["cell_px"]'))"
+ctl -q key key=ctrl+0
+until_ 25 eq "$after" ws 0 'round(v["col_max"])' || fail "zoom reset"
+# N4: on a German layout + has a key of its own: real Ctrl++ and Ctrl+-
+"$here/realkeys-xkb" "$dir" --layout de ctrl+plus >/dev/null
+until_ 25 eval '[[ "$(ws 0 "round(v[\"col_max\"])")" -gt "$after" ]]' || fail "German Ctrl++ did not zoom in"
+"$here/realkeys-xkb" "$dir" --layout de ctrl+0 >/dev/null
+until_ 25 eq "$after" ws 0 'round(v["col_max"])' || fail "German Ctrl+0 did not reset the zoom"
+grep -q '"unfocusedFade": 70' "$dir/home/.config/webmux-gtk/config.json" || fail "settings not persisted"
+for scheme in light dark; do
+  ctl -q settings-set theme="$scheme"
+  want=$([[ $scheme == light ]] && echo false || echo true)
+  until_ 25 eq "$want" get settings adw_dark || fail "$scheme: libadwaita"
+  [[ "$(get settings css_dark)" == "$want" ]] || fail "$scheme: panels CSS"
+  [[ "$(get settings app_scheme)" == "$scheme" ]] || fail "$scheme: terminal colours"
+  tree="$(get panels-tree tree window=main depth:=1)"
+  if [[ $scheme == light ]]; then [[ "$tree" == *wm-light* ]] || fail "light: chrome class"; else [[ "$tree" != *wm-light* ]] || fail "dark: chrome class"; fi
+  ctl -q screenshot path="$dir/scheme-$scheme.png"
+done
+ok "fade, widths, zoom vs the width rule live; light/dark restyle chrome, panels, terminal (screenshots scheme-*.png)"
+
+# --- 4. clipboard image on a host switch -------------------------------------------
+"$here/realkeys" "$dir" -k Shift_L
+python3 -I - "$dir/t.png" <<'EOF'
+import struct, sys, zlib
+w, h = 4, 4
+raw = b"".join(b"\0" + b"\xff\x00\x00" * w for _ in range(h))
+def chunk(t, b): return struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b))
+open(sys.argv[1], "wb").write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+EOF
+ctl -q key key=ctrl+2
+# -o: served once, to the one sync the switch back to a makes
+"$here/in-session" "$dir" wl-copy -o -t image/png < "$dir/t.png"
+sleep 0.3
+ctl -q key key=ctrl+1
+slot="$dir/remote/me_a/tmp/webmux-pastes-$(id -un)/clipboard"
+until_ 25 cmp -s "$dir/t.png" "$slot" || fail "clipboard image not in a's slot ($slot)"
+ok "a host switch mirrors the clipboard image into the front host's slot"
+
+# --- 5. URLs -------------------------------------------------------------------------
+ctl -q text text=$'echo https://ex.invalid/p\n'
+ctl -q wait contains=$'\nhttps://ex.invalid/p' || fail "echo"
+fp="$(ctl dump text:=false --get focused_pane)"
+row="$(ctl dump --get "panes.$fp.text" | grep -n '^https://ex.invalid/p' | head -n1 | cut -d: -f1 || true)"
+[[ -n "$row" ]] || fail "link line not on screen"; row=$((row - 1))
+ctl -q url-sink clear:=true
+ctl -q mouse action=click col:=4 row:="$row"
+until_ 25 eq "https://ex.invalid/p" get url-sink recorded.0.target || fail "link click not recorded"
+markl
+ctl -q mouse action=click col:=4 row:="$row" mods=shift
+until_ 25 eq "https://ex.invalid/p" get url-sink last_copied || fail "shift-click did not copy"
+until_ 25 newlog 'status: link copied' || fail "no copy toast"
+ctl -q text text=$'xdg-open https://chooser.invalid/z\n'
+until_ 50 eq true get url-chooser open || fail "host xdg-open did not open the chooser"
+[[ "$(get url-chooser url)" == "https://chooser.invalid/z" ]] || fail "chooser url"
+# Re-check N3: the chooser belongs to a's view: gone while b is in front
+# (and the keyboard works there), back when a returns.
+"$here/realkeys-xkb" "$dir" ctrl+2 >/dev/null
+until_ 25 eq false get url-chooser open || fail "a's chooser stayed over b"
+"$here/realkeys" "$dir" 'echo on-b-ok' -k Return
+until_ 25 eval '[[ "$(ws 1 "v[\"has_keyboard_focus_in\"]")" != None ]]' || fail "no keyboard focus on b with a's chooser parked"
+"$here/realkeys-xkb" "$dir" ctrl+1 >/dev/null
+until_ 25 eq true get url-chooser open || fail "a's chooser did not come back with a"
+[[ "$(get url-chooser url)" == "https://chooser.invalid/z" ]] || fail "chooser url after coming back"
+ok "link click recorded, Shift+click copied with a toast, host xdg-open → chooser, which follows its host"
+
+# --- 6. K-18 ----------------------------------------------------------------------------
+n="$(ws 0 'v["pane_count"]')"
+ctl -q key key=ctrl+shift+Return
+[[ "$(ws 0 'v["pane_count"]')" == "$n" ]] || fail "pane chord ran under the link chooser"
+ctl -q url-chooser press=cancel
+ctl -q key key=ctrl+shift+o; ctl -q page action=new
+ctl -q key key=ctrl+shift+Return
+[[ "$(get conns page.mode)" == form ]] || fail "form lost"
+ctl -q key key=ctrl+1
+[[ "$(get conns front)" == a ]] || fail "Ctrl+1 from a form field"
+[[ "$(ws 0 'v["pane_count"]')" == "$n" ]] || fail "pane chord ran from a form field"
+ctl -q key key=ctrl+shift+o; ctl -q page action=escape; ctl -q key key=ctrl+1
+ctl -q key key=ctrl+shift+g
+until_ 25 eq true get log-dump open || fail "Ctrl+Shift+G did not open the log"
+[[ "$(get log-key handled key=ctrl+shift+Return)" == none ]] || fail "log window ran a pane chord"
+[[ "$(get log-key handled key=ctrl+shift+o)" == app_shortcut && "$(get conns front)" == null ]] || fail "app chord from the log window"
+ctl -q log-key key=ctrl+1
+[[ "$(get conns front)" == a && "$(ws 0 'v["pane_count"]')" == "$n" ]] || fail "after the log window"
+ctl -q log-close
+ok "pane chords swallowed under the chooser, in a form field, in the log window; app chords work there"
+
+# --- 7. resilience ---------------------------------------------------------------------
+pkill -f "UNIX-LISTEN:$dir/run/webmux-gtk/me-a" || fail "no tunnel"
+until_ 50 eq retry state 0 || fail "no retry"
+until_ 150 eq connected state 0 || fail "retry never healed"
+[[ "$(get conns front)" == a && "$(ws 0 'v["pane_count"]')" == "$n" ]] || fail "view or panes changed on a tunnel blip"
+pkill -f "$dir/remote/me_a/.webmux/.*webmux-host serve" || fail "no server"
+until_ 50 eq degraded state 0 || fail "no degraded state (workspace offline)"
+[[ "$(get conns header.pills.0.dot)" == degraded ]] || fail "pill not degraded"
+until_ 150 eq retry state 0 || fail "dead server not given up"
+until_ 200 eq connected state 0 || fail "server restart never healed"
+until_ 100 eq False ws 0 'v["offline"]' || fail "workspace stayed offline"
+ok "tunnel blip and server restart heal in place (degraded → retry → connected)"
+ctl -q key key=ctrl+shift+o
+ctl -q page action=menu name=a; ctl -q page action=restart name=a; ctl -q page action=restart name=a
+until_ 100 eval 'logl | grep -q "reloading workspace after session restart"' || fail "no reload after Restart Sessions"
+ctl -q key key=ctrl+1
+ctl -q workspace-wait panes:=1 timeout_ms:=15000 || fail "workspace did not reconcile to a fresh session ($(ws 0 'v["pane_count"]'))"
+ok "Restart Sessions → Workspace.reload → one fresh session"
+
+# --- 2b. status messages follow the front host (iface.services.status) ----------
+# A real host message: OSC 52 in a's terminal toasts "clipboard set from
+# terminal" (or "could not write …") with a's name. It fires while b is in
+# front, so it is held, and shows when a comes back within its 3 s. Late in
+# the run: the app then owns CLIPBOARD, and (headless) GTK stops seeing
+# outside wl-copy changes while the window keeps focus (Known gaps).
+toast_text() { get status-dump text; }
+toast_up() { [[ "$(get status-dump visible)" == true ]]; }
+ctl -q key key=ctrl+1
+ctl -q text text='clear; sleep 1.5; printf "\\033]52;c;aGk=\\007"\n'
+ctl -q key key=ctrl+2
+sleep 2.2
+toast_up && fail "a's status message shown while b is in front ($(toast_text))"
+ctl -q key key=ctrl+1
+until_ 10 toast_up || fail "a's held message not shown when a came back to the front"
+[[ "$(toast_text)" == *"from terminal"* || "$(toast_text)" == *"write to the clipboard"* ]] || fail "toast says [$(toast_text)]"
+ctl -q key key=ctrl+2
+toast_up && fail "a's message stayed up after a went behind"
+ctl -q status text='app-wide message'
+toast_up || fail "an app-wide message did not show"
+sleep 3.3
+ok "status messages: a host behind is held and shown at its return, hidden when it goes behind; app-wide always"
+ctl -q key key=ctrl+1
+
+# --- 8. quit with two hosts ------------------------------------------------------------
+ctl -q key key=ctrl+2; ctl -q header button=new-terminal
+ctl -q workspace-wait index:=1 panes:=2 timeout_ms:=10000 || fail "b second pane"
+want_b="$(ws 1 'len([p for c in v["columns"] for p in c["panes"]])')"
+app="$(sed -n 's/^app=//p' "$dir/pids")"
+ctl -q quit || fail quit
+for _ in $(seq 1 80); do kill -0 "$app" 2>/dev/null || break; sleep 0.1; done
+for _ in $(seq 1 20); do [[ -f "$dir/app.exit" ]] && break; sleep 0.1; done
+[[ "$(cat "$dir/app.exit" 2>/dev/null)" == 0 ]] || fail "exit status $(cat "$dir/app.exit" 2>/dev/null)"
+logl | grep -q "client quitting connections=2" || fail "no 'client quitting connections=2'"
+lb="$(ls "$dir"/home/.local/state/webmux-gtk/layout/me-b-*.json)"
+[[ "$(python3 -I -c 'import json,sys; print(sum(len(c["panes"]) for c in json.load(open(sys.argv[1]))["columns"]))' "$lb")" == "$want_b" ]] || fail "b's layout not saved with its panes"
+if grep -qiE 'panic|segmentation fault|leaked' "$dir/app.log"; then fail "crash or leak in app.log"; fi
+"$here/headless" stop "$dir"
+left="$(pgrep -af -- "$dir/" | grep -v pgrep || true)"
+[[ -z "$left" ]] || fail "processes left: $left"
+ok "quit with two hosts: exit 0, layouts saved, nothing left"
+echo "smoke-integration: OK $dir"

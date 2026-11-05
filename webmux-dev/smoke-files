@@ -1,0 +1,754 @@
+#!/usr/bin/env bash
+# End-to-end check of the file-browser pane in dev mode against an
+# isolated host (headless --host): the pane lives in the workspace, as in
+# the app. Its saved state comes from a layout file written before the
+# start (the run's XDG_STATE_HOME points at a scratch dir for that); a
+# throwaway HOME is populated by webmux-dev/files-fixture, then
+# the smoke navigates (keys, clicks, cursor memory), previews every kind
+# (text, markdown rendered/source, image, zip tree, binary, other, error),
+# renames (real keystrokes into the inline field), deletes (confirmation),
+# uploads (drop of a file + a folder tree, paste of an image from the real
+# clipboard), downloads (to a path, and through the real save dialog with
+# real keystrokes), checks every result on disk, sees an outside change
+# arrive over the watch stream, restores a saved state, quits cleanly and
+# checks nothing of the run is left.
+#
+# The headless seat has no pointer and no file manager: clicks and drops
+# go through the control socket (files-click, files-drop), which enter at
+# the functions the GTK handlers call. Screenshots land in the run dir.
+#
+#   webmux-dev/smoke-files      (build first: webmux-dev/build)
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fork="$(cd "$here/.." && pwd)"
+: "${WEBMUX_HOST_BIN:=$(cd "$fork/../.." && pwd)/host/dist/webmux-host-linux-x64}"
+[[ -x "$WEBMUX_HOST_BIN" ]] || WEBMUX_HOST_BIN="$(cd "$fork/../../.." && pwd)/host/dist/webmux-host-linux-x64"
+export WEBMUX_HOST_BIN
+
+# GtkFileChooser aborts the app without its GSettings schema; the headless
+# environment has none, so hand it GTK's own (the one the binary links).
+gtklib="$(nix develop "$fork" --accept-flake-config -c pkg-config --variable=libdir gtk4 2>/dev/null | tail -n1)"
+schemas="$(ls -d "${gtklib%/lib}"/share/gsettings-schemas/*/glib-2.0/schemas 2>/dev/null | head -n1 || true)"
+
+fail() {
+  echo "smoke-files: FAIL: $*" >&2
+  [[ -n "${statedir:-}" ]] && echo "smoke-files: state dir kept: $statedir" >&2
+  if [[ -n "${dir:-}" ]]; then chmod 755 "$dir/host/home/noperm" 2>/dev/null || true; "$here/headless" stop "$dir" >/dev/null 2>&1; fi
+  exit 1
+}
+ctl() { "$here/wmctl" -s "$dir/ctl.sock" "$@"; }
+idle() { ctl -q files-wait timeout_ms:=15000 || fail "browser never went idle ($*)"; }
+st() { ctl files-state entries:=false --get "$1"; }
+pv() { # pv FIELD: a field of the preview column
+  ctl files-state entries:=false | python3 -I -c '
+import json, sys
+cols = json.load(sys.stdin)["result"]["columns"]
+p = [c for c in cols if c["kind"] == "preview" and not c["leaving"]]
+v = p[0]["preview"].get(sys.argv[1]) if p else None
+print(json.dumps(v) if not isinstance(v, str) else v)' "$1"
+}
+entries() { # entries COLUMN: names in that column
+  ctl files-state limit:=3000 | python3 -I -c '
+import json, sys
+c = json.load(sys.stdin)["result"]["columns"][int(sys.argv[1])]
+print("\n".join(e["name"] for e in c.get("entries") or []))' "$1"
+}
+open_() { ctl -q files-open dir="$1" cursor="$2"; idle "open $2"; }
+expect() { [[ "$1" == "$2" ]] || fail "$3: expected '$2', got '$1'"; }
+status_seen() { grep -qF "status: $1" "$dir/app.log" || fail "no status '$1'"; }
+
+# The workspace's layout file for the dev connection (slug "dev"): one
+# file-browser pane with a saved {dir, cursor} (F-01/F-02 through the
+# workspace's persistence).
+statedir="$(mktemp -d /tmp/wm-files-state-XXXXXX)"
+mkdir -p "$statedir/webmux-gtk/layout"
+state_file="$statedir/webmux-gtk/layout/dev.json"
+echo '{"version":1,"columns":[{"panes":["files-a"],"sizes":[1],"active":"files-a","full":false}],"focused":"files-a","widgets":{"files-a":{"type":"files","dir":"/","cursor":"tmp"}}}' > "$state_file"
+# N1: GTK's chooser records saves in the desktop-wide recently-used.xbel
+# (the run's own XDG_DATA_HOME, never the real one). Another application's
+# entry is there before the app starts, as on a desktop; it must survive
+# every download, and the file must stay valid.
+xbel="$statedir/data/recently-used.xbel"
+mkdir -p "$(dirname "$xbel")"
+# Dated now: GTK drops entries older than gtk-recent-files-max-age (30 days).
+now="$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)"
+cat > "$xbel" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<xbel version="1.0"
+      xmlns:bookmark="http://www.freedesktop.org/standards/desktop-bookmarks"
+      xmlns:mime="http://www.freedesktop.org/standards/shared-mime-info"
+>
+  <bookmark href="file:///home/someone/important-report.odt" added="$now" modified="$now" visited="$now">
+    <info>
+      <metadata owner="http://freedesktop.org">
+        <mime:mime-type type="application/vnd.oasis.opendocument.text"/>
+        <bookmark:applications>
+          <bookmark:application name="LibreOffice" exec="&apos;soffice %u&apos;" modified="$now" count="1"/>
+        </bookmark:applications>
+      </metadata>
+    </info>
+  </bookmark>
+</xbel>
+EOF
+extra=("XDG_STATE_HOME=$statedir")
+extra+=("XDG_DATA_HOME=$statedir/data")
+[[ -n "$schemas" ]] && extra+=("GSETTINGS_SCHEMA_DIR=$schemas")
+dir="$("$here/headless" start --host -- "${extra[@]}" | tail -n1)"
+echo "smoke-files: run dir $dir"
+ptyname="$(sed -n 's/^ptyname=//p' "$dir/pids")"
+H="$dir/host/home"
+L="$dir/local"
+
+# Restored state (F-02): the saved {dir, cursor} came back.
+ctl -q workspace-wait panes:=1 timeout_ms:=15000 || fail "the workspace never restored the files pane"
+idle start
+expect "$(st dir)" "/" "restored dir"
+expect "$(st cursor)" "tmp" "restored cursor"
+
+"$here/files-fixture" "$H" "$L" >/dev/null
+ctl -q files-focus # focus from outside re-lists everything (F-61)
+open_ "$H" "deep"
+expect "$(st title)" "~/deep" "title"
+
+# --- navigation -------------------------------------------------------------
+ctl -q files-key key=l; idle l
+expect "$(st cursor)" "level1" "enter picks the first entry"
+ctl -q files-key key=Right; idle Right
+ctl -q files-key key=h; idle h
+ctl -q files-key key=h; idle h
+expect "$(st cursor)" "deep" "left puts the cursor on the dir just left"
+open_ "$H" "notes"
+ctl -q files-key key=l; idle l
+expect "$(st cursor)" "plain.txt" "first entry"
+ctl -q files-key key=j; idle j
+ctl -q files-key key=h; idle h
+ctl -q files-key key=l; idle l
+expect "$(st cursor)" "todo.md" "cursor memory (F-13)"
+open_ "$H" "deep"
+ctl -q files-key key=Up; idle Up
+ctl -q files-key key=Up; idle Up
+expect "$(st cursor)" "deep" "up clamps at the first entry"
+ncols="$(ctl files-state entries:=false | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)["result"]["columns"]))')"
+ctl -q files-click column:=$((ncols - 2)) row:=1; idle click
+expect "$(st cursor)" "emptydir" "row click"
+echo "smoke-files: navigation ok"
+
+# --- previews (F-30…F-41) ----------------------------------------------------
+check_preview() { # name kind narrow
+  open_ "$H" "$1"
+  expect "$(pv kind)" "$2" "$1 kind"
+  expect "$(pv narrow)" "$3" "$1 narrow"
+}
+check_preview big.txt text false
+expect "$(pv truncated)" "true" "big.txt truncated"
+expect "$(pv text_len)" "65536" "big.txt 64 KiB"
+check_preview fake.zip text false
+check_preview archive.zip zip false
+expect "$(pv zip_rows)" "6" "zip rows"
+check_preview bin.dat binary true
+check_preview pipe other true
+expect "$(pv has_download)" "false" "no download for other"
+check_preview README.md text false
+expect "$(pv markdown)" "rendered" "markdown rendered by default"
+expect "$(pv md_images_loaded)" "2" "markdown images"
+ctl -q screenshot path="$dir/markdown.png"
+ctl -q files-click target=source; idle source
+expect "$(pv markdown)" "source" "source view"
+open_ "$H/notes" "todo.md"
+expect "$(pv markdown)" "source" "the choice sticks across files"
+ctl -q files-click target=rendered; idle rendered
+expect "$(pv markdown)" "rendered" "rendered again"
+for img in logo.png sample.jpg sample.gif sample.bmp sample.ico sample.svg; do
+  [[ -e "$H/img/$img" ]] || continue
+  open_ "$H/img" "$img"
+  [[ "$(pv image)" == *'"w"'* ]] || fail "$img did not decode ($(pv image))"
+done
+open_ "$H" "noperm"
+expect "$(ctl files-state entries:=false | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["result"]["columns"][-1]["error_code"])')" "EACCES" "error column"
+open_ "$H" "wide"
+open_ "$H/wide" "file-0000.txt"
+[[ "$(ctl files-state entries:=false | python3 -I -c 'import json,sys; c=json.load(sys.stdin)["result"]["columns"]; print([x for x in c if x["key"].endswith("/wide")][0]["truncated"])')" == True ]] || fail "wide listing not truncated"
+open_ "$H" "big.txt"
+ctl -q files-click target=preview
+[[ "$(st drilled)" == "$H/big.txt" ]] || fail "click did not drill"
+ctl -q files-key key=j
+expect "$(pv scroll_y)" "48" "drilled j scrolls 48 px"
+ctl -q files-key key=Escape
+expect "$(st drilled)" "null" "escape leaves drilled"
+echo "smoke-files: previews ok"
+
+# --- links (F-38) ---------------------------------------------------------------
+open_ "$H" "README.md"
+ctl -q files-link href=notes/todo.md; idle link
+expect "$(st dir)/$(st cursor)" "$H/notes/todo.md" "relative link"
+ctl -q files-link href=ftp://x/y
+status_seen "can't open ftp://x/y"
+
+# --- rename (F-50), real keystrokes -----------------------------------------------
+open_ "$H" "rename-me.txt"
+ctl -q files-key key=r
+expect "$(ctl files-state entries:=false --get rename.selection)" "$(printf '[\n  0,\n  9\n]')" "stem preselected"
+# K-18: a pane chord while the rename field has focus is swallowed.
+np="$(ctl workspace --get pane_count)"
+ctl -q key key=ctrl+shift+Return
+[[ "$(ctl dump --get last_shortcut)" == pane.new-terminal ]] || fail "chord not seen"
+[[ "$(ctl workspace --get pane_count)" == "$np" ]] || fail "pane chord ran while renaming"
+[[ "$(ctl files-state entries:=false --get rename.selection)" != null ]] || fail "rename field closed by the chord"
+"$here/realkeys" "$dir" renamed -k Return
+for _ in $(seq 1 50); do [[ -e "$H/renamed.txt" ]] && break; sleep 0.1; done
+[[ -e "$H/renamed.txt" && ! -e "$H/rename-me.txt" ]] || fail "rename on disk"
+idle rename
+expect "$(st cursor)" "renamed.txt" "cursor on the new name"
+status_seen "renamed rename-me.txt → renamed.txt"
+ctl -q files-key key=F2
+ctl -q files-rename text=lower.txt; idle conflict
+status_seen "rename failed: name already taken"
+echo "smoke-files: rename ok"
+
+# --- delete (F-52, F-53) --------------------------------------------------------------
+open_ "$H" "to-delete.txt"
+ctl -q files-key key=d
+expect "$(st confirm)" "Delete “to-delete.txt”?" "confirm text"
+ctl -q screenshot path="$dir/confirm.png"
+ctl -q files-confirm answer=escape
+[[ -e "$H/to-delete.txt" ]] || fail "escape deleted"
+ctl -q files-key key=BackSpace # A-17
+"$here/realkeys" "$dir" -k Return # Delete has initial focus
+for _ in $(seq 1 50); do [[ -e "$H/to-delete.txt" ]] || break; sleep 0.1; done
+[[ ! -e "$H/to-delete.txt" ]] || fail "file not deleted"
+idle delete
+status_seen "deleted to-delete.txt"
+open_ "$H" "folder-to-delete"
+ctl -q files-key key=Delete
+expect "$(st confirm)" "Delete folder “folder-to-delete” and everything in it?" "folder confirm"
+ctl -q files-confirm answer=delete; idle delete2
+[[ ! -e "$H/folder-to-delete" ]] || fail "folder not deleted"
+echo "smoke-files: delete ok"
+
+# --- uploads (F-54, F-56, F-57) ---------------------------------------------------------
+open_ "$H" "uploads"
+ctl -q files-drop "paths:=[\"$L/single.txt\",\"$L/tree\"]" column:=$((ncols - 1)); idle upload
+[[ -f "$H/uploads/single.txt" && -f "$H/uploads/tree/top.txt" && -f "$H/uploads/tree/sub/deep.txt" ]] || fail "uploaded files"
+[[ ! -e "$H/uploads/tree/empty-sub" ]] || fail "empty folder was recreated"
+cmp -s "$L/tree/sub/deep.txt" "$H/uploads/tree/sub/deep.txt" || fail "upload content"
+status_seen "uploaded 3 file(s) → $H/uploads"
+# Elsewhere in the browser: the rightmost directory (the cursor is on tree/).
+ctl -q files-drop "paths:=[\"$L/single.txt\"]" target=browser; idle upload2
+[[ -f "$H/uploads/tree/single.txt" ]] || fail "drop on the browser: rightmost dir"
+ctl -q files-drop "paths:=[\"$L/single.txt\"]" column:=$((ncols - 1)); idle upload3
+[[ -f "$H/uploads/single (1).txt" ]] || fail "collision rename"
+"$here/in-session" "$dir" sh -c "wl-copy -t image/png < '$L/pasted.png'"
+for _ in 1 2 3 4 5; do
+  sleep 0.5
+  ctl -q files-paste
+  for _ in $(seq 1 20); do [[ -e "$H/uploads/image.png" ]] && break; sleep 0.1; done
+  [[ -e "$H/uploads/image.png" ]] && break
+done
+# GDK re-encodes the clipboard image (as Chromium does): compare its size.
+[[ "$(python3 -I -c 'import struct,sys; d=open(sys.argv[1],"rb").read(24); print(d[:8]==b"\x89PNG\r\n\x1a\n", struct.unpack(">II", d[16:24]))' "$H/uploads/image.png")" == "True (40, 40)" ]] || fail "pasted image"
+idle paste
+echo "smoke-files: uploads ok"
+
+# --- downloads (F-55) -------------------------------------------------------------------------
+mkdir -p "$dir/dl"
+# N1: GTK's chooser records saves in recently-used.xbel, seeded (with
+# another application's entry) before the start: see the top.
+xbel_check() { # xbel_check FILE...: valid XML, the foreign entry kept, one entry per saved file
+  python3 -I - "$xbel" "$@" <<'EOF'
+import sys, xml.dom.minidom
+doc = xml.dom.minidom.parse(sys.argv[1])
+marks = {b.getAttribute("href"): b for b in doc.getElementsByTagName("bookmark")}
+assert any("important-report.odt" in h for h in marks), "foreign entry lost"
+for f in sys.argv[2:]:
+    m = [b for h, b in marks.items() if h.endswith("/" + f)]
+    assert m, "no entry for " + f
+    apps = m[0].getElementsByTagName("bookmark:application")
+    assert apps and apps[0].getAttribute("exec").strip("'").startswith("webmux-gtk"), "bad exec: %r" % (apps[0].getAttribute("exec") if apps else None)
+print("ok")
+EOF
+}
+# Final check item 2: with no folder remembered for the connection yet,
+# the first save dialog opens in the download folder, else the home folder
+# (here the run's throwaway home, which has no Downloads), never the app's
+# working directory. Return accepts the prefilled name where it opened.
+if [[ -n "$schemas" ]]; then
+  open_ "$H" "lower.txt"
+  ctl -q files-key key=shift+D; sleep 2
+  "$here/in-session" "$dir" swaymsg -t get_tree | grep -q '"name": "Save file"' || fail "no save dialog"
+  "$here/realkeys" "$dir" -k Return
+  for _ in $(seq 1 50); do [[ -e "$dir/home/lower.txt" ]] && break; sleep 0.1; done
+  cmp -s "$H/lower.txt" "$dir/home/lower.txt" || fail "first save dialog did not open in the home folder ($(st last_dialog_folder))"
+  [[ ! -e "$fork/lower.txt" && ! -e "$PWD/lower.txt" ]] || fail "first save went to the working directory"
+  [[ "$(st last_dialog_folder)" == "$dir/home" ]] || fail "first dialog folder: $(st last_dialog_folder)"
+fi
+open_ "$H" "archive.zip"
+ctl -q files-download dest="$dir/dl/archive.zip"
+for _ in $(seq 1 50); do [[ -e "$dir/dl/archive.zip" ]] && break; sleep 0.1; done
+cmp -s "$H/archive.zip" "$dir/dl/archive.zip" || fail "download content"
+connlog="$statedir/webmux-gtk/logs/webmux.log"   # the engine's connection log
+for _ in $(seq 1 30); do grep -q 'download saved file=archive.zip' "$connlog" && break; sleep 0.1; done
+grep -q 'download saved file=archive.zip' "$connlog" || fail "download saved log"
+ctl -q files-download cancel:=true
+for _ in $(seq 1 30); do grep -q 'download cancelled' "$connlog" && break; sleep 0.1; done
+grep -q 'download cancelled file=archive.zip' "$connlog" || fail "download cancelled log"
+if [[ -n "$schemas" ]]; then
+  open_ "$H" "big.txt"
+  ctl -q files-key key=shift+D # opens the real save dialog
+  sleep 2
+  "$here/in-session" "$dir" swaymsg -t get_tree | grep -q '"name": "Save file"' || fail "no save dialog"
+  "$here/realkeys-xkb" "$dir" ctrl+a >/dev/null
+  "$here/realkeys" "$dir" "$dir/dl/saved.txt" -k Return
+  for _ in $(seq 1 50); do [[ -e "$dir/dl/saved.txt" ]] && break; sleep 0.1; done
+  cmp -s "$H/big.txt" "$dir/dl/saved.txt" || fail "dialog download"
+  sleep 0.5
+  [[ "$(xbel_check saved.txt 2>&1)" == ok ]] || fail "N1: recently-used.xbel after one download: $(xbel_check saved.txt 2>&1 | tail -1)"
+  # A second dialog download (the one that used to wipe the other entries).
+  open_ "$H" "lower.txt"
+  ctl -q files-key key=shift+D; sleep 2
+  "$here/realkeys-xkb" "$dir" ctrl+a >/dev/null
+  "$here/realkeys" "$dir" "$dir/dl/saved2.txt" -k Return
+  for _ in $(seq 1 50); do [[ -e "$dir/dl/saved2.txt" ]] && break; sleep 0.1; done
+  cmp -s "$H/lower.txt" "$dir/dl/saved2.txt" || fail "second dialog download"
+  sleep 0.5
+  [[ "$(xbel_check saved.txt saved2.txt 2>&1)" == ok ]] || fail "N1: recently-used.xbel after two downloads: $(xbel_check saved.txt saved2.txt 2>&1 | tail -1)"
+  grep -q "g_markup_escape_text" "$dir/app.log" && fail "N1: GLib assertion in app.log"
+  grep -q "download dir \[dev\]: $dir/dl" "$dir/app.log" || fail "download folder not remembered"
+fi
+ctl -q files-key key=Up; idle
+open_ "$H" "img"
+ctl -q files-key key=shift+D
+status_seen "select a file to download"
+echo "smoke-files: downloads ok"
+
+# --- live listing (F-59) -------------------------------------------------------------------------
+open_ "$H/notes" "plain.txt"
+touch "$H/notes/from-outside.txt"
+for _ in $(seq 1 30); do entries "$((ncols - 1))" | grep -qx from-outside.txt && break; sleep 0.1; done
+entries "$((ncols - 1))" | grep -qx from-outside.txt || fail "outside change not shown"
+echo "smoke-files: watch ok"
+
+# --- fix round (gtk/audit/files.md): each check would have caught its defect ---
+# Real pointer input goes through the compositor (webmux-dev/realpointer);
+# files-locate gives window coordinates, the window's place comes from sway.
+read -r wx wy < <("$here/in-session" "$dir" swaymsg -t get_tree | python3 -I -c '
+import json, sys
+def walk(n):
+    if n.get("app_id") == "me.puntium.webmux.gtk": print(n["rect"]["x"], n["rect"]["y"]); sys.exit(0)
+    for k in n.get("nodes", []) + n.get("floating_nodes", []): walk(k)
+walk(json.load(sys.stdin))')
+rp() { "$here/realpointer" "$dir" "$@" >/dev/null 2>&1; }
+at() { # at WHAT [DX]: output coordinates of a thing (centre, or its left edge + DX)
+  ctl files-locate what="$1" | python3 -I -c '
+import json, sys
+r = json.load(sys.stdin)["result"]; dx = sys.argv[3]
+x = r["x"] - r["w"] / 2 + int(dx) if dx else r["x"]
+print(int(x) + int(sys.argv[1]), r["y"] + int(sys.argv[2]))' "$wx" "$wy" "${2:-}"
+}
+click_at() { local x y; read -r x y < <(at "$@"); rp abs $((x - 4)) "$y", sleep 30, abs "$x" "$y", sleep 30, down, sleep 40, up, sleep 200; }
+f63() { ctl files-state entries:=false | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)["result"]; h = d["hscroll"]; cols = [c for c in d["columns"] if not c["leaving"]]
+right = cols[-1]["x"] + cols[-1]["target_width"]
+cur = [c for c in cols if c.get("highlight_kind") == "cursor"]
+ok = abs(h["value"] - h["target"]) < 1.5 and (right <= h["page"] + 1.5 or (cur and abs(cur[0]["x"]) < 1.5 and not d["drilled"]))
+print("OK" if ok else "BAD value=%.0f target=%.0f page=%.0f right=%.0f" % (h["value"], h["target"], h["page"], right))'; }
+
+# D2: a download never replaces anything but the file the user chose.
+echo precious > "$dir/dl/out.txt.part"
+open_ "$H" "lower.txt"
+ctl -q files-download dest="$dir/dl/out.txt"
+for _ in $(seq 1 50); do [[ -e "$dir/dl/out.txt" ]] && break; sleep 0.1; done
+cmp -s "$H/lower.txt" "$dir/dl/out.txt" || fail "D2: download content"
+[[ "$(cat "$dir/dl/out.txt.part")" == precious ]] || fail "D2: an existing .part file was destroyed"
+[[ -z "$(ls -A "$dir/dl" | grep webmux-part || true)" ]] || fail "D2: temporary file left behind"
+
+# N5: any name the remote side can hold downloads (240 bytes here; the
+# temporary name used to exceed the 255-byte limit).
+long="$(python3 -I -c 'print("l" * 236 + ".txt")')"
+echo "long name" > "$H/$long"
+sleep 1; idle new-file # the watch lists it (a fresh cached listing would not)
+open_ "$H" "$long"
+ctl -q files-download dest="$dir/dl/$long"
+for _ in $(seq 1 50); do [[ -e "$dir/dl/$long" ]] && break; sleep 0.1; done
+cmp -s "$H/$long" "$dir/dl/$long" || fail "N5: a 240-byte name did not download"
+# N6: a failure says why.
+mkdir -p "$dir/dl-ro" "$dir/dl/a-folder"; chmod 555 "$dir/dl-ro"
+open_ "$H" "lower.txt"
+ctl -q files-download dest="$dir/dl-ro/x.txt"
+for _ in $(seq 1 50); do grep -q "status: download failed: lower.txt: permission denied" "$dir/app.log" && break; sleep 0.1; done
+status_seen "download failed: lower.txt: permission denied"
+ctl -q files-download dest="$dir/dl/a-folder"
+for _ in $(seq 1 50); do grep -q "download failed: lower.txt: a folder has that name" "$dir/app.log" && break; sleep 0.1; done
+status_seen "download failed: lower.txt: a folder has that name"
+ctl -q files-download dest="$dir/dl/$(python3 -I -c 'print("n" * 260)')"
+for _ in $(seq 1 50); do grep -q "download failed: lower.txt: name too long for the target folder" "$dir/app.log" && break; sleep 0.1; done
+status_seen "download failed: lower.txt: name too long for the target folder"
+[[ -z "$(ls -A "$dir/dl-ro")" ]] || fail "N6: something was written to the read-only folder"
+[[ -z "$(ls -A "$dir/dl/a-folder")" ]] || fail "N6: the folder's contents changed"
+[[ -z "$(ls -A "$dir/dl" | grep webmux-part || true)" ]] || fail "N6: temporary file left behind"
+chmod 755 "$dir/dl-ro"
+
+# Real pointer: a row click, the row buttons, the backdrop (F-10, F-11, F-52).
+open_ "$H" "README.md"
+click_at row:big.txt; idle row-click
+expect "$(st cursor)" "big.txt" "real click on a row"
+click_at act-rename
+[[ "$(st rename)" != null ]] || fail "real click on ✎ did not open the rename field"
+"$here/realkeys" "$dir" -k Escape; idle rename-esc
+click_at act-delete
+expect "$(st confirm)" "Delete “big.txt”?" "real click on ✕"
+click_at backdrop
+expect "$(st confirm)" "null" "real click on the backdrop"
+[[ -e "$H/big.txt" ]] || fail "backdrop click deleted"
+
+# D5: Tab stays inside the confirmation; Escape still closes it.
+"$here/realkeys" "$dir" d; sleep 0.3
+"$here/realkeys" "$dir" -k Tab; sleep 0.2
+[[ "$(st confirm)" != null ]] || fail "D5: Tab closed the confirmation"
+[[ "$(st focus_widget)" == button ]] || fail "D5: Tab moved focus out of the confirmation ($(st focus_widget))"
+"$here/realkeys" "$dir" -k Escape; sleep 0.3
+expect "$(st confirm)" "null" "D5: Escape after Tab"
+[[ -e "$H/big.txt" ]] || fail "D5: Tab+Escape deleted"
+# Item 7: the confirmation never stays behind when focus leaves the pane.
+"$here/realkeys" "$dir" d; sleep 0.3
+ctl -q pane-command name=new-terminal # takes the focus
+ctl -q workspace-wait panes:=2 timeout_ms:=15000 || fail "no second pane"
+sleep 0.3
+expect "$(st confirm)" "null" "confirmation left behind after focus moved away"
+ctl -q pane-command name=close-pane
+ctl -q workspace-wait panes:=1 timeout_ms:=15000 || fail "terminal pane not closed"
+sleep 0.3
+[[ -e "$H/big.txt" ]] || fail "focus change deleted"
+
+# Real pointer on the preview header: Source / Rendered, ⤓ (F-32, F-35), a
+# click in the body drills in (F-43); wheel and touchpad in the preview.
+open_ "$H" "README.md"
+click_at source; idle source-click
+expect "$(pv markdown)" "source" "real click on Source"
+click_at rendered; idle rendered-click
+expect "$(pv markdown)" "rendered" "real click on Rendered"
+if [[ -n "$schemas" ]]; then
+  click_at download; sleep 2
+  "$here/in-session" "$dir" swaymsg -t get_tree | grep -q '"name": "Save file"' || fail "real click on ⤓: no save dialog"
+  ctl -q files-dialog-cancel; sleep 0.5
+  grep -q 'recently used' "$dir/app.log" && fail "D7: recently-used warning"
+fi
+open_ "$H" "big.txt"
+read -r bx by < <(at preview-body)
+rp abs $((bx - 3)) "$by", sleep 30, abs "$bx" "$by", sleep 30, scroll 0 2, sleep 300
+y1="$(pv scroll_y)"
+awk "BEGIN { exit !($y1 > 0) }" || fail "wheel over the preview did not scroll it"
+rp abs "$bx" "$by", sleep 30, fscroll 0 100, sleep 30, fstop, sleep 600
+y2="$(pv scroll_y)"
+awk "BEGIN { d = $y2 - $y1; exit !(d > 98 && d < 102) }" || fail "100 px of touchpad scrolled $y1 → $y2 (kinetic/step)"
+click_at preview-body
+expect "$(st drilled)" "$H/big.txt" "real click in the preview drills in"
+
+# F-42: a refresh of the same file keeps the reader's place (watch event,
+# focus refresh, twice in a row).
+"$here/realkeys" "$dir" -k Page_Down; sleep 0.3
+y0="$(pv scroll_y)"
+touch "$H/x-refresh-1"; sleep 0.8; idle refresh
+ctl -q files-focus; ctl -q files-focus; idle refocus
+expect "$(pv scroll_y)" "$y0" "F-42: preview scroll after refreshes"
+"$here/realkeys" "$dir" -k Escape
+# ... and when the file's own content changes (editing, a growing log):
+# kept while the content reaches it, else as far as it allows.
+seq 400 > "$H/grow.txt"
+sleep 1; idle new-file
+open_ "$H" "grow.txt"
+read -r gx gy < <(at preview-body)
+rp abs $((gx - 3)) "$gy", sleep 30, abs "$gx" "$gy", sleep 30, scroll 0 5, sleep 300
+g0="$(pv scroll_y)"
+awk "BEGIN { exit !($g0 > 100) }" || fail "F-42: wheel did not scroll grow.txt ($g0)"
+for i in $(seq 1 8); do
+  echo "appended $i" >> "$H/grow.txt"; sleep 0.$((RANDOM % 6 + 3)); idle "grow $i"
+  [[ $i == 4 ]] && { ctl -q files-focus; idle "grow-focus"; }
+  expect "$(pv scroll_y)" "$g0" "F-42: scroll after the open file changed ($i)"
+done
+seq 60 > "$H/grow.txt"; sleep 1; idle shrink
+python3 -I -c 'import json,sys; p=[c["preview"] for c in json.load(sys.stdin)["result"]["columns"] if c["kind"]=="preview"][0]; sys.exit(0 if p["scroll_y"] > 0 else 1)' < <(ctl files-state entries:=false) || fail "F-42: a shorter file went back to the top"
+
+# F-39: links are underlined only under the pointer; a real click opens.
+open_ "$H/md" "hover.md"
+read -r lx ly < <(at link:https://example.com/hover 30)
+read -r lx0 ly0 < <(at link:https://example.com/hover)
+expect "$(pv md_hover)" "false" "link underlined without the pointer"
+(rp abs $((lx - 10)) "$ly0", sleep 40, abs $((lx - 5)) "$ly0", sleep 40, abs "$lx" "$ly0", sleep 1200 &)
+sleep 0.8
+expect "$(pv md_hover)" "true" "F-39: hovered link not underlined"
+sleep 0.8
+rp abs "$lx" $((ly0 + 60)), sleep 40, abs $((lx + 5)) $((ly0 + 80)), sleep 300
+expect "$(pv md_hover)" "false" "F-39: underline stays after the pointer left"
+ctl -q url-sink clear:=true
+rp abs $((lx - 10)) "$ly0", sleep 40, abs "$lx" "$ly0", sleep 60, down, sleep 40, up, sleep 300
+for _ in $(seq 1 30); do [[ "$(ctl url-sink --get recorded.0.target 2>/dev/null)" == "https://example.com/hover" ]] && break; sleep 0.1; done
+[[ "$(ctl url-sink --get recorded.0.target)" == "https://example.com/hover" ]] || fail "real click on a markdown link"
+
+# D1: content wider than the preview scrolls inside the body; the header
+# (toggle, ⤓) stays in the column.
+open_ "$H/md" "nest.md"
+cw="$(pv content_width)"
+(( cw <= 600 )) || fail "D1: preview content is $cw px wide (header pushed out)"
+click_at source; idle nest-source
+expect "$(pv markdown)" "source" "D1: Source still clickable"
+click_at rendered; idle nest-rendered
+
+# D10: a missing image shows its alt text.
+open_ "$H/md" "missing-image.md"
+expect "$(pv md_images_failed)" "1" "D10: missing image"
+
+# D12: an unreadable file inside a dropped folder is skipped, not fatal.
+open_ "$H" "uploads"
+ctl -q files-drop "paths:=[\"$L/mixed\"]" column:=$((ncols - 1)); idle upload-mixed
+[[ -f "$H/uploads/mixed/ok-1.txt" && -f "$H/uploads/mixed/ok-2.txt" ]] || fail "D12: readable files not uploaded"
+[[ ! -e "$H/uploads/mixed/unreadable.txt" ]] || fail "D12: unreadable file uploaded?"
+status_seen "uploaded 2 file(s) → $H/uploads"
+
+# F-54 for real: a drag from another Wayland client (dragon-drop, fetched
+# from the pinned nixpkgs; skipped when it cannot be fetched) dropped with
+# the real pointer on the uploads column: the folder uploads recursively.
+dragon="$(timeout 120 nix build --no-link --print-out-paths --inputs-from "$fork" nixpkgs#dragon-drop 2>/dev/null | tail -n1 || true)"
+if [[ -x "$dragon/bin/dragon-drop" ]]; then
+  open_ "$H" "uploads"
+  ( "$here/in-session" "$dir" env GDK_BACKEND=wayland "$dragon/bin/dragon-drop" --and-exit "$L/tree" >/dev/null 2>&1 & )
+  for _ in $(seq 1 50); do
+    read -r gx gy < <("$here/in-session" "$dir" swaymsg -t get_tree | python3 -I -c '
+import json, sys
+def walk(n):
+    if n.get("app_id") == "dragon-drop": print(n["rect"]["x"] + 30, n["rect"]["y"] + n["rect"]["height"] // 2); sys.exit(0)
+    for k in n.get("nodes", []) + n.get("floating_nodes", []): walk(k)
+walk(json.load(sys.stdin)); print("")') || true
+    [[ -n "${gx:-}" ]] && break; sleep 0.1
+  done
+  [[ -n "${gx:-}" ]] || fail "dragon-drop window never appeared"
+  read -r tx ty < <(ctl files-state entries:=false | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)["result"]; c = [x for x in d["columns"] if x["key"].endswith("/uploads")][0]
+print(int(c["x"] + c["target_width"] / 2) + int(sys.argv[1]) + 7, int(sys.argv[2]) + 300)' "$wx" "$wy")
+  n_up="$(grep -c "status: uploaded 2 file(s) → $H/uploads" "$dir/app.log" || true)"
+  rm -f "$dir/ptr.fifo"; mkfifo "$dir/ptr.fifo"
+  ( "$here/realpointer" "$dir" - < "$dir/ptr.fifo" >/dev/null 2>&1 & )
+  exec 7> "$dir/ptr.fifo"
+  printf '%s\n' "abs $gx $gy" "sleep 150" down "sleep 150" "abs $((gx + 10)) $((gy - 5))" "sleep 60" \
+    "abs $((gx + 40)) $((gy - 30))" "sleep 60" "abs $((tx - 30)) $((ty + 20))" "sleep 80" "abs $tx $ty" "sleep 80" "abs $((tx + 3)) $((ty + 2))" >&7
+  sleep 1.2
+  hl="$(ctl files-state entries:=false | python3 -I -c 'import json,sys; print(any(c["drop_highlight"] for c in json.load(sys.stdin)["result"]["columns"]))')"
+  printf '%s\n' up "sleep 400" >&7; exec 7>&-
+  expect "$hl" "True" "F-54: no drop highlight under a real drag"
+  for _ in $(seq 1 50); do (( $(grep -c "status: uploaded 2 file(s) → $H/uploads" "$dir/app.log" || true) > n_up )) && break; sleep 0.1; done
+  (( $(grep -c "status: uploaded 2 file(s) → $H/uploads" "$dir/app.log" || true) > n_up )) || fail "F-54: real drag-and-drop did not upload"
+  [[ -f "$H/uploads/tree/top (1).txt" ]] || fail "F-54: dropped folder not merged into uploads/tree"
+  idle dnd
+  echo "smoke-files: real drag and drop ok"
+else
+  echo "smoke-files: note: dragon-drop not available, real drag and drop skipped"
+fi
+
+# D9: after a listing error, keys list again once the cache has expired.
+open_ "$H" "noperm"
+ctl -q files-key key=l; idle into-noperm
+chmod 755 "$H/noperm"; touch "$H/noperm/now-readable.txt"
+sleep 4.3
+"$here/realkeys" "$dir" j; sleep 0.3; idle recover
+expect "$(st cursor)" "now-readable.txt" "D9: no keyboard recovery after a listing error"
+
+# F-63: after navigations that add columns the newest column is on screen
+# (the old bug: 1 in 3–8 real h/l steps). With 2000-entry directories so
+# re-renders are slow.
+for d in s1 s2; do mkdir -p "$H/stress/$d"; (cd "$H/stress/$d" && for i in $(seq 1 2000); do : > "$d-a-rather-long-file-name-$i.txt"; done); done
+open_ "$H/stress" "s1"
+for i in $(seq 1 12); do
+  "$here/realkeys" "$dir" l; sleep 0.2; idle "l $i"
+  r="$(f63)"; [[ "$r" == OK ]] || fail "F-63 after l (step $i): $r"
+  "$here/realkeys" "$dir" h; sleep 0.2; idle "h $i"
+  r="$(f63)"; [[ "$r" == OK ]] || fail "F-63 after h (step $i): $r"
+  [[ $i == 6 ]] && { "$here/realkeys" "$dir" j; sleep 4.3; }
+done
+# F-65: the browser shows its right edge after its width changes.
+open_ "$H/notes" "todo.md"
+for w in 900 640 1400; do
+  ctl -q files-scroll dx:=-300
+  ctl -q resize width:=$w height:=900; sleep 0.6; idle "resize $w"
+  r="$(f63)"; [[ "$r" == OK ]] || fail "F-65 after a resize to $w: $r"
+done
+
+# D8: no main-thread stall when the 4 s cache expires (it was ~600 ms per
+# key press with a 2000-entry column and /tmp on screen, Debug build).
+open_ "$H/stress/s1" "s1-a-rather-long-file-name-1000.txt"
+worst=10000
+cat > "$dir/stall-probe.py" <<'EOF'
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); f = s.makefile("rb")
+end = time.time() + 1.2; last = time.time(); w = 0
+while time.time() < end:
+    s.sendall(b'{"cmd":"files-state","entries":false}\n'); f.readline()
+    now = time.time(); w = max(w, now - last); last = now
+print(int(w * 1000))
+EOF
+for t in 1 2 3; do
+  sleep 4.3
+  python3 -I "$dir/stall-probe.py" "$dir/ctl.sock" > "$dir/stall.out" &
+  sleep 0.2; "$here/realkeys" "$dir" j; wait
+  g="$(cat "$dir/stall.out")"
+  (( g < worst )) && worst=$g
+done
+(( worst < 200 )) || fail "D8: main loop stalled ${worst} ms on a key press after the cache expired"
+echo "smoke-files: D8 best-of-3 worst gap ${worst} ms"
+# D8, first display: a fresh 2000-row directory is built a screenful at a
+# time (it blocked 60–195 ms in a release build, ~380 ms in Debug).
+case "$(sed -n 's/.*build optimize=\([a-z_]*\).*/\1/p' "$dir/app.log" | head -n1)" in
+  debug) limit=450 ;; *) limit=150 ;;
+esac
+best=10000
+for t in 1 2 3; do
+  fv="$H/fv-$t"; mkdir -p "$fv"; (cd "$fv" && for i in $(seq 1 3000); do : > "entry-number-$i-of-a-big-folder.txt"; done)
+  sleep 4.3
+  python3 -I "$dir/stall-probe.py" "$dir/ctl.sock" > "$dir/stall.out" &
+  sleep 0.2; ctl -q files-open dir="$H" cursor="fv-$t"; wait
+  g="$(cat "$dir/stall.out")"; (( g < best )) && best=$g
+done
+idle first-visit
+(( best < limit )) || fail "D8: first display of a 2000-row directory stalled ${best} ms (limit $limit)"
+echo "smoke-files: D8 first display best-of-3 worst gap ${best} ms"
+
+# D13: reduced motion: animations end at once. Checked through the
+# duration the browser starts its column animations with (180 ms, or 1 ms
+# under reduced motion), not by sampling widths: wmctl takes tens of ms a
+# call and a release build finishes 180 ms before a second call lands.
+open_ "$H" "notes"
+"$here/realkeys" "$dir" l; sleep 0.3; idle anim1
+expect "$(st last_animation_ms)" "180" "columns animate normally"
+ctl -q files-motion reduce:=true
+"$here/realkeys" "$dir" h; sleep 0.3; idle reduced
+expect "$(st last_animation_ms)" "1" "D13: reduced motion still animates"
+ctl -q files-motion reduce:=false
+# D6: markdown tables measure consistently (README, nest.md, hyph.md were shown).
+grep -q "Trying to measure" "$dir/app.log" && fail "D6: $(grep -c 'Trying to measure' "$dir/app.log") GTK measure warning(s)"
+# N4: no wrapping label lets Pango add hyphens (a markdown file with long
+# words, a table, a long file name in the preview header).
+open_ "$H/md" "hyph.md"
+expect "$(st hyphenating_labels)" "0" "N4: labels that may hyphenate (markdown)"
+open_ "$H" "$long"
+expect "$(st hyphenating_labels)" "0" "N4: labels that may hyphenate (preview header)"
+# N11: in a small window the cursor row is not under a scrollbar.
+ctl -q resize width:=480 height:=360; sleep 0.5
+open_ "$H/wide" "file-0300.txt"; sleep 0.3
+python3 -I - <(ctl files-locate what=row:file-0300.txt) <(ctl files-locate what=strip) <<'EOF' || fail "N11: cursor row under the strip's scrollbar"
+import json, sys
+r = json.load(open(sys.argv[1]))["result"]; v = json.load(open(sys.argv[2]))["result"]
+sys.exit(0 if r["y"] + r["h"] / 2 <= v["y"] + v["h"] / 2 + 0.5 else 1)
+EOF
+ctl -q resize width:=1400 height:=900; sleep 0.5
+echo "smoke-files: fix-round checks ok"
+
+# --- focus changes leave the browser's view alone (final check item 1) ---
+# A GtkViewport scrolls to the new focus widget when focus leaves it, even
+# to a widget outside it: after a click on a markdown link, focusing a
+# terminal threw the strip sideways. Every focus change a browser sees in
+# a day must leave the strip, every column and the preview where they were.
+printf '[TOPLINKTOPLINKTOPLINK](#top)\n\n' > "$H/wide/file-1500.md"
+cat "$H/README.md" >> "$H/wide/file-1500.md"; seq 300 | sed 's/^/line /' >> "$H/wide/file-1500.md"
+sleep 1; idle focus-setup
+ctl -q pane-command name=new-terminal # to the right of the browser
+ctl -q workspace-wait panes:=2 timeout_ms:=15000 || fail "no terminal pane"
+"$here/realkeys-xkb" "$dir" ctrl+shift+h >/dev/null; sleep 0.5
+[[ "$(st focused)" == true ]] || fail "focus test: the browser has no focus"
+open_ "$H/wide" "file-1500.md"
+read -r lx0 ly0 < <(at link:#top 30)
+rp abs $((lx0 - 10)) "$ly0", sleep 40, abs $((lx0 - 5)) "$ly0", sleep 40, abs "$lx0" "$ly0", sleep 200, down, sleep 40, up, sleep 300
+read -r bx by < <(at preview-body)
+rp abs $((bx - 3)) "$by", sleep 30, abs "$bx" "$by", sleep 30, scroll 0 3, sleep 300
+view() { ctl files-state entries:=false | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)["result"]
+print(round(d["hscroll"]["value"]), d["hscroll"]["pinned"], [round(c["scroll_y"] or 0) for c in d["columns"] if c["kind"] == "listing"],
+      [round(c["preview"]["scroll_y"] or 0) for c in d["columns"] if c["kind"] == "preview"])'; }
+v0="$(view)"
+[[ "$v0" == *True* ]] || fail "focus test: the strip is not pinned to its right edge ($v0)"
+[[ "$(python3 -I -c 'import sys; v=sys.argv[1]; print("ok" if "[0]" not in v.split("] [")[-1] else "")' "$v0")" == ok ]] || fail "focus test: the preview did not scroll ($v0)"
+same() { local v; sleep 0.6; v="$(view)"; [[ "$v" == "$v0" ]] || fail "view changed $1: $v0 → $v"; }
+back() { "$here/realkeys-xkb" "$dir" "$1" >/dev/null; sleep 0.6; [[ "$(st focused)" == true ]] || fail "focus did not come back ($2)"; same "after focus came back ($2)"; }
+"$here/realkeys-xkb" "$dir" ctrl+shift+l >/dev/null; same "on a chord to the terminal"
+back ctrl+shift+h "chord"
+read -r tx ty < <(ctl workspace | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)["result"]; s = d["scroll"]
+p = [p for c in d["columns"] for p in c["panes"] if p["kind"] == "terminal"][0]["box"]
+x = min(max(p["x"] - s + 40, 5), 1390)
+print(int(x) + int(sys.argv[1]), p["y"] + 200 + int(sys.argv[2]))' "$wx" "$wy")
+rp abs $((tx - 3)) "$ty", sleep 30, abs "$tx" "$ty", sleep 30, down, sleep 40, up, sleep 200
+[[ "$(st focused)" == false ]] || fail "a click on the terminal did not take focus"
+same "on a click on the terminal"
+back ctrl+shift+h "click"
+"$here/realkeys-xkb" "$dir" ctrl+comma >/dev/null; sleep 0.8; same "when the settings opened"
+"$here/realkeys" "$dir" -k Escape; sleep 0.5; same "when the settings closed"
+ctl -q url target=https://example.com/focus-test action=choose pane:=0; sleep 0.6; same "when the link chooser opened"
+ctl -q url-chooser press=cancel; sleep 0.5; same "when the link chooser closed"
+ctl -q workspace-front front:=false; sleep 0.4; ctl -q workspace-front front:=true; same "on a host switch away and back"
+if [[ -x "${dragon:-}/bin/dragon-drop" ]]; then
+  # Another window takes the focus (the window loses it), then goes.
+  ( "$here/in-session" "$dir" env GDK_BACKEND=wayland "$dragon/bin/dragon-drop" "$L/single.txt" >/dev/null 2>&1 & )
+  sleep 1.5
+  "$here/in-session" "$dir" swaymsg -t get_tree | python3 -I -c '
+import json, sys
+def walk(n):
+    if n.get("focused"): print(n.get("app_id")); sys.exit(0)
+    for k in n.get("nodes", []) + n.get("floating_nodes", []): walk(k)
+walk(json.load(sys.stdin))' | grep -qx dragon-drop || fail "the other window did not take the focus"
+  same "when the window lost focus"
+  pkill -f -- "dragon-drop $L/single.txt" || true; sleep 0.8
+  "$here/in-session" "$dir" swaymsg -t get_tree | grep -q '"app_id": "dragon-drop"' && fail "dragon-drop still open"
+  same "when the window regained focus"
+fi
+[[ "$(st focused)" == true ]] || "$here/realkeys-xkb" "$dir" ctrl+shift+h >/dev/null
+ctl -q pane-command name=focus-right; ctl -q pane-command name=close-pane
+ctl -q workspace-wait panes:=1 timeout_ms:=15000 || fail "terminal pane not closed"
+echo "smoke-files: focus changes leave the view alone"
+
+# --- web links in markdown through the panels' URL service (record mode) ---
+# Last: a copy makes the app the clipboard owner, and GTK then does not
+# see a later outside change while the window keeps focus (the image
+# paste above would read a stale clipboard).
+open_ "$H" "README.md"
+ctl -q files-link href=https://example.com/ shift:=true
+for _ in $(seq 1 30); do [[ "$(ctl url-sink --get last_copied)" == "https://example.com/" ]] && break; sleep 0.1; done
+[[ "$(ctl url-sink --get last_copied)" == "https://example.com/" ]] || fail "shift-click copy (panels' URL service)"
+status_seen "link copied"
+ctl -q url-sink clear:=true
+ctl -q files-link href=https://example.com/open
+for _ in $(seq 1 30); do [[ "$(ctl url-sink --get recorded.0.target 2>/dev/null)" == "https://example.com/open" ]] && break; sleep 0.1; done
+[[ "$(ctl url-sink --get recorded.0.target)" == "https://example.com/open" ]] || fail "link click not recorded by the URL service"
+echo "smoke-files: web links ok"
+
+# The state the pane saved last went into the workspace's layout file.
+ctl -q workspace-save
+grep -q '"cursor":"README.md"' "$state_file" || fail "layout file: $(cat "$state_file")"
+
+# Closing the pane through the workspace stops its watch streams (F-60):
+# the host's server-side connections drop by the number of watchers.
+conns_() { ss -xH 2>/dev/null | grep -c -- "$dir/h.sock" || true; }
+nw="$(ctl files-state entries:=false | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)["result"]["watchers"]))')"
+before="$(conns_)"
+(( nw > 0 )) || fail "no watchers before the close"
+ctl -q pane-command name=close-pane
+for _ in $(seq 1 50); do ctl files-state >/dev/null 2>&1 || break; sleep 0.1; done
+ctl files-state >/dev/null 2>&1 && fail "files pane still there after close-pane"
+for _ in $(seq 1 50); do (( $(conns_) <= before - nw )) && break; sleep 0.1; done
+(( $(conns_) <= before - nw )) || fail "watch streams still open after the close ($before → $(conns_), $nw watchers)"
+echo "smoke-files: close stops the watch streams ($nw)"
+
+ctl -q screenshot path="$dir/final.png"
+app="$(sed -n 's/^app=//p' "$dir/pids")"
+ctl -q quit || fail "quit"
+for _ in $(seq 1 50); do kill -0 "$app" 2>/dev/null || break; sleep 0.1; done
+for _ in $(seq 1 20); do [[ -f "$dir/app.exit" ]] && break; sleep 0.1; done
+[[ "$(cat "$dir/app.exit" 2>/dev/null)" == 0 ]] || fail "app exit status $(cat "$dir/app.exit" 2>/dev/null)"
+if grep -qiE 'panic|segmentation fault|leaked|critical' "$dir/app.log"; then fail "crash, leak or critical in app.log"; fi
+grep -q "Trying to measure" "$dir/app.log" && fail "D6: GTK measure warnings in app.log"
+chmod 755 "$H/noperm" 2>/dev/null || true
+"$here/headless" stop "$dir" >/dev/null
+rm -rf "$statedir"
+left="$(pgrep -af -- "$dir/|ptyhost --name $ptyname" | grep -v pgrep || true)"
+[[ -z "$left" ]] || fail "processes left: $left"
+echo "smoke-files: OK $dir"

@@ -1,0 +1,253 @@
+/* File browser (Miller columns): electron/ui/index.html's `.files-*`
+   rules, ported to GTK CSS. Loaded once for the display by files/css.zig
+   (one line in application.zig). Colours are the Electron palette tokens,
+   dark by default; the light scheme overrides them below. Every node
+   lives under `filesbrowser` (the widget's CSS name). */
+
+filesbrowser {
+  --panel: #1f1f2b;
+  --border: #34344a;
+  --text: #c8c8d8;
+  --accent: #7aa2f7;
+  --raise: rgba(255, 255, 255, 0.03);
+  --raise-strong: rgba(255, 255, 255, 0.1);
+  --hover: rgba(255, 255, 255, 0.05);
+  --accent-tint: rgba(122, 162, 247, 0.15);
+  --accent-tint-faint: rgba(122, 162, 247, 0.07);
+  --selection-bg: rgba(122, 162, 247, 0.3);
+  --selection-fg: #fff;
+  --input-bg: rgba(0, 0, 0, 0.4);
+  --overlay: rgba(0, 0, 0, 0.55);
+  --shadow: rgba(0, 0, 0, 0.6);
+  --mono: "JetBrainsMono Nerd Font", "JetBrains Mono", "DejaVu Sans Mono", monospace;
+
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+/* Light scheme: a class toggled from AdwStyleManager:dark (a
+   prefers-color-scheme media query does not follow libadwaita's forced
+   scheme in this app). */
+filesbrowser.light {
+    --panel: #f4f5f9;
+    --border: #c4c8d8;
+    --text: #343b58;
+    --accent: #2e7de9;
+    --raise: rgba(0, 0, 0, 0.03);
+    --raise-strong: rgba(0, 0, 0, 0.07);
+    --hover: rgba(0, 0, 0, 0.05);
+    --accent-tint: rgba(46, 125, 233, 0.14);
+    --accent-tint-faint: rgba(46, 125, 233, 0.07);
+    --selection-bg: rgba(46, 125, 233, 0.28);
+    --selection-fg: #1b2140;
+    --input-bg: rgba(255, 255, 255, 0.7);
+    --overlay: rgba(40, 44, 70, 0.35);
+    --shadow: rgba(30, 34, 60, 0.25);
+  }
+
+/* The unparented label that measures names for column widths. */
+.files-measure { font-size: 12.5px; }
+
+/* --- columns ------------------------------------------------------------ */
+
+filesbrowser .files-col {
+  border-right: 1px solid var(--border);
+}
+filesbrowser .files-rows {
+  padding: 4px 0;
+}
+filesbrowser .files-entry {
+  padding: 2px 10px;
+  font-size: 12.5px;
+}
+filesbrowser .files-entry:hover { background: var(--hover); }
+filesbrowser .files-entry.on-path { background: var(--raise-strong); }
+filesbrowser .files-entry.cursor { background: var(--selection-bg); color: var(--selection-fg); }
+/* Drilled preview: the highlight moves from the cursor row to the preview
+   header; the row keeps the on-path look. */
+filesbrowser.drilled .files-entry.cursor { background: var(--raise-strong); color: inherit; }
+filesbrowser.drilled .files-preview .files-preview-head {
+  background: var(--selection-bg);
+  color: var(--selection-fg);
+}
+filesbrowser.drilled .files-preview .files-preview-head .fmeta { opacity: 0.75; }
+filesbrowser .files-entry.hidden-file .files-name { opacity: 0.55; }
+filesbrowser .files-name.symlink { font-style: italic; }
+filesbrowser .files-arrow { opacity: 0.5; font-size: 11px; margin-left: 6px; }
+filesbrowser .files-acts { margin-left: 6px; }
+filesbrowser button.files-act {
+  border: none;
+  background: none;
+  box-shadow: none;
+  color: inherit;
+  opacity: 0.55;
+  font-size: 11px;
+  padding: 1px 3px;
+  margin: 0 1px;
+  min-height: 0;
+  min-width: 0;
+}
+filesbrowser button.files-act:hover { opacity: 1; }
+filesbrowser entry.files-rename {
+  min-height: 0;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--input-bg);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 0 3px;
+  margin: 0;
+  outline: none;
+  box-shadow: none;
+}
+filesbrowser .files-msg { padding: 6px 10px; opacity: 0.5; font-size: 12px; font-style: italic; }
+
+filesbrowser .drop-target {
+  box-shadow: inset 0 0 0 2px var(--accent);
+  background: var(--accent-tint-faint);
+}
+
+/* --- preview ------------------------------------------------------------ */
+
+filesbrowser .files-preview-head {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+filesbrowser .files-preview-head .fname { font-weight: 600; }
+filesbrowser .files-preview-head .fmeta { opacity: 0.6; margin-top: 2px; }
+filesbrowser button.files-download {
+  font-size: 14px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  opacity: 1;
+  margin-left: 8px;
+}
+filesbrowser button.files-download:hover { background: var(--hover); }
+filesbrowser .files-view-toggle {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin-left: 8px;
+}
+filesbrowser .files-view-toggle button {
+  border: none;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  color: inherit;
+  font-size: 11px;
+  padding: 2px 7px;
+  min-height: 0;
+  min-width: 0;
+  opacity: 0.6;
+}
+filesbrowser .files-view-toggle button + button { border-left: 1px solid var(--border); }
+filesbrowser .files-view-toggle button:hover { opacity: 1; background: var(--hover); }
+filesbrowser .files-view-toggle button:checked {
+  opacity: 1;
+  background: var(--accent-tint);
+  color: var(--accent);
+}
+filesbrowser .files-preview-body > viewport > .files-body-inner,
+filesbrowser .files-body-inner {
+  padding: 8px 10px;
+}
+filesbrowser .files-pre {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+filesbrowser .files-zip { font-family: var(--mono); font-size: 11.5px; line-height: 1.45; }
+filesbrowser .files-zip-entry { padding: 1px 0; }
+filesbrowser .files-zip-entry.dir .files-zip-name { opacity: 0.7; }
+filesbrowser .files-zip-tree { opacity: 0.4; }
+filesbrowser .files-zip-size { margin-left: 12px; opacity: 0.6; font-feature-settings: "tnum"; }
+
+/* --- delete confirmation (over the pane only) ---------------------------- */
+
+filesbrowser .files-modal-overlay { background: var(--overlay); }
+filesbrowser .files-confirm {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+  box-shadow: 0 8px 32px var(--shadow);
+  margin: 16px;
+}
+filesbrowser .files-confirm-text { font-size: 13px; margin-bottom: 14px; }
+filesbrowser .files-confirm button {
+  border: 1px solid var(--border);
+  background: none;
+  box-shadow: none;
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  margin-left: 8px;
+}
+filesbrowser .files-confirm button:hover,
+filesbrowser .files-confirm button:focus-visible { border-color: var(--accent); color: var(--accent); }
+filesbrowser .files-confirm button.danger {
+  background: #c34f5e;
+  border-color: #c34f5e;
+  color: #fff;
+  font-weight: 600;
+}
+filesbrowser .files-confirm button.danger:hover { color: #fff; }
+
+/* --- rendered markdown ---------------------------------------------------- */
+
+filesbrowser .files-md { font-size: 13px; }
+filesbrowser .files-md label { line-height: 1.5; }
+filesbrowser .files-md .md-block { margin-bottom: 10px; }
+filesbrowser .files-md .md-tight { margin-bottom: 0; }
+filesbrowser .files-md .md-h {
+  font-weight: 600;
+  line-height: 1.25;
+  margin-top: 16px;
+  margin-bottom: 6px;
+}
+filesbrowser .files-md .md-first { margin-top: 0; }
+filesbrowser .files-md .md-h1 { font-size: 19.5px; padding-bottom: 3px; border-bottom: 1px solid var(--border); }
+filesbrowser .files-md .md-h2 { font-size: 16.9px; padding-bottom: 3px; border-bottom: 1px solid var(--border); }
+filesbrowser .files-md .md-h3 { font-size: 14.95px; }
+filesbrowser .files-md .md-h4,
+filesbrowser .files-md .md-h5,
+filesbrowser .files-md .md-h6 { font-size: 13px; }
+filesbrowser .files-md label link { color: var(--accent); text-decoration-line: none; }
+/* The hovered link (md_view.zig keeps it the label's only link meanwhile). */
+filesbrowser .files-md label.md-hover link { text-decoration-line: underline; }
+filesbrowser .files-md .md-pre {
+  background: var(--input-bg);
+  border-radius: 4px;
+}
+filesbrowser .files-md .md-pre label {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  padding: 8px 10px;
+}
+filesbrowser .files-md .md-quote {
+  border-left: 3px solid var(--border);
+  padding-left: 10px;
+  opacity: 0.8;
+}
+filesbrowser .files-md .md-list { margin-left: 4px; }
+filesbrowser .files-md .md-li { margin-top: 2px; }
+filesbrowser .files-md .md-marker { min-width: 17px; margin-right: 4px; }
+filesbrowser .files-md checkbutton.md-task { margin: 0 5px 0 0; padding: 0; min-height: 0; }
+filesbrowser .files-md checkbutton.md-task check { min-width: 12px; min-height: 12px; margin: 0; }
+filesbrowser .files-md .md-hr { background: var(--border); min-height: 1px; margin: 6px 0 13px; }
+filesbrowser .files-md .md-table {
+  border-top: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+}
+filesbrowser .files-md .md-cell {
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 3px 8px;
+  font-size: 12px;
+}
+filesbrowser .files-md .md-th { background: var(--raise); font-weight: 600; }
+filesbrowser .files-md .md-alt { opacity: 0.6; font-style: italic; }
