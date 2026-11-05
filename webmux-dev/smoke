@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# End-to-end checks under the headless recipe.
+#
+#   webmux-dev/smoke            the application: connection page, a profile,
+#                               connect through a fake ssh to a freshly
+#                               deployed host, a terminal there (typing,
+#                               resize, real keystrokes), tunnel killed and
+#                               healed, wake from sleep, disconnect, quit
+#                               (webmux-dev/smoke-chrome; this replaced the
+#                               walking skeleton's local-shell smoke: the
+#                               app no longer runs a local pty)
+#   webmux-dev/smoke --host     dev mode: a remote pane on an isolated host
+#                               (webmux-dev/smoke-host)
+#   webmux-dev/smoke --pane     terminal-pane features (webmux-dev/smoke-pane)
+#   webmux-dev/smoke --integration  the areas together in the real flow
+#                               (webmux-dev/smoke-integration)
+#   webmux-dev/smoke --all      every smoke above plus each area's own
+#                               (src/apprt/webmux/<area>/smoke or smoke.sh),
+#                               one after the other, one line per smoke;
+#                               logs in a fresh /tmp/wm-smokes-* directory;
+#                               exit 1 if any failed
+#
+# Build first: webmux-dev/build
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${1:-}" == "--all" ]]; then
+  fork="$(cd "$here/.." && pwd)"
+  logs="$(mktemp -d /tmp/wm-smokes-XXXXXX)"
+  smokes=("$here/smoke-chrome" "$here/smoke-host" "$here/smoke-pane" "$here/smoke-files" "$here/smoke-integration")
+  for s in "$fork"/src/apprt/webmux/*/smoke "$fork"/src/apprt/webmux/*/smoke.sh; do
+    [[ -x "$s" ]] && smokes+=("$s")
+  done
+  failed=0
+  for s in "${smokes[@]}"; do
+    name="${s#"$fork"/}"
+    log="$logs/$(echo "$name" | tr '/' '_').log"
+    t0=$(date +%s)
+    if "$s" >"$log" 2>&1; then
+      printf 'PASS  %-40s %4ss  %s\n' "$name" "$(( $(date +%s) - t0 ))" "$(tail -n1 "$log")"
+    else
+      failed=1
+      printf 'FAIL  %-40s %4ss  %s\n' "$name" "$(( $(date +%s) - t0 ))" "$(grep -m1 FAIL "$log" || tail -n1 "$log")"
+    fi
+  done
+  echo "logs: $logs"
+  exit "$failed"
+fi
+if [[ "${1:-}" == "--host" ]]; then
+  exec "$here/smoke-host"
+fi
+if [[ "${1:-}" == "--integration" ]]; then
+  exec "$here/smoke-integration"
+fi
+if [[ "${1:-}" == "--pane" ]]; then
+  exec "$here/smoke-pane"
+fi
+exec "$here/smoke-chrome"

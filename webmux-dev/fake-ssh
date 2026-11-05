@@ -1,0 +1,70 @@
+#!/bin/sh
+# A stand-in for ssh, for headless runs of the chrome (never touches the
+# network or a real sshd). Point the app at it with WEBMUX_GTK_SSH:
+#
+#   D=$(webmux-dev/headless start -- WEBMUX_GTK_SSH=$PWD/webmux-dev/fake-ssh)
+#
+# Each "host" is a directory under $FAKE_REMOTE_ROOT (default: ../remote
+# next to the app's HOME, i.e. $D/remote/<host>): the remote command runs
+# locally with HOME and XDG_RUNTIME_DIR pointing there, so deploy pushes
+# the real payload into $D/remote/<host>/.webmux and starts the real
+# webmux-host under it. `-N -L local:remote` becomes a socat relay
+# between the two unix sockets (the same approach as src/webmux/conn/test.zig).
+#
+# Knobs (files in the host's directory, or host names):
+#   host "badhost"          fails like an unresolvable name (exit 255)
+#   <host>/ssh-down         "Connection refused" (exit 255)
+#   <host>/password         password auth: the askpass answer must match
+#                           the file's content, else "Permission denied"
+#   <host>/slow             remote commands sleep 30 s first
+# Kill a tunnel:  pkill -f "UNIX-LISTEN:$D/run/webmux-gtk/"
+#
+# Sessions run `sh` (FAKE_SESSION_SHELL to change) with the host's shims
+# first on PATH, so xdg-open/xclip in a session are the host's shims, and
+# DISPLAY can never reach this machine's X server.
+#
+# The restart-sessions script's pgrep fallback only ever sees a stub that
+# finds nothing, so it can never match a real pty host on this machine.
+tunnel=0; fwd=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -N) tunnel=1; shift;;
+    -o|-p|-i|-J|-F|-l) shift 2;;
+    -L) fwd="$2"; shift 2;;
+    -*) shift;;
+    *) break;;
+  esac
+done
+host="$1"; shift
+root="${FAKE_REMOTE_ROOT:-$(dirname "$HOME")/remote}"
+slug=$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_')
+R="$root/$slug"
+mkdir -p "$R/run" "$R/stubs" "$R/tmp"
+chmod 700 "$R/run"
+[ -x "$R/stubs/pgrep" ] || { printf '#!/bin/sh\nexit 1\n' > "$R/stubs/pgrep"; chmod +x "$R/stubs/pgrep"; }
+[ -x "$R/stubs/pkill" ] || { printf '#!/bin/sh\nexit 1\n' > "$R/stubs/pkill"; chmod +x "$R/stubs/pkill"; }
+printf '%s ARGV %s %s\n' "$(date +%T)" "$host" "$*" >> "$root/ssh.log"
+
+case "$host" in
+  badhost) echo "ssh: Could not resolve hostname badhost: Name or service not known" >&2; exit 255;;
+esac
+if [ -f "$R/ssh-down" ]; then echo "ssh: connect to host $host port 22: Connection refused" >&2; exit 255; fi
+if [ -f "$R/password" ]; then
+  if [ -z "$SSH_ASKPASS" ]; then echo "$host: Permission denied (publickey,password)." >&2; exit 255; fi
+  pw=$("$SSH_ASKPASS")
+  if [ "$pw" != "$(cat "$R/password")" ]; then echo "$host: Permission denied (publickey,password)." >&2; exit 255; fi
+  echo "password ok" >> "$root/ssh.log"
+fi
+if [ $tunnel = 1 ]; then
+  sock="${fwd%%:*}"
+  exec socat UNIX-LISTEN:"$sock",fork,unlink-early UNIX-CONNECT:"${fwd#*:}"
+fi
+if [ -f "$R/slow" ]; then sleep 30; fi
+export XDG_RUNTIME_DIR="$R/run" TMPDIR="$R/tmp"
+# Hermetic sessions: plain sh (a login bash would rebuild PATH from the
+# system profile and lose the host's shims, so `xdg-open` in a session
+# would reach this machine's real xdg-open), and an X display that cannot
+# exist (the host defaults an empty DISPLAY to :0, the desktop's).
+export SHELL_CMD="${FAKE_SESSION_SHELL:-sh}" SHELL=/bin/sh PS1='$ ' ENV= \
+  DISPLAY=no-such-display.invalid:0 BROWSER= WAYLAND_DISPLAY=
+cd "$R" && HOME="$R" PATH="$R/stubs:$PATH" exec sh -c "echo 'motd: welcome to $host'; $1"

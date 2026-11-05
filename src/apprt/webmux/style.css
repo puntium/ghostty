@@ -1,0 +1,9 @@
+/* webmux-gtk application stylesheet, loaded once for the whole display
+   at GTK_STYLE_PROVIDER_PRIORITY_APPLICATION (application.zig). Widgets
+   are styled by CSS name (gtk.Widget.Class.setCssName) or CSS class.
+   Pane chrome belongs on the container, not on `terminal-pane` itself:
+   the pane's pixels map 1:1 to the terminal grid. */
+
+terminal-pane {
+  background: transparent;
+}

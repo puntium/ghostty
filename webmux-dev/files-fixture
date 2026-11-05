@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Populate a throwaway HOME for the file browser (webmux-dev/smoke-files
+and manual testing): markdown with images and links, zips, a binary, a
+large text file, deep and wide directories, odd names, symlinks, a fifo,
+and every image format we can find on this machine.
+
+  webmux-dev/files-fixture HOME_DIR [LOCAL_DIR]
+
+LOCAL_DIR (optional) gets local files to upload: a file and a folder
+tree with an empty subfolder."""
+import os, struct, sys, zipfile, zlib, glob, shutil
+
+home = sys.argv[1]
+local = sys.argv[2] if len(sys.argv) > 2 else None
+os.makedirs(home, exist_ok=True)
+J = lambda *p: os.path.join(home, *p)
+
+def png(w, h, rgb):
+    raw = b''.join(b'\x00' + bytes(rgb) * w for _ in range(h))
+    def chunk(t, d):
+        c = struct.pack('>I', len(d)) + t + d
+        return c + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+
+def write(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'wb' if isinstance(data, bytes) else 'w') as f:
+        f.write(data)
+
+# Images: a generated PNG, plus whatever samples exist on this machine.
+write(J('img', 'logo.png'), png(160, 90, (122, 162, 247)))
+write(J('img', 'badge.png'), png(80, 20, (80, 200, 120)))
+write(J('img', 'wide.png'), png(1400, 300, (224, 175, 104)))
+samples = {
+    'jpg': '/nix/store/*/share/info/gawk_statist.jpg',
+    'gif': '/nix/store/*-apache-httpd-*/icons/world2.gif',
+    'bmp': '/nix/store/*-qemu-*/share/qemu/qemu-nsis.bmp',
+    'webp': '/nix/store/*-freerdp-*/share/FreeRDP/images/test_icon.webp',
+    'ico': '/nix/store/*-source/dist/windows/ghostty.ico',
+    'svg': '/nix/store/*-apache-httpd-*/icons/apache_pb.svg',
+}
+for ext, pat in samples.items():
+    found = sorted(glob.glob(pat))
+    if found:
+        shutil.copy(found[0], J('img', 'sample.' + ext))
+write(J('img', 'broken.png'), b'not really a png')
+
+write(J('README.md'), '''# Fixture README
+
+A paragraph with *emphasis*, **strong**, ~~strike~~, `inline code` and a
+hard break here  
+and a [relative link](notes/todo.md), a [web link](https://example.com/),
+a [mail link](mailto:someone@example.com), an [anchor](#lists) and a
+[missing scheme link](ftp://example.com/x).
+
+![logo](img/logo.png "The logo")
+
+[![badge](img/badge.png)](https://ci.example.com) [![remote](https://img.shields.io/x.svg)](https://shields.io)
+
+## Lists
+
+- one
+- two
+  - nested **bold**
+  - nested two
+- [ ] a task
+- [x] a done task
+
+1. first
+2. second
+
+> A quote with `code` and
+> a second line.
+>
+> > nested quote
+
+## Code
+
+```zig
+const std = @import("std");
+pub fn main() void {}
+```
+
+    indented code block
+
+| Left | Center | Right |
+|:-----|:------:|------:|
+| a | b | c |
+| longer cell text | `x` | 42 |
+
+---
+
+<div align="center">raw <b>html</b> stays literal</div>
+
+Inline <span>html</span> too, and a bare https://example.org link.
+''')
+write(J('notes', 'todo.md'), '# Todo\n\n- [ ] write tests\n- [x] write code\n\nBack to [the README](../README.md).\n')
+write(J('notes', 'plain.txt'), 'just text\n' * 20)
+# Fix-round cases: content wider than the preview (D1), a link alone at
+# the start of a document (hover/click by pointer, F-39), a missing image
+# (D10), a folder with an unreadable file (D12, made unreadable below).
+write(J('md', 'nest.md'), '\n'.join('  ' * i + '- item %d' % i for i in range(40)) + '\n\n' +
+      '| ' + ' | '.join('column-%02d-wide-header' % i for i in range(12)) + ' |\n' +
+      '|' + '---|' * 12 + '\n| ' + ' | '.join('cell' for _ in range(12)) + ' |\n')
+long_word = 'supercalifragilisticexpialidocious' * 6
+write(J('md', 'hyph.md'), '# Wrapping\n\nA long word: %s and a path /home/someone/projects/a-very-long-directory-name/another-long-directory-name/file.txt and a URL https://example.com/some/really/long/path/that/keeps/going?with=query\n\n| column-header-0 | column-header-1 | column-header-2 |\n|---|---|---|\n| %s | b | c |\n' % (long_word, long_word))
+write(J('md', 'hover.md'), '[HOVERLINKHOVERLINKHOVERLINK](https://example.com/hover)\n\nsome text after it\n')
+write(J('md', 'missing-image.md'), '# Image\n\n![the missing one](nope.png)\n\ntext after\n')
+deep = J('deep', *[f'level{i}' for i in range(1, 11)])
+os.makedirs(deep, exist_ok=True)
+write(os.path.join(deep, 'leaf.txt'), 'bottom of the tree\n')
+os.makedirs(J('wide'), exist_ok=True)
+for i in range(2100):
+    open(J('wide', f'file-{i:04d}.txt'), 'w').close()
+for i in range(30):
+    os.makedirs(J('wide', f'dir-{i:02d}'), exist_ok=True)
+write(J('big.txt'), ''.join(f'{i:06d} the quick brown fox jumps over the lazy dog, line {i}\n' for i in range(4000)))
+write(J('long-lines.txt'), ('x' * 300 + '\n') * 10)
+write(J('empty.txt'), '')
+write(J('bin.dat'), bytes(range(256)) * 16)
+with zipfile.ZipFile(J('archive.zip'), 'w') as z:
+    z.writestr('README.txt', 'hello zip\n')
+    z.writestr('src/', '')
+    z.writestr('src/main.zig', 'pub fn main() void {}\n' * 40)
+    z.writestr('src/lib/util.zig', '// util\n')
+    z.writestr('docs/guide/intro.md', '# intro\n')
+    z.writestr('Zeta.bin', bytes(5000))
+with zipfile.ZipFile(J('empty.zip'), 'w') as z:
+    pass
+write(J('fake.zip'), 'this is not a zip archive, just text pretending\n' * 3)
+write(J('spaces in name.txt'), 'spaces\n')
+write(J('ünïcödé ✓.md'), '# Unicode\n\nÄÖÜ — “quotes” — ✓\n')
+write(J('.hidden'), 'hidden\n')
+write(J('quote"s & <tags>.txt'), 'odd\n')
+write(J('a-very-long-file-name-that-goes-on-and-on-and-on-for-quite-a-while-indeed.txt'), 'long\n')
+write(J('UPPER.TXT'), 'upper\n')
+write(J('lower.txt'), 'lower\n')
+write(J('to-delete.txt'), 'delete me\n')
+write(J('rename-me.txt'), 'rename me\n')
+os.makedirs(J('folder-to-delete', 'inner'), exist_ok=True)
+write(J('folder-to-delete', 'inner', 'x.txt'), 'x\n')
+os.makedirs(J('emptydir'), exist_ok=True)
+os.makedirs(J('uploads'), exist_ok=True)
+if not os.path.lexists(J('link-to-notes')):
+    os.symlink('notes', J('link-to-notes'))
+if not os.path.lexists(J('broken-link')):
+    os.symlink('does-not-exist', J('broken-link'))
+if not os.path.exists(J('pipe')):
+    os.mkfifo(J('pipe'))
+noperm = J('noperm')
+os.makedirs(noperm, exist_ok=True)
+os.chmod(noperm, 0o000)
+
+if local:
+    write(os.path.join(local, 'mixed', 'ok-1.txt'), 'one\n')
+    write(os.path.join(local, 'mixed', 'ok-2.txt'), 'two\n')
+    write(os.path.join(local, 'mixed', 'unreadable.txt'), 'secret\n')
+    os.chmod(os.path.join(local, 'mixed', 'unreadable.txt'), 0o000)
+    write(os.path.join(local, 'single.txt'), 'single file upload\n')
+    write(os.path.join(local, 'tree', 'top.txt'), 'top\n')
+    write(os.path.join(local, 'tree', 'sub', 'deep.txt'), 'deep\n')
+    os.makedirs(os.path.join(local, 'tree', 'empty-sub'), exist_ok=True)
+    write(os.path.join(local, 'pasted.png'), png(40, 40, (200, 60, 90)))
+print(home)

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Screen coordinates (output pixels) of a terminal cell, for realpointer:
+#   webmux-dev/pane-point DIR COL ROW [PANE_INDEX]   ->  "X Y"
+# From sway's window rectangle plus the pane's origin, padding and cell
+# size in `wmctl dump`.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+dir="$1"; col="$2"; row="$3"; idx="${4:-0}"
+tree="$("$here/in-session" "$dir" swaymsg -t get_tree -r)"
+dump="$("$here/wmctl" -s "$dir/ctl.sock" dump text:=false)"
+python3 -I - "$col" "$row" "$idx" "$tree" "$dump" <<'PY'
+import json, sys
+col, row, idx = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+tree, dump = json.loads(sys.argv[4]), json.loads(sys.argv[5])["result"]
+def find(n):
+    if n.get("app_id") == "me.puntium.webmux.gtk":
+        return n
+    for c in n.get("nodes", []) + n.get("floating_nodes", []):
+        r = find(c)
+        if r: return r
+win = find(tree)["rect"]
+p = dump["panes"][idx]
+scale = dump["window"]["scale"] or 1
+x = win["x"] + p["origin"]["x"] + (p["padding_px"]["left"] + (col + 0.5) * p["cell_px"]["width"]) / scale
+y = win["y"] + p["origin"]["y"] + (p["padding_px"]["top"] + (row + 0.5) * p["cell_px"]["height"]) / scale
+print(int(round(x)), int(round(y)))
+PY

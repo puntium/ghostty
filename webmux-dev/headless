@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# Run webmux-gtk inside a nested, headless Wayland compositor (sway with
+# the wlroots headless backend), isolated from the user's session.
+#
+#   webmux-dev/headless start [--size WxH] [--scale S] [--] [extra env VAR=val ...]
+#       Starts sway + webmux-gtk in the background, waits until the
+#       control socket answers, prints the run directory on stdout (last
+#       line) and exits 0. Everything for that run lives in the directory:
+#         ctl.sock    the app's control socket (use webmux-dev/wmctl)
+#         app.log     the app's stderr/stdout
+#         app.exit    the app's exit status, once it has exited
+#         sway.log    the compositor's log
+#         env         shell-sourceable WAYLAND_DISPLAY/SWAYSOCK/WEBMUX_GTK_CONTROL
+#         home/       throwaway HOME (XDG_* point inside it)
+#   webmux-dev/headless start --host ...
+#       Dev mode: also starts an isolated local `webmux-host serve` (socket
+#       DIR/h.sock, state under DIR/host/, log DIR/host.log, sessions run
+#       `sh` with PS1='$ ' unless WEBMUX_HOST_SHELL is set) and runs the
+#       app with WEBMUX_GTK_DEV_SOCKET=DIR/h.sock.
+#   webmux-dev/headless host-restart DIR
+#       Restart the host's HTTP server only (the pty-host daemon and its
+#       sessions survive): attached panes see a link-down and reconnect.
+#   webmux-dev/headless stop DIR      quit the app (via the socket), shut
+#                                     the host's pty-host daemon and server
+#                                     down, stop sway and the private
+#                                     D-Bus; remove nothing
+#   webmux-dev/headless status DIR    which processes of that run are alive
+#
+# Safety: DISPLAY and the user's WAYLAND_DISPLAY are never inherited;
+# WAYLAND_DISPLAY is set to the absolute path of the nested compositor's
+# socket inside the run directory, and the script refuses to start the app
+# if that socket is not there and answering. The app gets its own D-Bus
+# session bus (shared with the nested sway; it has no service directories,
+# so nothing is ever bus-activated), so it cannot reach the desktop's
+# portals or notification daemon either.
+#
+# The app watches logind's PrepareForSleep on the run's private session bus
+# (WEBMUX_GTK_SLEEP_BUS=session), never the real system bus; pass
+# WEBMUX_GTK_SLEEP_BUS=system after -- to override.
+#
+# Environment:
+#   WEBMUX_GTK_BIN   binary to run (default: <fork>/zig-out/bin/webmux-gtk)
+#   WEBMUX_HOST_BIN  webmux-host for --host (default: <webmux>/host/dist/webmux-host-linux-x64)
+#   WEBMUX_WLR_RENDERER  gles2 (default; GPU render node) or pixman (CPU only)
+#   WEBMUX_HEADLESS_SHELL  the terminal's shell (default: bash; no rc files
+#                          exist in the throwaway HOME)
+set -euo pipefail
+
+FORK="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="${WEBMUX_GTK_BIN:-$FORK/zig-out/bin/webmux-gtk}"
+find_host_bin() { # walk up from the fork to the webmux checkout (works from gtk/wt/<name> too)
+  local d="$FORK"
+  while [[ "$d" != / ]]; do
+    [[ -x "$d/host/dist/webmux-host-linux-x64" ]] && { echo "$d/host/dist/webmux-host-linux-x64"; return; }
+    d="$(dirname "$d")"
+  done
+}
+HOST_BIN="${WEBMUX_HOST_BIN:-$(find_host_bin)}"
+
+die() { echo "headless: $*" >&2; exit 1; }
+
+tool() { # tool <nixpkgs attr> -> store path, pinned to the fork's flake.lock
+  nix build --no-link --print-out-paths --inputs-from "$FORK" "nixpkgs#$1" 2>/dev/null | grep -v -- '-man$' | head -n1
+}
+
+alive() { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null; }
+
+cmd_start() {
+  local size="1920x1200" scale="1" extra_env=() with_host=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --host) with_host=1; shift ;;
+      --size) size="$2"; shift 2 ;;
+      --scale) scale="$2"; shift 2 ;;
+      --) shift; extra_env+=("$@"); break ;;
+      *=*) extra_env+=("$1"); shift ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  [[ -x "$BIN" ]] || die "no binary at $BIN (build: webmux-dev/build)"
+
+  local sway dbus
+  sway="$(tool sway)" || die "cannot get sway from nixpkgs"
+  dbus="$(tool dbus)" || die "cannot get dbus from nixpkgs"
+
+  # Short path: unix socket paths are capped at 108 bytes.
+  local dir
+  dir="$(mktemp -d /tmp/wm-XXXXXX)"
+  mkdir -p "$dir/run" "$dir/home/.config" "$dir/home/.local/state" \
+           "$dir/home/.local/share" "$dir/home/.cache"
+  chmod 700 "$dir" "$dir/run"
+  # Until we report success, any exit tears the run down again.
+  trap 'cmd_stop "$dir" >/dev/null 2>&1' EXIT
+
+  cat > "$dir/sway.conf" <<EOF
+output HEADLESS-1 resolution $size scale $scale bg #303030 solid_color
+default_border none
+default_floating_border none
+for_window [app_id=".*"] floating enable
+focus_follows_mouse no
+EOF
+
+  # A clean environment for both processes: nothing from the desktop.
+  local base_env=(
+    "PATH=$PATH"
+    "HOME=$dir/home"
+    "XDG_CONFIG_HOME=$dir/home/.config"
+    "XDG_STATE_HOME=$dir/home/.local/state"
+    "XDG_DATA_HOME=$dir/home/.local/share"
+    "XDG_CACHE_HOME=$dir/home/.cache"
+    "XDG_RUNTIME_DIR=$dir/run"
+    "LANG=${LANG:-C.UTF-8}"
+    "TERM=xterm-256color"
+    "USER=${USER:-$(id -un)}"
+    "SHELL=${WEBMUX_HEADLESS_SHELL:-$(command -v bash)}"
+  )
+  if [[ -n "${LOCALE_ARCHIVE:-}" ]]; then base_env+=("LOCALE_ARCHIVE=$LOCALE_ARCHIVE"); fi
+
+  # One private session bus for the run (sway and the app), with no
+  # service directories: nothing is bus-activated (no portals, no a11y
+  # bus, no FUSE document portal in our runtime dir) and nothing
+  # autolaunches a bus of its own.
+  cat > "$dir/dbus.conf" <<EOF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path=$dir/run/bus</listen>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+EOF
+  local dbus_pid
+  dbus_pid="$(env -i "${base_env[@]}" "$dbus/bin/dbus-daemon" \
+    --config-file="$dir/dbus.conf" --fork --print-pid)" || die "dbus-daemon failed"
+  echo "dbus=$dbus_pid" > "$dir/pids"
+  base_env+=(
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=$dir/run/bus"
+    "NO_AT_BRIDGE=1"
+    "GTK_A11Y=none"
+  )
+
+  env -i "${base_env[@]}" \
+    WLR_BACKENDS=headless \
+    WLR_LIBINPUT_NO_DEVICES=1 \
+    WLR_RENDERER="${WEBMUX_WLR_RENDERER:-gles2}" \
+    "$sway/bin/sway" -c "$dir/sway.conf" >"$dir/sway.log" 2>&1 &
+  local sway_pid=$!
+  echo "sway=$sway_pid" >> "$dir/pids"
+
+  # Wait for the nested compositor's socket.
+  local sock="" i
+  for i in $(seq 1 100); do
+    alive "$sway_pid" || { cat "$dir/sway.log" >&2; die "sway exited"; }
+    sock="$(find "$dir/run" -maxdepth 1 -type s -name 'wayland-*' | head -n1)"
+    [[ -n "$sock" ]] && break
+    sleep 0.1
+  done
+  [[ -n "$sock" ]] || die "nested compositor socket never appeared ($dir/sway.log)"
+  local swaysock
+  swaysock="$(find "$dir/run" -maxdepth 1 -type s -name 'sway-ipc.*' | head -n1)"
+  [[ -n "$swaysock" ]] || die "no sway IPC socket"
+  env -i "${base_env[@]}" SWAYSOCK="$swaysock" "$sway/bin/swaymsg" -t get_outputs >/dev/null \
+    || die "nested compositor not answering"
+
+  cat > "$dir/env" <<EOF
+export WAYLAND_DISPLAY=$sock
+export SWAYSOCK=$swaysock
+export WEBMUX_GTK_CONTROL=$dir/ctl.sock
+export WEBMUX_HEADLESS_DIR=$dir
+EOF
+
+  # A virtual keyboard that lives as long as the run (wtype reading a
+  # FIFO nobody writes to). The headless seat has no input devices; without
+  # this the seat gains a keyboard only when `realkeys` runs wtype, and the
+  # first keystrokes race the app binding its wl_keyboard and are lost.
+  local wtype
+  wtype="$(tool wtype)" || die "cannot get wtype from nixpkgs"
+  mkfifo "$dir/kbd.fifo"
+  sleep 2147483647 > "$dir/kbd.fifo" 2>/dev/null </dev/null &
+  echo "kbdhold=$!" >> "$dir/pids"
+  env -i "${base_env[@]}" WAYLAND_DISPLAY="$sock" \
+    "$wtype/bin/wtype" - < "$dir/kbd.fifo" > "$dir/kbd.log" 2>&1 &
+  echo "kbd=$!" >> "$dir/pids"
+
+  # Dev mode: an isolated local webmux host, its socket handed to the app.
+  if [[ $with_host == 1 ]]; then
+    host_setup "$dir"
+    host_start "$dir" || die "webmux-host did not come up ($dir/host.log)"
+    extra_env=("WEBMUX_GTK_DEV_SOCKET=$dir/h.sock" "${extra_env[@]}")
+    echo "export WEBMUX_GTK_DEV_SOCKET=$dir/h.sock" >> "$dir/env"
+  fi
+
+  # GTK's own GSettings schemas (the GTK the binary links, from the same
+  # pinned nixpkgs): without any schema source GtkFileChooser aborts the
+  # app and GLib asserts in g_settings_schema_source_lookup at startup.
+  local gtk4 schemas=""
+  gtk4="$(tool gtk4)" || true
+  schemas="$(ls -d "$gtk4"/share/gsettings-schemas/*/glib-2.0/schemas 2>/dev/null | head -n1 || true)"
+
+  # The app. WAYLAND_DISPLAY is an absolute path into our run dir; no
+  # DISPLAY at all, and GDK may only use Wayland.
+  env -i "${base_env[@]}" \
+    WAYLAND_DISPLAY="$sock" \
+    GDK_BACKEND=wayland \
+    WEBMUX_GTK_CONTROL="$dir/ctl.sock" \
+    WEBMUX_GTK_SLEEP_BUS=session \
+    ${schemas:+GSETTINGS_SCHEMA_DIR="$schemas"} \
+    "${extra_env[@]}" \
+    bash -c '"$0" >"$1/app.log" 2>&1; echo $? > "$1/app.exit"' "$BIN" "$dir" \
+    </dev/null >/dev/null 2>&1 &
+  local app_pid=$!   # the wrapper; it records the app's exit status in app.exit
+  echo "app=$app_pid" >> "$dir/pids"
+
+  for i in $(seq 1 150); do
+    alive "$app_pid" || { tail -n 40 "$dir/app.log" >&2; die "app exited during startup"; }
+    if [[ -S "$dir/ctl.sock" ]] && "$FORK/webmux-dev/wmctl" -s "$dir/ctl.sock" -q help 2>/dev/null; then
+      trap - EXIT
+      echo "$dir"
+      return 0
+    fi
+    sleep 0.1
+  done
+  die "control socket did not come up ($dir/app.log)"
+}
+
+pid_of() { sed -n "s/^$2=//p" "$1/pids" 2>/dev/null | tail -n1; }
+
+# --- the isolated webmux host (dev mode) --------------------------------
+# Layout as in src/webmux/net/testhost.zig: everything under the run dir
+# ($dir/host/{run,tmp,home}), WEBMUX_SOCKET=$dir/h.sock (also suppresses
+# the ~/.webmux advert), a unique WEBMUX_PTYHOST name. The server can be
+# restarted (host-restart) while the pty-host daemon and its sessions live
+# on; stop shuts the daemon down with `ptyhost --name N shutdown`.
+
+host_setup() {
+  local dir="$1" rnd
+  [[ -x "$HOST_BIN" ]] || die "no webmux-host at $HOST_BIN (WEBMUX_HOST_BIN)"
+  mkdir -p "$dir/host/run" "$dir/host/tmp" "$dir/host/home"
+  chmod 700 "$dir/host" "$dir/host/run"
+  rnd="$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
+  echo "ptyname=wm-$rnd" >> "$dir/pids"
+  cat > "$dir/host.env" <<EOF
+PATH=$PATH
+HOME=$dir/host/home
+XDG_RUNTIME_DIR=$dir/host/run
+TMPDIR=$dir/host/tmp
+WEBMUX_SOCKET=$dir/h.sock
+WEBMUX_PTYHOST=wm-$rnd
+SHELL_CMD=${WEBMUX_HOST_SHELL:-sh}
+DISPLAY=no-such-display.invalid:0
+PS1=\$ 
+ENV=
+LANG=${LANG:-C.UTF-8}
+TERM=xterm-256color
+USER=${USER:-$(id -un)}
+EOF
+}
+
+host_probe() { # GET / on the host socket
+  python3 -I - "$1" <<'EOF' 2>/dev/null
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(1)
+s.connect(sys.argv[1])
+s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+sys.exit(0 if s.recv(64).startswith(b"HTTP/1.1 200") else 1)
+EOF
+}
+
+host_start() {
+  local dir="$1" env_lines=()
+  mapfile -t env_lines < "$dir/host.env"
+  env -i "${env_lines[@]}" "$HOST_BIN" serve >>"$dir/host.log" 2>&1 </dev/null &
+  echo "host=$!" >> "$dir/pids"
+  for _ in $(seq 1 100); do
+    host_probe "$dir/h.sock" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+host_stop_server() {
+  local dir="$1" pid
+  pid="$(pid_of "$dir" host)"
+  if alive "$pid"; then
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do alive "$pid" || break; sleep 0.1; done
+    if alive "$pid"; then kill -9 "$pid" 2>/dev/null || true; fi
+  fi
+}
+
+host_shutdown() {
+  local dir="$1" name env_lines=()
+  name="$(pid_of "$dir" ptyname)"
+  [[ -n "$name" && -f "$dir/host.env" ]] || return 0
+  mapfile -t env_lines < "$dir/host.env"
+  # The pty host first: kills every session and exits the daemon.
+  env -i "${env_lines[@]}" timeout 10 "$HOST_BIN" ptyhost --name "$name" shutdown \
+    >>"$dir/host.log" 2>&1 </dev/null || true
+  host_stop_server "$dir"
+  for _ in $(seq 1 50); do
+    [[ -e "$dir/host/run/webmux/$name.sock" ]] || break
+    sleep 0.1
+  done
+  # Belt and braces: nothing of this host may outlive the run.
+  pkill -f -- "ptyhost --name $name" 2>/dev/null || true
+}
+
+cmd_host_restart() {
+  local dir="${1:?usage: headless host-restart DIR}"
+  host_stop_server "$dir"
+  host_start "$dir" || die "webmux-host did not come back ($dir/host.log)"
+}
+
+cmd_stop() {
+  local dir="${1:?usage: headless stop DIR}"
+  local app sway
+  app="$(pid_of "$dir" app)"; sway="$(pid_of "$dir" sway)"
+  if alive "$app"; then
+    "$FORK/webmux-dev/wmctl" -s "$dir/ctl.sock" -q quit 2>/dev/null || true
+    for _ in $(seq 1 50); do alive "$app" || break; sleep 0.1; done
+    if alive "$app"; then
+      echo "headless: app did not quit, killing" >&2
+      pkill -P "$app" 2>/dev/null || true
+    fi
+  fi
+  if alive "$sway"; then
+    kill "$sway" 2>/dev/null || true
+    for _ in $(seq 1 50); do alive "$sway" || break; sleep 0.1; done
+    alive "$sway" && kill -9 "$sway" 2>/dev/null || true
+  fi
+  host_shutdown "$dir"
+  local name pid
+  for name in kbdhold kbd dbus; do
+    pid="$(pid_of "$dir" "$name")"
+    if alive "$pid"; then kill "$pid" 2>/dev/null || true; fi
+  done
+  # Anything else still running out of this run dir: by command line, and
+  # clients started in the nested session (wl-copy …), by environment.
+  # Never this script or its callers (a caller's own command line often
+  # names the run dir: `bash -c '… headless stop /tmp/wm-x'`).
+  local p q keep=" "
+  q=$$
+  while [[ -n "$q" && "$q" != 0 && "$q" != 1 ]]; do
+    keep+="$q "
+    q="$(sed 's/.*) //' "/proc/$q/stat" 2>/dev/null | cut -d' ' -f2 || true)"
+  done
+  for p in $(pgrep -u "$(id -u)" -f -- "$dir/"); do
+    [[ "$keep" == *" $p "* ]] || kill "$p" 2>/dev/null || true
+  done
+  for p in $(pgrep -u "$(id -u)"); do
+    [[ "$keep" == *" $p "* ]] && continue
+    if { tr '\0' '\n' < "/proc/$p/environ"; } 2>/dev/null | grep -qx "XDG_RUNTIME_DIR=$dir/run"; then
+      kill "$p" 2>/dev/null || true
+    fi
+  done
+  return 0
+}
+
+cmd_status() {
+  local dir="${1:?usage: headless status DIR}" name pid
+  for name in dbus sway kbdhold kbd host app; do
+    pid="$(pid_of "$dir" "$name")"
+    if alive "$pid"; then echo "$name $pid running"; else echo "$name ${pid:-?} gone"; fi
+  done
+  pgrep -af -- "$dir/" || true
+  pid="$(pid_of "$dir" ptyname)"
+  if [[ -n "$pid" ]]; then pgrep -af -- "ptyhost --name $pid" || true; fi
+}
+
+case "${1:-}" in
+  start) shift; cmd_start "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  host-restart) shift; cmd_host_restart "$@" ;;
+  *) sed -n '2,45p' "$0"; exit 2 ;;
+esac

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Build webmux-gtk (zig-out/bin/webmux-gtk). Extra args go to `zig build`,
+# e.g. webmux-dev/build -Doptimize=ReleaseFast
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+exec nix develop . -c zig build -Dapp-runtime=gtk -Dwebmux=true "$@"

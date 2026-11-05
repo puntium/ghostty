@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Compare the native pane's key encoding with xterm.js 5.5's, every key and
+# modifier combination of a US keyboard (see expected.mjs), with real keys
+# (realkeys-xkb: US layout through the compositor) into a raw-mode reader
+# in the session. Chords the shell's shortcut table takes are skipped (the
+# Electron client takes the same chords before xterm).
+#
+#   webmux-dev/xterm-keys/run DIR     (a `headless start --host` run)
+#   XTERM_KEYS_ONLY=spec,spec XTERM_KEYS_MODES=normal …   a subset (smoke-pane)
+# Prints a summary; writes DIR/xterm-keys.json with every comparison.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+dev="$here/.."
+FORK="$(cd "$dev/.." && pwd)"
+dir="${1:?usage: xterm-keys/run DIR}"
+ctl() { "$dev/wmctl" -s "$dir/ctl.sock" "$@"; }
+
+ts=""
+d="$FORK"
+while [[ "$d" != / ]]; do   # walk up to the webmux checkout's electron/
+  if [[ -f "$d/electron/node_modules/@xterm/xterm/src/common/input/Keyboard.ts" ]]; then
+    ts="$d/electron/node_modules/@xterm/xterm/src/common/input/Keyboard.ts"; break
+  fi
+  d="$(dirname "$d")"
+done
+[[ -n "$ts" ]] || { echo "xterm-keys: Keyboard.ts not found" >&2; exit 1; }
+node --experimental-strip-types "$here/expected.mjs" "$ts" > "$dir/xterm-expected.json"
+
+home="$dir/host/home"
+cp "$here/kread.py" "$home/kread.py"
+"$dev/in-session" "$dir" wl-copy --clear 2>/dev/null || true   # Ctrl+V with an empty clipboard sends ^V
+
+for mode in ${XTERM_KEYS_MODES:-normal app}; do
+  rm -f "$home/kread-$mode.json"
+  pre=""; [[ $mode == app ]] && pre='printf "\\033[?1h"; '
+  ctl -q text text="clear; ${pre}python3 ~/kread.py ~/kread-$mode.json\\n"
+  ctl -q wait contains=KREAD-READY timeout_ms:=10000
+  python3 -I "$here/drive.py" "$FORK/src/apprt/webmux/shortcuts.zig" "$dir/xterm-expected.json" "$mode" > "$dir/xterm-cmds-$mode.txt"
+  "$dev/realkeys-xkb" "$dir" - < "$dir/xterm-cmds-$mode.txt" > "$dir/xterm-sent-$mode.txt"
+  for _ in $(seq 1 100); do [[ -f "$home/kread-$mode.json" ]] && break; sleep 0.1; done
+  ctl -q text text='printf "\\033[?1l"; clear\n'
+done
+python3 -I "$here/compare.py" "$dir"

@@ -1,0 +1,156 @@
+/* The workspace strip and its pane chrome (workspace/*.zig), after
+   electron/ui/index.html (#layout, .column, .pane, .pane-bar, .divider,
+   .strip-ghost). Dark is the default; light overrides the same rules.
+   Colours: --bg #16161e, --panel #1f1f2b, --border #34344a, --text
+   #c8c8d8, --accent #7aa2f7, --accent-yellow #e0af68, --danger #f7768e,
+   --raise rgba(255,255,255,.03), --yellow-tint rgba(224,175,104,.22). The
+   unfocused fade is drawn in code (frame.zig), not here. */
+
+workspace-strip {
+  background-color: #16161e;
+  color: #c8c8d8;
+}
+
+workspace-strip > .workspace-message {
+  color: #c8c8d8;
+  opacity: 0.7;
+  padding: 24px;
+}
+
+pane-frame {
+  background-color: #1f1f2b;
+  border: 1px solid #34344a;
+  border-radius: 8px;
+  color: #c8c8d8;
+}
+
+/* A 2px accent ring: the border plus a 1px outer shadow. */
+pane-frame.focused {
+  border-color: #7aa2f7;
+  box-shadow: 0 0 0 1px #7aa2f7;
+}
+
+pane-frame > .pane-bar {
+  padding: 3px 6px;
+  font-size: 12px;
+  background-color: rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid #34344a;
+}
+
+pane-frame.focused > .pane-bar {
+  background-color: rgba(224, 175, 104, 0.22);
+  color: #e0af68;
+  font-weight: 600;
+}
+
+pane-frame > .pane-bar > .pane-icon {
+  opacity: 0.55;
+  margin-left: 4px;
+}
+
+pane-frame > .pane-bar > .pane-label {
+  padding: 2px 0;
+}
+
+pane-frame > .pane-bar > button.pane-close {
+  background: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+  color: inherit;
+  font-size: 10px;
+  font-weight: normal;
+  opacity: 0.5;
+  padding: 0 4px;
+  margin: 0;
+  min-height: 0;
+  min-width: 0;
+}
+
+pane-frame > .pane-bar > button.pane-close:hover {
+  opacity: 1;
+  color: #f7768e;
+}
+
+pane-frame > .pane-placeholder {
+  color: #c8c8d8;
+  opacity: 0.6;
+  padding: 16px;
+}
+
+.wm-divider {
+  background-color: #34344a;
+  border-radius: 3px;
+  transition: background-color 150ms;
+}
+
+.wm-divider:hover,
+.wm-divider.dragging {
+  background-color: #7aa2f7;
+}
+
+.strip-ghost.pane-ghost {
+  background-color: #1f1f2b;
+  border: 1px solid #34344a;
+  border-radius: 8px;
+}
+
+.strip-ghost.pane-ghost.focused {
+  border-color: #7aa2f7;
+  box-shadow: 0 0 0 1px #7aa2f7;
+}
+
+.strip-ghost.divider-ghost {
+  background-color: #34344a;
+  border-radius: 3px;
+}
+
+/* Light (the workspace carries .light while AdwStyleManager is not dark;
+   a prefers-color-scheme media query in an application provider did not
+   follow the forced scheme): --bg #dfe1e8, --panel #f4f5f9, --border #c4c8d8, --text #343b58,
+   --accent #2e7de9, --accent-yellow #8c6c3e, --danger #c8283f,
+   --raise rgba(0,0,0,.03), --yellow-tint rgba(140,108,62,.18). */
+workspace-strip.light {
+  background-color: #dfe1e8;
+  color: #343b58;
+}
+workspace-strip.light > .workspace-message,
+workspace-strip.light pane-frame > .pane-placeholder {
+  color: #343b58;
+}
+workspace-strip.light pane-frame {
+  background-color: #f4f5f9;
+  border-color: #c4c8d8;
+  color: #343b58;
+}
+workspace-strip.light pane-frame.focused {
+  border-color: #2e7de9;
+  box-shadow: 0 0 0 1px #2e7de9;
+}
+workspace-strip.light pane-frame > .pane-bar {
+  background-color: rgba(0, 0, 0, 0.03);
+  border-bottom-color: #c4c8d8;
+}
+workspace-strip.light pane-frame.focused > .pane-bar {
+  background-color: rgba(140, 108, 62, 0.18);
+  color: #8c6c3e;
+}
+workspace-strip.light pane-frame > .pane-bar > button.pane-close:hover {
+  color: #c8283f;
+}
+workspace-strip.light .wm-divider,
+workspace-strip.light .strip-ghost.divider-ghost {
+  background-color: #c4c8d8;
+}
+workspace-strip.light .wm-divider:hover,
+workspace-strip.light .wm-divider.dragging {
+  background-color: #2e7de9;
+}
+workspace-strip.light .strip-ghost.pane-ghost {
+  background-color: #f4f5f9;
+  border-color: #c4c8d8;
+}
+workspace-strip.light .strip-ghost.pane-ghost.focused {
+  border-color: #2e7de9;
+  box-shadow: 0 0 0 1px #2e7de9;
+}

@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Command-line client for the webmux-gtk control socket.
+
+  wmctl [-s SOCK] CMD [key=value ...]     send one command, print the reply
+  wmctl [-s SOCK] --json '{"cmd": ...}'   send a raw request object
+  wmctl [-s SOCK] -                       read requests (JSON lines) from stdin
+
+SOCK defaults to $WEBMUX_GTK_CONTROL (set by `source <run dir>/env`).
+
+Values: `key=value` sends value as a string, with \\n \\r \\t \\e \\\\
+escapes interpreted; `key:=value` sends value parsed as JSON (numbers,
+booleans, objects). Examples:
+
+  wmctl dump
+  wmctl text text='echo hello\\n'
+  wmctl wait contains=hello timeout_ms:=3000
+  wmctl key key=ctrl+shift+w
+  wmctl resize width:=900 height:=600
+  wmctl screenshot path=/tmp/wm-x/shot.png
+  wmctl dump --get panes.0.text        # print one field of the result raw
+
+Exit status: 0 if every reply had "ok": true, 1 otherwise, 2 on usage or
+connection errors. -q suppresses output.
+"""
+import argparse
+import json
+import os
+import socket
+import sys
+
+
+def unescape(s):
+    out, i = [], 0
+    table = {"n": "\n", "r": "\r", "t": "\t", "e": "\x1b", "\\": "\\"}
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s) and s[i + 1] in table:
+            out.append(table[s[i + 1]])
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def build(cmd, pairs):
+    req = {"cmd": cmd}
+    for p in pairs:
+        eq = p.find("=")
+        if eq <= 0:
+            raise SystemExit(f"wmctl: argument must be key=value or key:=json: {p}")
+        if p[eq - 1] == ":":
+            req[p[: eq - 1]] = json.loads(p[eq + 1 :])
+        else:
+            req[p[:eq]] = unescape(p[eq + 1 :])
+    return req
+
+
+def pick(value, path):
+    for part in path.split("."):
+        if isinstance(value, list):
+            value = value[int(part)]
+        else:
+            value = value[part]
+    return value
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("-s", "--socket", default=os.environ.get("WEBMUX_GTK_CONTROL"))
+    ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("--json")
+    ap.add_argument("--get")
+    ap.add_argument("--timeout", type=float, default=60.0)
+    ap.add_argument("-h", "--help", action="store_true")
+    # Options may appear anywhere; everything else is CMD and key=value.
+    a, rest = ap.parse_known_args()
+    a.rest = rest
+    if a.help or (not a.rest and not a.json):
+        print(__doc__)
+        return 2
+    if not a.socket:
+        print("wmctl: no socket (-s or $WEBMUX_GTK_CONTROL)", file=sys.stderr)
+        return 2
+
+    if a.json:
+        requests = [json.loads(a.json)]
+    elif a.rest == ["-"]:
+        requests = [json.loads(line) for line in sys.stdin if line.strip()]
+    else:
+        requests = [build(a.rest[0], a.rest[1:])]
+
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(a.timeout)
+        s.connect(a.socket)
+    except OSError as e:
+        if not a.quiet:
+            print(f"wmctl: cannot connect to {a.socket}: {e}", file=sys.stderr)
+        return 2
+
+    f = s.makefile("rwb")
+    status = 0
+    for req in requests:
+        f.write((json.dumps(req) + "\n").encode())
+        f.flush()
+        line = f.readline()
+        if not line:
+            print("wmctl: connection closed", file=sys.stderr)
+            return 2
+        reply = json.loads(line)
+        if not reply.get("ok"):
+            status = 1
+        if a.quiet:
+            continue
+        if a.get and reply.get("ok"):
+            v = pick(reply["result"], a.get)
+            print(v if isinstance(v, str) else json.dumps(v, indent=2))
+        else:
+            print(json.dumps(reply, indent=2, ensure_ascii=False))
+    s.close()
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

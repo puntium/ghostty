@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# A real Secret Service (GNOME Keyring, from the fork's pinned nixpkgs) on
+# a headless run's private session bus, for testing saved passwords. Its
+# keyrings live in the run's throwaway HOME; the user's keyring is never
+# touched (different bus, different data dir).
+#
+#   webmux-dev/keyring start DIR    start gnome-keyring-daemon (secrets
+#                                   component), login keyring created and
+#                                   unlocked with the password "test"
+#   webmux-dev/keyring lock DIR     lock every collection (next lookup
+#                                   needs an unlock prompt, which a
+#                                   headless run cannot answer)
+#   webmux-dev/keyring stop DIR
+#
+# `headless stop` kills it too (its command line names the run dir).
+set -euo pipefail
+FORK="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cmd="${1:?usage: keyring start|lock|stop DIR}"; dir="${2:?usage: keyring start|lock|stop DIR}"
+[[ -f "$dir/env" ]] || { echo "keyring: $dir is not a headless run" >&2; exit 1; }
+bus="unix:path=$dir/run/bus"
+tool() { nix build --no-link --print-out-paths --inputs-from "$FORK" "nixpkgs#$1" 2>/dev/null | grep -v -- '-man$' | head -n1; }
+
+case "$cmd" in
+  start)
+    gk="$(tool gnome-keyring)"
+    mkdir -p "$dir/run/keyring"
+    chmod 700 "$dir/run/keyring"
+    printf 'test' | env -i PATH="$PATH" HOME="$dir/home" XDG_DATA_HOME="$dir/home/.local/share" \
+      XDG_CONFIG_HOME="$dir/home/.config" XDG_RUNTIME_DIR="$dir/run" DBUS_SESSION_BUS_ADDRESS="$bus" \
+      "$gk/bin/gnome-keyring-daemon" --foreground --components=secrets --unlock \
+      --control-directory="$dir/run/keyring" >"$dir/keyring.log" 2>&1 &
+    echo "keyring=$!" >> "$dir/pids"
+    for _ in $(seq 1 50); do
+      if env -i DBUS_SESSION_BUS_ADDRESS="$bus" "$(tool glib)/bin/gdbus" call --session \
+           --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+           --method org.freedesktop.DBus.NameHasOwner org.freedesktop.secrets 2>/dev/null | grep -q true; then
+        echo "keyring: up"
+        exit 0
+      fi
+      sleep 0.1
+    done
+    echo "keyring: did not come up ($dir/keyring.log)" >&2; exit 1 ;;
+  lock)
+    env -i DBUS_SESSION_BUS_ADDRESS="$bus" "$(tool glib)/bin/gdbus" call --session \
+      --dest org.freedesktop.secrets --object-path /org/freedesktop/secrets \
+      --method org.freedesktop.Secret.Service.LockService ;;
+  stop)
+    pid="$(sed -n 's/^keyring=//p' "$dir/pids" | tail -n1)"
+    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true ;;
+  *) echo "usage: keyring start|lock|stop DIR" >&2; exit 2 ;;
+esac

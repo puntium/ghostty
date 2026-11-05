@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# End-to-end check of a remote terminal pane in dev mode (headless
+# --host): attach to the isolated host's session, type and see the
+# output; restart the host's HTTP server (the pty host and the session
+# survive) and see exactly one link-down, a reconnect and a repaint with
+# no duplicated lines; exit the remote shell and see the pane removed
+# after the 1.2 s delay; quit; nothing left running (app, sway, bus,
+# keyboard, host server, pty-host daemon). The session sockets go through
+# webmux-dev/ws-proxy.py, which checks that every WebSocket ends with a
+# close handshake and never with a reset (panels D6): after an exit, a
+# pane closed during heavy output, and at quit.
+#
+#   webmux-dev/smoke --host     (build first: webmux-dev/build)
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fail() { echo "smoke-host: FAIL: $*" >&2; [[ -n "${dir:-}" ]] && "$here/headless" stop "$dir"; exit 1; }
+ctl() { "$here/wmctl" -s "$dir/ctl.sock" "$@"; }
+field() { ctl dump text:=false --get "$1"; }
+until_field() { # until_field PATH VALUE [tries]
+  for _ in $(seq 1 "${3:-50}"); do
+    [[ "$(field "$1" 2>/dev/null)" == "$2" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+links_down() { grep -c "dev: pane .* link down" "$dir/app.log" || true; }
+
+px="$(mktemp -d /tmp/wm-px-XXXXXX)"
+echo /nonexistent > "$px/up"
+python3 -I "$here/ws-proxy.py" "$px/sock" "$px/up" "$px/log" "$px/ctl" & pxpid=$!
+trap 'kill $pxpid 2>/dev/null || true' EXIT
+for _ in $(seq 1 50); do [[ -S "$px/sock" ]] && break; sleep 0.1; done
+dir="$("$here/headless" start --host -- WEBMUX_GTK_DEV_SOCKET="$px/sock" | tail -n1)"
+echo "$dir/h.sock" > "$px/up"
+echo "smoke-host: run dir $dir (sockets through $px)"
+ptyname="$(sed -n 's/^ptyname=//p' "$dir/pids")"
+
+until_field panes.0.link up || fail "pane never attached (link $(field panes.0.link))"
+session="$(field panes.0.session_id)"
+echo "smoke-host: attached to session $session"
+
+
+ctl -q text text='echo remote-$((6*7))\n' || fail "text"
+ctl -q wait contains=$'\nremote-42' timeout_ms:=10000 || fail "remote output never appeared"
+before="$(ctl dump --get panes.0.text)"
+[[ "$(grep -c '^remote-42' <<<"$before")" == 1 ]] || fail "expected one output line"
+ctl -q screenshot path="$dir/remote.png"
+
+# Server restart: one outage, one reconnect, a repaint, same screen.
+"$here/headless" host-restart "$dir" || fail "host restart"
+until_field panes.0.snapshots 2 100 || fail "no reconnect snapshot (snapshots $(field panes.0.snapshots))"
+until_field panes.0.link up || fail "link not back up"
+[[ "$(links_down)" == 1 ]] || fail "expected exactly one link-down, saw $(links_down)"
+[[ "$(field panes.0.session_id)" == "$session" ]] || fail "different session after reconnect"
+after="$(ctl dump --get panes.0.text)"
+[[ "$after" == "$before" ]] || { diff <(echo "$before") <(echo "$after") >&2; fail "screen differs after the repaint"; }
+echo "smoke-host: server restart: 1 link-down, reconnected, repaint identical"
+ctl -q text text='echo again\n'
+ctl -q wait contains=$'\nagain' || fail "no output after reconnect"
+
+# Frames the host never sends but a server could: a title with control
+# characters (panels D7: shown as the browser shows them, BEL as ␇, ESC
+# as ␛) and output with a lone UTF-16 surrogate (panels D10: U+FFFD, the
+# frame is not dropped).
+inject() { python3 -I -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.argv[2].encode()+b"\n"); print(s.makefile().readline().strip())' "$px/ctl" "$1"; }
+[[ "$(inject '{"type":"title","title":"T\u0007itle\u001b]0;evil\u0007 end"}')" == 1 ]] || fail "inject title"
+until_field panes.0.title $'T␇itle␛]0;evil␇ end' 30 || fail "title shown as [$(field panes.0.title)]"
+[[ "$(inject '{"type":"output","data":"SURR-\ud800-OK\r\n"}')" == 1 ]] || fail "inject output"
+ctl -q wait contains=$'SURR-�-OK' timeout_ms:=5000 || fail "an output frame with a lone surrogate was dropped"
+echo "smoke-host: control characters in a title shown as control pictures; a lone surrogate becomes U+FFFD"
+
+# A pane closed while its session floods output: close 1000 both ways, no
+# reset. Three times, at different points of the flood: the reader may be
+# busy feeding output when the close reply arrives (it must still read it).
+for delay in 0.3 0.6 0.9; do
+  "$here/realkeys-xkb" "$dir" ctrl+shift+Return >/dev/null
+  until_field panes.1.link up 100 || fail "second pane did not open"
+  ctl -q text text='seq 1 10000000\n'; sleep "$delay"
+  closes_before=$(grep -c '"dir": "c2s", "close": 1000' "$px/log" || true)
+  "$here/realkeys-xkb" "$dir" ctrl+shift+w >/dev/null
+  for _ in $(seq 1 50); do (( $(grep -c '"dir": "c2s", "close": 1000' "$px/log" || true) > closes_before )) && break; sleep 0.1; done
+  (( $(grep -c '"dir": "c2s", "close": 1000' "$px/log" || true) > closes_before )) || fail "closing a pane sent no close frame"
+  for _ in $(seq 1 50); do [[ "$(field panes.1.link 2>/dev/null)" == "" ]] && break; sleep 0.1; done
+done
+
+# Exit: the red line, the pane stays ~1.2 s, then goes.
+ctl -q text text='exit 3\n'
+until_field panes.0.exit_code 3 30 || fail "no exit event"
+t0=$(date +%s%N)
+ctl dump --get panes.0.text | grep -q '\[session exited: 3\]' || fail "no exit line"
+ctl -q screenshot path="$dir/exited.png"
+until_field panes '[]' 50 || fail "pane not removed after exit"
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+(( ms >= 700 )) || fail "pane removed too early (${ms} ms after the exit was seen)"
+echo "smoke-host: pane removed ${ms} ms after the exit line was seen (delay 1200 ms from the event)"
+
+app="$(sed -n 's/^app=//p' "$dir/pids")"
+ctl -q quit || fail "quit"
+for _ in $(seq 1 50); do kill -0 "$app" 2>/dev/null || break; sleep 0.1; done
+for _ in $(seq 1 20); do [[ -f "$dir/app.exit" ]] && break; sleep 0.1; done
+[[ "$(cat "$dir/app.exit" 2>/dev/null)" == 0 ]] || fail "app exit status $(cat "$dir/app.exit" 2>/dev/null)"
+if grep -qiE 'panic|segmentation fault|leaked' "$dir/app.log"; then fail "crash or leak in app.log"; fi
+"$here/headless" stop "$dir"
+sleep 0.5
+if grep -E '"ended": "(reset|error|send-error)' "$px/log" >&2; then fail "a session socket ended without a clean close (see $px/log)"; fi
+n_closes=$(grep -c '"dir": "c2s", "close"' "$px/log" || true)
+(( n_closes >= 4 )) || fail "expected close frames from the client after exit and the pane closes, saw $n_closes"
+# Every connection that closed did so with both close frames.
+python3 -I - "$px/log" <<'PY' || fail "a session socket closed with only one close frame (see $px/log)"
+import json, sys
+c = {}
+for line in open(sys.argv[1]):
+    d = json.loads(line)
+    if "close" in d: c.setdefault(d["conn"], set()).add(d["dir"])
+sys.exit(0 if all(v == {"c2s", "s2c"} for v in c.values()) else 1)
+PY
+echo "smoke-host: every session socket closed with a handshake ($n_closes client close frames, no reset)"
+left="$(pgrep -af -- "$dir/|ptyhost --name $ptyname" | grep -v pgrep || true)"
+[[ -z "$left" ]] || fail "processes left: $left"
+echo "smoke-host: OK $dir"

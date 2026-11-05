@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Type real keystrokes into a headless run through the compositor (sway's
+# virtual-keyboard protocol, via wtype), so they take GTK's real path:
+# wl_keyboard -> GDK -> the window's capture-phase shortcut controller ->
+# the pane's controller -> input method -> Ghostty key encoding.
+# Arguments are wtype's:
+#
+#   webmux-dev/realkeys DIR 'echo hi' -k Return
+#   webmux-dev/realkeys DIR -M ctrl -M shift c -m shift -m ctrl   # Ctrl+Shift+C
+#
+# Relies on the run's persistent virtual keyboard (see `headless`), so the
+# app already has keyboard focus when these keys arrive.
+#
+# Caveat: wtype uploads its own keymap and gives each keysym an arbitrary
+# keycode (9, 10, ...). Ghostty maps a key back from its keysym only when
+# it can (letters, digits, most punctuation); otherwise it uses the
+# physical key, and e.g. '+' typed by wtype can arrive as Tab (keycode
+# 23). Stick to letters, digits, space, '-', '.', '/' here, or use the
+# control socket's `text` for arbitrary strings.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+dir="${1:?usage: realkeys DIR WTYPE-ARGS...}"; shift
+exec "$here/in-session" "$dir" wtype -s 50 "$@"

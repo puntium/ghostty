@@ -1,0 +1,48 @@
+/* Terminal pane styles (loaded once by TerminalPane's class init).
+   T-10: a 10px scrollbar column on a transparent track, with a pill thumb
+   inset by 3px. Colours from electron/ui/index.html:102-111. */
+
+terminal-pane scrollbar.webmux-terminal-scrollbar,
+terminal-pane scrollbar.webmux-terminal-scrollbar > range,
+terminal-pane scrollbar.webmux-terminal-scrollbar > range > trough {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  margin: 0;
+  min-width: 10px;
+}
+
+terminal-pane scrollbar.webmux-terminal-scrollbar > range > trough > slider {
+  min-width: 4px;
+  min-height: 20px;
+  margin: 3px;
+  border: none;
+  border-radius: 9999px;
+  background-color: rgba(200, 200, 216, 0.22);
+  transition: none;
+}
+
+terminal-pane scrollbar.webmux-terminal-scrollbar > range > trough > slider:hover,
+terminal-pane scrollbar.webmux-terminal-scrollbar > range > trough > slider:active {
+  background-color: rgba(200, 200, 216, 0.4);
+}
+
+terminal-pane.light scrollbar.webmux-terminal-scrollbar > range > trough > slider {
+  background-color: rgba(52, 59, 88, 0.25);
+}
+
+terminal-pane.light scrollbar.webmux-terminal-scrollbar > range > trough > slider:hover,
+terminal-pane.light scrollbar.webmux-terminal-scrollbar > range > trough > slider:active {
+  background-color: rgba(52, 59, 88, 0.45);
+}
+
+/* The scrollbar column sits on the terminal's own background, as xterm's
+   viewport does (config.zig's two scheme backgrounds). */
+terminal-pane {
+  background-color: #1f1f2b;
+}
+
+terminal-pane.light {
+  background-color: #f4f5f9;
+}

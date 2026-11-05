@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Real keystrokes from a keyboard with a real XKB layout (default us),
+# through sway's virtual-keyboard protocol: keys carry the layout's real
+# evdev keycodes and levels, and modifiers are real Control_L/Shift_L/Alt_L/
+# Super_L presses, as from a physical keyboard. Use it for every chord and
+# for anything that depends on the layout (chords matched by physical key,
+# K-16; input methods). `realkeys` (wtype) is for typing plain text only: it
+# uploads its own keymap with arbitrary keycodes.
+#
+#   webmux-dev/realkeys-xkb DIR [--layout L] [--variant V] [--group N] KEYSPEC...
+#   webmux-dev/realkeys-xkb DIR [options] -     commands on stdin (key, type, mods, sleep;
+#                                                see virtual-keyboard/xkb-keys.c)
+#
+#   KEYSPEC  [mod+]...KEY, mods ctrl shift alt super; or sleep:MS.
+#            A KEY that a US keyboard has unshifted (a-z 0-9 bracketleft
+#            minus Return Tab Left Prior F5 KP_Enter ...) names that physical
+#            key under any layout; another keysym (exclam, ISO_Left_Tab,
+#            eacute) is found in the layout and adds shift when shifted.
+#   --layout  XKB layout(s): ru, de, fr, "us,ru" ...   --group N  locked group
+#
+#   webmux-dev/realkeys-xkb $D ctrl+shift+Return alt+Left exclam
+#   webmux-dev/realkeys-xkb $D --layout ru ctrl+shift+h        # Ctrl+Shift+Р
+#   webmux-dev/realkeys-xkb $D --layout us,ru --group 1 ctrl+shift+l
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FORK="$(cd "$here/.." && pwd)"
+dir="${1:?usage: realkeys-xkb DIR [--layout L] [--variant V] [--group N] KEYSPEC...|-}"; shift
+layout=us variant="" group=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --layout) layout="$2"; shift 2 ;;
+    --variant) variant="$2"; shift 2 ;;
+    --group) group="$2"; shift 2 ;;
+    *) break ;;
+  esac
+done
+
+bin="$here/.build/xkb-keys"
+src="$here/virtual-keyboard/xkb-keys.c"
+if [[ ! -x "$bin" || "$src" -nt "$bin" ]]; then
+  mkdir -p "$here/.build"
+  out() { nix build --no-link --print-out-paths --inputs-from "$FORK" "nixpkgs#$1" 2>/dev/null | grep -v -- '-man$' | head -n1; }
+  wl_dev="$(out wayland.dev)"; wl_lib="$(out wayland)"; gcc="$(out gcc)"; scan="$(out wayland-scanner)"
+  xkb_dev="$(out libxkbcommon.dev)"; xkb_lib="$(out libxkbcommon)"; wtype_src="$(out wtype.src)"
+  xml="$wtype_src/protocol/virtual-keyboard-unstable-v1.xml"
+  gen="$here/.build/vkbd-gen"; mkdir -p "$gen"
+  "$scan/bin/wayland-scanner" client-header "$xml" "$gen/virtual-keyboard-unstable-v1-client-protocol.h"
+  "$scan/bin/wayland-scanner" private-code "$xml" "$gen/virtual-keyboard-unstable-v1-protocol.c"
+  "$gcc/bin/gcc" -O1 -o "$bin" "$src" "$gen/virtual-keyboard-unstable-v1-protocol.c" \
+    -I"$gen" -I"$wl_dev/include" -I"$xkb_dev/include" -L"$wl_lib/lib" -L"$xkb_lib/lib" \
+    -lwayland-client -lxkbcommon -Wl,-rpath,"$wl_lib/lib" -Wl,-rpath,"$xkb_lib/lib"
+fi
+
+if [[ "${1:-}" == "-" ]]; then
+  exec "$here/in-session" "$dir" "$bin" "$layout" "$variant" "$group"
+fi
+for k in "$@"; do
+  if [[ "$k" == sleep:* ]]; then echo "sleep ${k#sleep:}"; else echo "key $k"; fi
+done | "$here/in-session" "$dir" "$bin" "$layout" "$variant" "$group"

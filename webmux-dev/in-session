@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Run a command inside a headless run's nested Wayland session, e.g. to
+# inject real input through the compositor or read the clipboard:
+#
+#   webmux-dev/in-session DIR wtype 'echo hi' -k Return     # real keystrokes
+#   webmux-dev/in-session DIR wlrctl pointer move 10 0      # real pointer
+#   webmux-dev/in-session DIR swaymsg -t get_tree           # compositor state
+#   webmux-dev/in-session DIR wl-paste -n                   # clipboard
+#
+# Tool names that are not on PATH are fetched from the fork's pinned
+# nixpkgs (sway, wtype, wlrctl, wl-clipboard, grim, wayland-utils).
+# DISPLAY is unset and WAYLAND_DISPLAY points at the nested compositor.
+set -euo pipefail
+FORK="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+dir="${1:?usage: in-session DIR COMMAND [ARGS...]}"; shift
+[[ -f "$dir/env" ]] || { echo "in-session: $dir is not a headless run" >&2; exit 1; }
+# shellcheck disable=SC1091
+source "$dir/env"
+[[ -S "$WAYLAND_DISPLAY" ]] || { echo "in-session: nested compositor is not running" >&2; exit 1; }
+cmd="$1"; shift
+if ! command -v "$cmd" >/dev/null; then
+  case "$cmd" in
+    swaymsg) pkg=sway ;; wl-copy|wl-paste) pkg=wl-clipboard ;; wayland-info) pkg=wayland-utils ;;
+    *) pkg="$cmd" ;;
+  esac
+  path="$(nix build --no-link --print-out-paths --inputs-from "$FORK" "nixpkgs#$pkg" 2>/dev/null | grep -v -- '-man$' | head -n1)"
+  cmd="$path/bin/$cmd"
+fi
+exec env -u DISPLAY XDG_RUNTIME_DIR="$dir/run" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+  SWAYSOCK="$SWAYSOCK" DBUS_SESSION_BUS_ADDRESS="unix:path=$dir/run/bus" "$cmd" "$@"
