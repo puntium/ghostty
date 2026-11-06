@@ -159,9 +159,11 @@ pub fn text(scheme: Scheme) []const u8 {
 
 /// xterm.js web-links addon's URL regex (@xterm/addon-web-links,
 /// `strictUrlRegex`), in Oniguruma syntax: http(s) only, no trailing
-/// punctuation.
+/// punctuation. NUL is excluded as well: the renderer writes an empty
+/// cell as U+0000 (`RenderState.string`), so without it the underline of
+/// a URL that ends its row would run on to the right edge.
 pub const url_regex =
-    \\(?:https?|HTTPS?)://[^\s"'!*(){}|\\\^<>`]*[^\s"':,.!?{}|\\\^~\[\]`()<>]
+    \\(?:https?|HTTPS?)://[^\s\x00"'!*(){}|\\\^<>`]*[^\s\x00"':,.!?{}|\\\^~\[\]`()<>]
 ;
 
 /// Build the finalized Ghostty configuration. Caller owns the result
@@ -199,6 +201,29 @@ test "built-in config parses cleanly and keeps only the terminal keybinds" {
         try testing.expectEqual(@as(usize, 12), config.@"selection-word-chars".codepoints.len);
         try testing.expect(!config.@"clipboard-paste-protection");
         try testing.expect(config.@"cursor-style-blink".?);
+    }
+}
+
+test "url regex stops at an empty cell" {
+    const testing = std.testing;
+    const oni = @import("oniguruma");
+
+    try oni.testing.ensureInit();
+    var re = try oni.Regex.init(url_regex, .{}, oni.Encoding.utf8, oni.Syntax.default, null);
+    defer re.deinit();
+
+    const cases = [_]struct { input: []const u8, expect: []const u8 }{
+        .{ .input = "see https://ex.invalid/a?b=c, then", .expect = "https://ex.invalid/a?b=c" },
+        // A URL that ends its row, as the renderer sees it.
+        .{ .input = "https://ex.invalid/m\x00\x00\x00\n", .expect = "https://ex.invalid/m" },
+        .{ .input = "https://ex.invalid/m.\x00\x00", .expect = "https://ex.invalid/m" },
+    };
+    for (cases) |case| {
+        var reg = try re.search(case.input, .{});
+        defer reg.deinit();
+        const start: usize = @intCast(reg.starts()[0]);
+        const end: usize = @intCast(reg.ends()[0]);
+        try testing.expectEqualStrings(case.expect, case.input[start..end]);
     }
 }
 
