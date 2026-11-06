@@ -6,7 +6,8 @@
 # conversion; Ctrl+Shift+C copy and PRIMARY on selection; URL and OSC 8
 # link click and Shift+click (through the panels' URL service in record
 # mode: the recorded launch, the copy and its toast) and an inert mailto:
-# OSC 8 link; OSC 52 write (any target lands on
+# OSC 8 link; the same links while the program has mouse reporting on;
+# OSC 52 write (any target lands on
 # CLIPBOARD, toast) and refused OSC 52 read; scroll stickiness; hidden
 # pane; a session the host does not have; then a clean teardown.
 #
@@ -150,6 +151,42 @@ if tail -n +"$mark" "$dir/app.log" | grep -q 'url sink recorded.*mailto'; then f
 ctl -q mouse action=drag col:=0 row:=1 col2:=11 row2:=1
 [[ "$(sess wl-paste --primary -n)" == "https://ex." ]] || fail "a drag starting on a link does not select"
 ok "URL and OSC 8 links: click opens, Shift+click copies, mailto: inert, drag still selects"
+
+# --- links while the program has mouse reporting on (T-19 with T-24/T-25) ------
+# As xterm.js: the link under the pointer is still underlined, a click goes
+# to the program and opens the link as well, Shift+click (Shift takes the
+# mouse back from the program) copies, Ctrl+click and drags are the
+# program's alone.
+cp "$here/raw-reader.py" "$dir/host/home/raw-reader.py"
+cat > "$dir/host/home/links.sh" <<'LINKS'
+echo https://ex.invalid/m
+printf '\033]8;;https://o8.invalid/m\033\\OSC8-LINK\033]8;;\033\\\n'
+python3 ~/raw-reader.py mouse ~/raw.out
+LINKS
+rm -f "$dir/host/home/raw.out"
+fresh 'sh ~/links.sh\n'; wait_ RAW-READY || fail "mouse-reporting link fixture"
+ctl -q url-sink clear:=true
+[[ "$(ctl mouse action=move col:=4 row:=1 --get mouse_reporting)" == true ]] || fail "mouse reporting is not on"
+[[ "$(ctl mouse action=move col:=4 row:=1 --get over_link)" == true ]] || fail "no link hover while mouse reporting is on"
+[[ "$(ctl mouse action=move col:=30 row:=1 --get over_link)" == false ]] || fail "link hover off the link"
+markl
+ctl -q mouse action=click col:=4 row:=1
+until_log 'url sink recorded uri: https://ex.invalid/m' || fail "URL click while mouse reporting is on"
+ctl -q mouse action=click col:=4 row:=1 mods=shift
+for _ in $(seq 1 30); do [[ "$(copied)" == "https://ex.invalid/m" ]] && break; sleep 0.1; done
+[[ "$(copied)" == "https://ex.invalid/m" ]] || fail "URL shift-click while mouse reporting is on copied $(copied)"
+ctl -q mouse action=click col:=4 row:=1 mods=ctrl
+ctl -q mouse action=click col:=4 row:=2
+until_log 'url sink recorded uri: https://o8.invalid/m' || fail "OSC 8 click while mouse reporting is on"
+ctl -q mouse action=drag col:=4 row:=1 col2:=9 row2:=1
+type_ q
+for _ in $(seq 1 50); do [[ -s "$dir/host/home/raw.out" ]] && break; sleep 0.1; done
+# What the program saw: the click, the Ctrl+click, the OSC 8 click, the drag.
+want="b'\\x1b[<0;5;2M\\x1b[<0;5;2m\\x1b[<16;5;2M\\x1b[<16;5;2m\\x1b[<0;5;3M\\x1b[<0;5;3m\\x1b[<0;5;2M\\x1b[<0;10;2mq'"
+[[ "$(cat "$dir/host/home/raw.out")" == "$want" ]] || fail "mouse reports with links under the pointer: $(cat "$dir/host/home/raw.out")"
+n=$(ctl url-sink | grep -c '"kind": "uri"')
+(( n == 2 )) || fail "$n links opened while mouse reporting was on, want 2 (the click and the OSC 8 click)"
+ok "links under mouse reporting: hover, click opens and is reported, Shift+click copies, Ctrl+click and drag only reported"
 
 # --- OSC 52 ----------------------------------------------------------------
 "$here/realkeys" "$dir" -k Shift_L   # a fresh input serial (see above)

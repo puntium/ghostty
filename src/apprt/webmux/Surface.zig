@@ -85,6 +85,11 @@ pub fn defaultTermioEnv(self: *Self) !std.process.Environ.Map {
     return try self.pane.defaultTermioEnv();
 }
 
+/// Links are underlined on hover while the program has mouse reporting
+/// on too, as in xterm.js (T-24). Read by the core (`mouseLinksActive`);
+/// the pane opens them (`TerminalPane.mousePress`).
+pub const links_while_mouse_reporting = true;
+
 /// The termio backend seam (src/termio/Webmux.zig): a remote pane returns
 /// its session's config, a local pane null (termio.Exec).
 pub fn termioBackend(self: *Self) !?termio.Webmux.Config {

@@ -378,6 +378,8 @@ fn mouseInner(req: *Request) !void {
         .consumed = consumed,
         .has_selection = surface.hasSelection(),
         .mouse_reporting = surface.mouseReportingActive(),
+        // The core's hover state: the link under the pointer is underlined.
+        .over_link = surface.mouse.over_link,
     });
 }
 
