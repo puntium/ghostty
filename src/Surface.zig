@@ -2875,9 +2875,9 @@ pub fn keyCallback(
         // 1. mouse reporting is off
         // OR
         // 2. mouse reporting is on and we are not reporting shift to the terminal
-        if (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
-        {
+        // OR
+        // 3. the apprt wants links while mouse reporting is on
+        if (self.mouseLinksActive()) {
             // Refresh our link state
             const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
             self.renderer_state.mutex.lockUncancelable(global.io());
@@ -3819,6 +3819,33 @@ pub fn mouseReportingActive(self: *Surface) bool {
     return self.isMouseReporting();
 }
 
+/// webmux-gtk: true if a click with these mods is reported to the program
+/// (mouse reporting is on and Shift is not releasing the mouse from it)
+/// rather than handled here as selection or a link click.
+pub fn mouseClickReported(self: *Surface, mods: input.Mods) bool {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    return self.isMouseReporting() and
+        !(mods.shift and !self.mouseShiftCapture(false));
+}
+
+/// webmux-gtk: an apprt whose Surface declares
+/// `links_while_mouse_reporting = true` gets links looked up under the
+/// pointer while the program has mouse reporting on, as xterm.js does.
+/// Stock Ghostty only does that while Shift releases the mouse.
+const links_while_mouse_reporting: bool =
+    @hasDecl(apprt.runtime.Surface, "links_while_mouse_reporting") and
+    apprt.runtime.Surface.links_while_mouse_reporting;
+
+/// True if links under the pointer should be looked up and highlighted.
+///
+/// Requires the renderer state mutex is held.
+fn mouseLinksActive(self: *const Surface) bool {
+    if (links_while_mouse_reporting) return true;
+    return self.io.terminal.flags.mouse_event == .none or
+        (self.mouse.mods.shift and !self.mouseShiftCapture(false));
+}
+
 fn mouseReport(
     self: *Surface,
     button: ?input.MouseButton,
@@ -4042,7 +4069,14 @@ pub fn mouseButtonCallback(
         // Handle link clicking. We want to do this before we do mouse
         // reporting or any other mouse handling because a successfully
         // clicked link will swallow the event.
-        if (self.mouse.over_link and !self.mouse.selection_gesture.left_click_dragged) {
+        //
+        // webmux-gtk: a click that is reported to the program is never
+        // also a link click here. Only reachable with
+        // `links_while_mouse_reporting`, where the apprt opens the link.
+        if (self.mouse.over_link and
+            !self.mouse.selection_gesture.left_click_dragged and
+            !(self.isMouseReporting() and !(mods.shift and !shift_capture)))
+        {
             // We are holding the renderer lock, but this should just be
             // a cached value.
             const pos = release_pos orelse try self.rt_surface.getCursorPos();
@@ -4773,11 +4807,12 @@ pub fn cursorPosCallback(
     // 1. mouse reporting is off
     // OR
     // 2. mouse reporting is on and we are not reporting shift to the terminal
+    // OR
+    // 3. the apprt wants links while mouse reporting is on
     if ((over_link or
         self.mouse.link_point == null or
         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
-        (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
+        self.mouseLinksActive())
     {
         // If we were previously over a link, we always update. We do this so that if the text
         // changed underneath us, even if the mouse didn't move, we update the URL hints and state

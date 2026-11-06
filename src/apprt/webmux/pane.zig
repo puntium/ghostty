@@ -250,7 +250,7 @@ pub const TerminalPane = extern struct {
 
         /// The http(s) OSC 8 hyperlink under the pointer (owned).
         link_osc8: ?[:0]u8 = null,
-        /// A left press on a link, held back from the core (see
+        /// A left press on a link, waiting for its release (see
         /// `mouseMotion`).
         pending_link: ?PendingLink = null,
         /// Where the left button went down (for Alt+click).
@@ -943,6 +943,12 @@ pub const TerminalPane = extern struct {
     /// link through `iface.services.url` (Shift: copies it); moved to
     /// another cell it is replayed to the core as an ordinary press, so a
     /// drag that starts on a link still selects.
+    ///
+    /// While the program has mouse reporting on, the press is its to see
+    /// (T-19), so it goes to the core as usual and a release in the same
+    /// cell opens the link as well, as xterm.js does. Shift takes the
+    /// mouse back from the program, so Shift+click is held back and
+    /// copies as above.
     fn mouseMotion(self: *Self, pos: apprt.CursorPos, mods: input.Mods) void {
         const priv = self.private();
         const surface = priv.core_surface orelse {
@@ -951,15 +957,19 @@ pub const TerminalPane = extern struct {
         };
         if (priv.pending_link) |pl| {
             if (!self.sameCell(pl.pos, pos)) {
-                // The core reads the press position from getCursorPos, so
-                // replay with the pointer back where the press happened.
                 const press_pos = pl.pos;
                 const press_mods = pl.mods;
+                const held = pl.held;
                 self.clearPendingLink();
-                priv.cursor_pos = press_pos;
-                surface.cursorPosCallback(press_pos, press_mods) catch {};
-                _ = surface.mouseButtonCallback(.press, .left, press_mods) catch false;
-                priv.left_press = press_pos;
+                // A drag, not a link click. If the core has not seen the
+                // press, replay it. The core reads the press position from
+                // getCursorPos, so the pointer goes back there first.
+                if (held) {
+                    priv.cursor_pos = press_pos;
+                    surface.cursorPosCallback(press_pos, press_mods) catch {};
+                    _ = surface.mouseButtonCallback(.press, .left, press_mods) catch false;
+                    priv.left_press = press_pos;
+                }
             }
         }
         priv.cursor_pos = pos;
@@ -974,15 +984,17 @@ pub const TerminalPane = extern struct {
         const surface = priv.core_surface orelse return false;
         if (button == .left) {
             priv.left_press = priv.cursor_pos;
-            if (!surface.mouseReportingActive() and !mods.alt and !mods.ctrl) {
+            if (!mods.alt and !mods.ctrl) {
                 if (self.hoveredLink()) |url| {
+                    const held = !surface.mouseClickReported(mods);
                     self.clearPendingLink();
                     priv.pending_link = .{
                         .url = alloc_c.dupeSentinel(u8, url, 0) catch return false,
                         .pos = priv.cursor_pos,
                         .mods = mods,
+                        .held = held,
                     };
-                    return true;
+                    if (held) return true;
                 }
             }
         }
@@ -1071,7 +1083,9 @@ pub const TerminalPane = extern struct {
             defer self.clearPendingLink();
             const action: iface.services.UrlAction = if (mods.shift) .copy else .open;
             iface.services.url(pl.url, action, self.as(gtk.Widget));
-            return true;
+            // A held press never reached the core, so neither does its
+            // release. A reported one is the program's too.
+            if (pl.held) return true;
         };
         if (button == .middle and
             !priv.gtk_enable_primary_paste and
@@ -1970,6 +1984,10 @@ const PendingLink = struct {
     url: [:0]u8,
     pos: apprt.CursorPos,
     mods: input.Mods,
+    /// True if the press was held back from the core. False while the
+    /// program has mouse reporting on: it got the press, and gets the
+    /// release.
+    held: bool,
 };
 
 /// See `TerminalPane.handleKey` and the stock surface's IMKeyEvent.
