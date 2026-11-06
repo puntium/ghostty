@@ -10,6 +10,7 @@ const gtk = @import("gtk");
 const control = @import("../control.zig");
 const Application = @import("../application.zig").Application;
 const iface = @import("../iface.zig");
+const perf = @import("../perf.zig");
 const layout = @import("../../../webmux/layout.zig");
 const ws_mod = @import("workspace.zig");
 const Workspace = ws_mod.Workspace;
@@ -25,6 +26,7 @@ pub fn register() void {
     control.register(.{ .name = "workspace-front", .help = "front=true|false: Workspace.setFront", .handler = &front });
     control.register(.{ .name = "workspace-reload", .help = "Workspace.reload: re-list the host's sessions and reconcile", .handler = &reload });
     control.register(.{ .name = "workspace-save", .help = "write the layout file now", .handler = &save });
+    control.register(.{ .name = "perf", .help = "[window_ms=5000] [frames=N] [reset=true]: frame metrics (perf.zig): the stats of every frame clock cycle of the last window_ms, of each layout animation and scroll chase, the newest N cycles as recorded, and this process's GPU counters", .handler = &perfCmd });
     control.register(.{ .name = "workspace-settings", .help = "[fade=0..100] [min_cols] [max_cols]: replace iface.settings (dev/test only; the chrome owns them)", .handler = &settings });
 }
 
@@ -180,6 +182,14 @@ fn scroll(req: *control.Request) void {
     const bub = if (!cap and over == .files) ws.handleScroll(dx, dy, unit, false, null) else false;
     const d = ws.dump(req.allocator()) catch return req.fail("out of memory", .{});
     req.ok(.{ .capture = cap, .bubble = bub, .scroll = d.scroll });
+}
+
+fn perfCmd(req: *control.Request) void {
+    const window_ms = @max(1, req.int("window_ms") orelse 5000);
+    const raw: usize = @intCast(@max(0, req.int("frames") orelse 0));
+    const r = perf.report(req.allocator(), window_ms * 1000, raw) catch return req.fail("out of memory", .{});
+    if (req.get("reset")) |v| if (v == .bool and v.bool) perf.reset();
+    req.ok(r);
 }
 
 fn motion(req: *control.Request) void {

@@ -17,8 +17,11 @@ workspace-strip > .workspace-message {
   padding: 24px;
 }
 
+/* No background-color: frame.zig draws the panel colour itself, and only
+   where the pane does not paint its own (a terminal does). The colours
+   here have twins in frame.zig (panelColor, stripColor, borderColor,
+   accentColor), which redraws the corners over the pane's content. */
 pane-frame {
-  background-color: #1f1f2b;
   border: 1px solid #34344a;
   border-radius: 8px;
   color: #c8c8d8;
@@ -119,7 +122,6 @@ workspace-strip.light pane-frame > .pane-placeholder {
   color: #343b58;
 }
 workspace-strip.light pane-frame {
-  background-color: #f4f5f9;
   border-color: #c4c8d8;
   color: #343b58;
 }

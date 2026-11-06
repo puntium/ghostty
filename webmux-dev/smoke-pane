@@ -230,7 +230,9 @@ connlog() { cat "$dir/home/.local/state/webmux-gtk/logs/webmux.log"; }
 ok "padding 4 px, cell 7x17 px"
 
 # --- scrollback keeps at least 5000 lines (T-03) -----------------------------
-fresh 'seq 1 7000\n'; wait_ $'\n7000\n' || fail "seq 7000"
+# (The Debug binary parses this for about 9 s on a busy machine: more than
+# wait_'s 8 s, and how fast it is is not what is being checked.)
+fresh 'seq 1 7000\n'; ctl -q wait contains=$'\n7000\n' timeout_ms:=30000 || fail "seq 7000"
 kept=$(python3 -I -c 'import json,sys; s=json.loads(sys.argv[1]); print(s["total"]-s["len"])' "$(field panes.0.scrollbar)")
 (( kept >= 5000 )) || fail "scrollback keeps $kept lines, want >= 5000"
 ok "scrollback keeps $kept lines"

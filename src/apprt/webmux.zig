@@ -34,6 +34,7 @@ test {
     _ = @import("webmux/terminal/links.zig");
     _ = @import("webmux/terminal/selection.zig");
     _ = @import("webmux/workspace/tests.zig");
+    _ = @import("webmux/perf.zig");
     _ = @import("webmux/chrome/tests.zig");
     _ = @import("webmux/terminal/clipboard.zig");
     _ = @import("webmux/panels/model.zig");

@@ -12,7 +12,13 @@
 //!
 //!     WebmuxTerminalPane (adw.Bin; holds all event controllers)
 //!       gtk.Overlay   (`overlay()`: put pane-local overlays here)
-//!         WebmuxRenderSurface (focusable; shows the renderer's frames)
+//!         [gtk.GraphicsOffload, only with WEBMUX_GTK_OFFLOAD=1]
+//!           WebmuxRenderSurface (focusable; shows the renderer's frames)
+//!       gtk.Box       (the 10 px scrollbar column) > gtk.Scrollbar
+//!
+//! The pane paints its own background: the render surface where its
+//! texture does not reach, the scrollbar column through CSS. Nothing
+//! needs to be drawn under it.
 //!
 //! Event coordinates are taken relative to the pane and handed to the core
 //! as surface pixels, so the render surface must fill the pane: put chrome
@@ -48,7 +54,8 @@ const Common = @import("class.zig").Common;
 const ApprtSurface = @import("Surface.zig");
 const Application = @import("application.zig").Application;
 const ConfigObject = @import("config_object.zig").Config;
-const RenderSurface = @import("render_surface.zig").RenderSurface;
+const render_surface_mod = @import("render_surface.zig");
+const RenderSurface = render_surface_mod.RenderSurface;
 const KeyEvent = @import("key_event.zig").KeyEvent;
 const gsettings = @import("gsettings.zig");
 const gtk_key = @import("key.zig");
@@ -187,6 +194,9 @@ pub const TerminalPane = extern struct {
 
         overlay: *gtk.Overlay = undefined,
         render_surface: *RenderSurface = undefined,
+        /// See `holdResize`.
+        hold_resize: bool = false,
+        pending_size: ?apprt.SurfaceSize = null,
         im_context: *gtk.IMMulticontext = undefined,
 
         rt_surface: ApprtSurface = undefined,
@@ -1514,12 +1524,37 @@ pub const TerminalPane = extern struct {
         return window.isSuspended() != 0;
     }
 
+    /// While held, a resize of the terminal waits (`iface.Pane.
+    /// holdResize`): the container is animating the pane to its new size,
+    /// and the terminal takes it when the move ends. A pane that has no
+    /// core surface yet is not held back: its session starts at once, at
+    /// the size it is given.
+    pub fn holdResize(self: *Self, hold: bool) void {
+        const priv = self.private();
+        if (priv.hold_resize == hold) return;
+        priv.hold_resize = hold;
+        if (hold) return;
+        const pending = priv.pending_size orelse return;
+        priv.pending_size = null;
+        self.applySize(pending);
+    }
+
     fn renderSurfaceResize(_: *RenderSurface, width: c_int, height: c_int, self: *Self) callconv(.c) void {
         const priv = self.private();
         const new_size: apprt.SurfaceSize = .{
             .width = @intCast(width),
             .height = @intCast(height),
         };
+        if (priv.hold_resize and priv.core_surface != null) {
+            priv.pending_size = new_size;
+            return;
+        }
+        priv.pending_size = null;
+        self.applySize(new_size);
+    }
+
+    fn applySize(self: *Self, new_size: apprt.SurfaceSize) void {
+        const priv = self.private();
         const changed = !priv.size.eql(&new_size);
         priv.size = new_size;
 
@@ -1579,6 +1614,9 @@ pub const TerminalPane = extern struct {
 
         signals.ready.impl.emit(self, null, .{}, null);
         self.updateFocus(priv.focused);
+        // A pane told to stay hidden before its surface existed (the
+        // container is still moving it into place) starts that way.
+        if (!priv.shown) self.updateOcclusion();
     }
 
     //---------------------------------------------------------------
@@ -1731,9 +1769,18 @@ pub const TerminalPane = extern struct {
     fn applySchemeClass(self: *Self) void {
         const priv = self.private();
         const config = priv.config orelse return;
-        const lum = config.get().background.toTerminalRGB().perceivedLuminance();
+        const bg = config.get().background.toTerminalRGB();
+        const lum = bg.perceivedLuminance();
         const widget = self.as(gtk.Widget);
         if (lum > 0.5) widget.addCssClass("light") else widget.removeCssClass("light");
+        // The render surface fills in the terminal's background itself,
+        // and imports its frames as opaque when the terminal is.
+        priv.render_surface.setBackground(.{
+            .f_red = @as(f32, @floatFromInt(bg.r)) / 255,
+            .f_green = @as(f32, @floatFromInt(bg.g)) / 255,
+            .f_blue = @as(f32, @floatFromInt(bg.b)) / 255,
+            .f_alpha = 1,
+        }, config.get().@"background-opacity" >= 1);
     }
 
     /// Send a side-channel frame on the session socket (remote panes).
@@ -1826,7 +1873,18 @@ pub const TerminalPane = extern struct {
         rs_widget.setFocusable(1);
         rs_widget.setFocusOnClick(1);
         rs_widget.setCursorFromName("text");
-        ov.setChild(rs_widget);
+        if (render_surface_mod.offloadWanted()) {
+            // The frames go to the compositor on a subsurface while
+            // nothing but a rectangular clip stands between the texture
+            // and the window (GTK falls back to drawing them otherwise).
+            const off = gtk.GraphicsOffload.new(rs_widget);
+            off.setEnabled(.enabled);
+            off.as(gtk.Widget).setHexpand(1);
+            off.as(gtk.Widget).setVexpand(1);
+            ov.setChild(off.as(gtk.Widget));
+        } else {
+            ov.setChild(rs_widget);
+        }
         ov.as(gtk.Widget).setHexpand(1);
 
         // T-10: terminal | 10px scrollbar column.
@@ -1837,9 +1895,16 @@ pub const TerminalPane = extern struct {
         priv.scrollbar_widget = sb;
         sb.as(gtk.Widget).addCssClass("webmux-terminal-scrollbar");
         sb.as(gtk.Widget).setOpacity(0);
+        // The column carries the terminal's background (terminal.css):
+        // the scrollbar itself is fully transparent while there is
+        // nothing to scroll, and nothing is painted under the pane.
+        const sb_col = gtk.Box.new(.vertical, 0);
+        sb_col.as(gtk.Widget).addCssClass("webmux-terminal-scrollbar-column");
+        sb.as(gtk.Widget).setVexpand(1);
+        sb_col.append(sb.as(gtk.Widget));
         const box = gtk.Box.new(.horizontal, 0);
         box.append(ov.as(gtk.Widget));
-        box.append(sb.as(gtk.Widget));
+        box.append(sb_col.as(gtk.Widget));
         self.as(adw.Bin).setChild(box.as(gtk.Widget));
         self.applySchemeClass();
 

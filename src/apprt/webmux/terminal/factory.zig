@@ -4,6 +4,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const gobject = @import("gobject");
+const graphene = @import("graphene");
 const gtk = @import("gtk");
 
 const iface = @import("../iface.zig");
@@ -69,6 +70,8 @@ const vtable: iface.Pane.VTable = .{
     .saveState = saveState,
     .setShown = setShown,
     .cellWidthPx = cellWidthPx,
+    .fade = fade,
+    .holdResize = holdResize,
 };
 
 fn fromCtx(ctx: *anyopaque) *Adapter {
@@ -98,6 +101,22 @@ fn cellWidthPx(ctx: *anyopaque) ?u32 {
     const surface = pane.core() orelse return null;
     const w = surface.size.cell.width;
     return if (w == 0) null else w;
+}
+
+/// The terminal paints its own background and fades in the pass that
+/// draws its texture; the scrollbar column beside it is left to the
+/// container.
+fn fade(ctx: *anyopaque, scale: f32, add: [3]f32) ?iface.Pane.Rect {
+    const pane = fromCtx(ctx).pane;
+    const rs = pane.renderSurface();
+    rs.setFade(scale, add);
+    var b: graphene.Rect = undefined;
+    if (rs.as(gtk.Widget).computeBounds(pane.as(gtk.Widget), &b) == 0) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    return .{ .x = b.f_origin.f_x, .y = b.f_origin.f_y, .w = b.f_size.f_width, .h = b.f_size.f_height };
+}
+
+fn holdResize(ctx: *anyopaque, hold: bool) void {
+    fromCtx(ctx).pane.holdResize(hold);
 }
 
 fn onTitle(_: *TerminalPane, _: *gobject.ParamSpec, self: *Adapter) callconv(.c) void {

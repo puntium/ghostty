@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Measure how smoothly webmux-gtk animates: a repeatable run in a nested
+headless compositor, at any output size, with nothing touching the desktop.
+
+  webmux-dev/perf                               # 6016x3384 at scale 2 (a 6K display)
+  webmux-dev/perf --size 3840x2160 --scale 1.5
+  webmux-dev/perf -- WEBMUX_GTK_OFFLOAD=1       # the same run with one thing changed
+  webmux-dev/perf --json out.json               # keep the raw spans
+  webmux-dev/perf --keep                        # leave the run up; prints its directory
+
+What it does: starts `webmux-dev/headless start --host` with the window
+filling the output, opens `--columns` terminal columns with text in them,
+then runs each kind of change (new column, new stacked pane, focus moves
+that scroll the strip, column and pane moves, full-width toggle, close),
+waiting for the strip to settle after each. The app records every frame
+of every animation (src/apprt/webmux/perf.zig); this prints one row per
+change from the control socket's `perf` command.
+
+Reading a row:
+
+  frames      frame clock cycles during the animation
+  ms          how long it ran
+  gap         the longest time between two frames the compositor showed
+  missed      refreshes that went by without a new frame
+  step        the longest step of the frame clock's time (what the motion saw)
+  cpu avg/max main-thread time per cycle; `u/l/p` are the worst cycle's
+              update (ticks), layout (allocation; terminal resizes land
+              here) and paint (snapshot + GSK submission) phases
+  first       from the change to the end of its first cycle
+  tex         pane textures built (new terminal frames) and the time it took
+  gpu app     the app's share of the GPU's render engine during the change
+  gpu comp    the nested compositor's share over the same time
+
+Main-thread bound: `cpu max` near or over the refresh interval. GPU bound:
+`cpu` small but `missed` > 0 and the two `gpu` columns adding up to most
+of the engine. A timing fault: `step` uneven with nothing missed.
+
+The compositor here is sway's headless backend rendering with the real
+GPU, so the pixel work matches a display of that size, but there is no
+scanout and its frame timer is not a display's vsync: compare runs with
+each other rather than reading one as what a desktop would do. The GPU
+is shared with the desktop session, so close heavy things first.
+
+The first run on a machine compiles every shader (its cache starts
+empty) and shows long `paint` and `layout` phases wherever something is
+drawn for the first time; the script says so. Later runs reuse the cache
+in --shader-cache, as a desktop reuses its own.
+
+Environment: WEBMUX_GTK_BIN as for `headless` (default: the release
+binary if there is one under the checkout, else the debug one).
+"""
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+FORK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEV = os.path.join(FORK, "webmux-dev")
+
+
+class Ctl:
+    def __init__(self, path):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(path)
+        self.file = self.sock.makefile("rwb")
+
+    def call(self, cmd, **args):
+        req = dict(args, cmd=cmd)
+        self.file.write(json.dumps(req).encode() + b"\n")
+        self.file.flush()
+        line = self.file.readline()
+        if not line:
+            raise SystemExit(f"perf: the app closed the control socket during {cmd}")
+        rep = json.loads(line)
+        if not rep.get("ok"):
+            raise SystemExit(f"perf: {cmd} failed: {rep.get('error')}")
+        return rep.get("result")
+
+
+def gpu_counters(pid):
+    """(busy, total) render-engine counters of a process, from DRM fdinfo."""
+    busy, total, seen = 0, 0, set()
+    try:
+        fds = os.listdir(f"/proc/{pid}/fdinfo")
+    except OSError:
+        return None
+    found = False
+    for fd in fds:
+        try:
+            with open(f"/proc/{pid}/fdinfo/{fd}") as f:
+                text = f.read()
+        except OSError:
+            continue
+        if "drm-client-id:" not in text:
+            continue
+        fields = {}
+        for line in text.splitlines():
+            k, _, v = line.partition(":")
+            fields[k.strip()] = v.strip().split(" ")[0]
+        client = fields.get("drm-client-id")
+        if client in seen:
+            continue
+        seen.add(client)
+        if "drm-cycles-rcs" in fields:
+            busy += int(fields["drm-cycles-rcs"])
+            total = max(total, int(fields.get("drm-total-cycles-rcs", "0")))
+            found = True
+        elif "drm-engine-render" in fields:
+            busy += int(fields["drm-engine-render"])
+            total = time.monotonic_ns()
+            found = True
+    return (busy, total) if found else None
+
+
+def share(a, b):
+    if not a or not b or b[1] <= a[1] or b[0] < a[0]:
+        return None
+    return 100.0 * (b[0] - a[0]) / (b[1] - a[1])
+
+
+def pid_of(run, name):
+    with open(os.path.join(run, "pids")) as f:
+        for line in f:
+            k, _, v = line.strip().partition("=")
+            if k == name:
+                return int(v)
+    return None
+
+
+def child_of(pid):
+    """The app is the child of the wrapper shell `headless` records."""
+    try:
+        out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout.split()
+        return int(out[0]) if out else pid
+    except (OSError, ValueError):
+        return pid
+
+
+def fmt(v, spec="{:.1f}"):
+    return "-" if v is None else spec.format(v)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--size", default="6016x3384", help="output size in device pixels (default: %(default)s)")
+    ap.add_argument("--scale", default="2", help="output scale (default: %(default)s)")
+    ap.add_argument("--columns", type=int, default=5, help="terminal columns to open (default: %(default)s)")
+    ap.add_argument("--rounds", type=int, default=2, help="times to repeat the moves (default: %(default)s)")
+    ap.add_argument("--fade", type=int, default=None, help="unfocused fade, 0..100 (default: the app's)")
+    ap.add_argument("--shader-cache", metavar="DIR", default="/tmp/wm-perf-shader-cache",
+                    help="Mesa shader cache kept between runs; empty string for none (default: %(default)s)")
+    ap.add_argument("--json", metavar="FILE", help="write the raw spans here")
+    ap.add_argument("--keep", action="store_true", help="leave the run up afterwards")
+    ap.add_argument("env", nargs="*", help="after --: VAR=value for the app")
+    args = ap.parse_args()
+
+    bin_ = os.environ.get("WEBMUX_GTK_BIN")
+    if not bin_:
+        rel = os.path.join(FORK, "zig-out-release", "bin", "webmux-gtk")
+        bin_ = rel if os.path.exists(rel) else os.path.join(FORK, "zig-out", "bin", "webmux-gtk")
+    env = dict(os.environ, WEBMUX_GTK_BIN=bin_)
+
+    w, h = (int(x) for x in args.size.split("x"))
+    scale = float(args.scale)
+    # The run's HOME is thrown away, and with it Mesa's shader cache: every
+    # shader GSK and the terminals use would be compiled again on its first
+    # use, tens of milliseconds each on the main thread, which a desktop
+    # pays once. Keep a cache between runs (not the desktop's own).
+    cache = args.shader_cache
+    cold = False
+    if cache:
+        cold = not (os.path.isdir(cache) and os.listdir(cache))
+        os.makedirs(cache, exist_ok=True)
+    start = [os.path.join(DEV, "headless"), "start", "--host", "--size", args.size, "--scale", args.scale, "--"]
+    if cache:
+        start += [f"MESA_SHADER_CACHE_DIR={cache}"]
+    start += args.env
+    run = subprocess.run(start, env=env, capture_output=True, text=True)
+    if run.returncode != 0:
+        sys.stderr.write(run.stderr)
+        raise SystemExit("perf: headless start failed")
+    rundir = run.stdout.strip().splitlines()[-1]
+    try:
+        measure(args, rundir, bin_, int(w / scale), int(h / scale))
+        if cold:
+            print("the shader cache was empty: this run compiled every shader on first use; run again for numbers a desktop would see")
+    finally:
+        if args.keep:
+            print(f"perf: run left up in {rundir} (webmux-dev/headless stop {rundir})")
+        else:
+            subprocess.run([os.path.join(DEV, "headless"), "stop", rundir], capture_output=True)
+
+
+def measure(args, rundir, bin_, lw, lh):
+    ctl = Ctl(os.path.join(rundir, "ctl.sock"))
+    sway_pid = pid_of(rundir, "sway")
+    app_pid = child_of(pid_of(rundir, "app"))
+
+    ctl.call("resize", width=lw, height=lh)
+    subprocess.run([os.path.join(DEV, "in-session"), rundir, "swaymsg",
+                    '[app_id="me.puntium.webmux.gtk"] move position 0 0'], capture_output=True)
+    ctl.call("workspace-wait", panes=1, timeout_ms=15000)
+    if args.fade is not None:
+        ctl.call("workspace-settings", fade=args.fade)
+
+    def fill():
+        # Text in the focused terminal, so its frames are not blank.
+        ctl.call("text", text="seq 1 400\n")
+
+    rows = []
+
+    def op(name, panes=None):
+        """One change: run it, wait until the strip is settled, note the
+        compositor's GPU share over that time."""
+        c0 = gpu_counters(sway_pid)
+        ctl.call("pane-command", name=name)
+        wait = {"timeout_ms": 15000}
+        if panes is not None:
+            wait["panes"] = panes
+        ctl.call("workspace-wait", **wait)
+        c1 = gpu_counters(sway_pid)
+        rows.append({"op": name, "comp_gpu": share(c0, c1)})
+        # Spans get their stats a moment after they end.
+        time.sleep(0.45)
+
+    fill()
+    time.sleep(0.5)
+    ctl.call("perf", reset=True)
+    n = 1
+    for _ in range(args.columns - 1):
+        n += 1
+        op("new-terminal", panes=n)
+        fill()
+    n += 1
+    op("new-terminal-below", panes=n)
+    fill()
+    for _ in range(args.rounds):
+        for name in ["focus-left"] * (args.columns - 1) + ["focus-right"] * (args.columns - 1):
+            op(name)
+        for name in ["move-column-left", "move-column-left", "move-column-right", "move-column-right",
+                     "consume-expel-left", "consume-expel-right", "toggle-full", "toggle-full",
+                     "move-pane-up", "move-pane-down"]:
+            op(name)
+    op("close-pane", panes=n - 1)
+    op("close-pane", panes=n - 2)
+
+    # Terminal output with nothing animating: what a busy pane costs.
+    o0, c0, t0 = gpu_counters(app_pid), gpu_counters(sway_pid), time.monotonic()
+    ctl.call("text", text="timeout 2 yes 'the quick brown fox jumps over the lazy dog 0123456789'\n")
+    time.sleep(2.3)
+    o1, c1 = gpu_counters(app_pid), gpu_counters(sway_pid)
+    out_ms = int((time.monotonic() - t0) * 1000)
+
+    rep = ctl.call("perf", window_ms=out_ms)
+    dump = ctl.call("dump", text=False)
+    spans = rep["spans"]
+
+    win = dump["window"]
+    print(f"binary   {bin_}")
+    print(f"window   {win['width']}x{win['height']} at scale {win['scale']}, {win['gsk_renderer']}, "
+          f"offload {'on' if win.get('offload') else 'off'}"
+          + (f", env {' '.join(args.env)}" if args.env else ""))
+    panes = dump["panes"]
+    if panes:
+        f = panes[0]["frames"]
+        print(f"panes    {len(panes)}; frames of the first: {f['dmabuf']} dmabuf ({f.get('opaque', 0)} opaque), "
+              f"{f['memory']} memory, {f['dmabuf_import_failures']} import failures")
+    print()
+    head = f"{'change':<22}{'frames':>7}{'ms':>6}{'gap':>7}{'missed':>7}{'step':>7}{'cpu avg':>9}{'max':>6}  {'u/l/p':<16}{'first':>6}{'tex':>5}{'ms':>6}{'gpu app':>9}{'comp':>6}"
+    print(head)
+    print("-" * len(head))
+    # Layout spans pair up with the ops in order; chases are listed under
+    # the op that started them.
+    it = iter(rows)
+    cur = None
+    total = {"frames": 0, "missed": 0, "gap": 0.0, "cpu_max": 0.0, "gpu": [], "comp": []}
+    out_rows = []
+    for s in spans:
+        st = s["stats"]
+        if s["kind"] == "layout":
+            cur = next(it, None)
+            # Focus moves start no layout animation; skip to the op this
+            # span belongs to.
+            while cur is not None and cur["op"].startswith("focus-"):
+                cur = next(it, None)
+        label = s["label"] if s["kind"] == "layout" else "  scroll"
+        comp = cur["comp_gpu"] if (cur is not None and s["kind"] == "layout") else None
+        ulp = f"{st['worst_update_ms']:.1f}/{st['worst_layout_ms']:.1f}/{st['worst_paint_ms']:.1f}"
+        print(f"{label:<22}{st['frames']:>7}{st['duration_ms']:>6.0f}{st['presented_max_ms']:>7.1f}{st['missed']:>7}"
+              f"{st['step_max_ms']:>7.1f}{st['cpu_avg_ms']:>9.1f}{st['cpu_max_ms']:>6.1f}  {ulp:<16}"
+              f"{st['first_frame_ms']:>6.0f}{st['textures']:>5}{st['texture_ms']:>6.1f}"
+              f"{fmt(st.get('gpu_pct'), '{:.0f}%'):>9}{fmt(comp, '{:.0f}%'):>6}")
+        total["frames"] += st["frames"]
+        total["missed"] += st["missed"]
+        total["gap"] = max(total["gap"], st["presented_max_ms"])
+        total["cpu_max"] = max(total["cpu_max"], st["cpu_max_ms"])
+        if st.get("gpu_pct") is not None:
+            total["gpu"].append(st["gpu_pct"])
+        if comp is not None:
+            total["comp"].append(comp)
+        out_rows.append({"kind": s["kind"], "label": s["label"], "comp_gpu_pct": comp, **st})
+    print("-" * len(head))
+    avg = lambda xs: sum(xs) / len(xs) if xs else None
+    print(f"{len(spans)} animations: {total['frames']} frames, {total['missed']} missed refreshes, "
+          f"longest gap {total['gap']:.1f} ms, worst cycle {total['cpu_max']:.1f} ms on the main thread, "
+          f"GPU app {fmt(avg(total['gpu']), '{:.0f}%')} + compositor {fmt(avg(total['comp']), '{:.0f}%')} on average")
+    w = rep["window"]
+    print(f"terminal output ({out_ms} ms, 2 s of `yes`): {w['frames']} cycles, cpu avg {w['cpu_avg_ms']:.1f} max {w['cpu_max_ms']:.1f} ms, "
+          f"{w['textures']} textures in {w['texture_ms']:.1f} ms, longest gap {w['presented_max_ms']:.1f} ms, "
+          f"GPU app {fmt(share(o0, o1), '{:.0f}%')} + compositor {fmt(share(c0, c1), '{:.0f}%')}")
+
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump({"binary": bin_, "window": win, "env": args.env, "spans": out_rows,
+                       "output": {"ms": out_ms, **w, "app_gpu_pct": share(o0, o1), "comp_gpu_pct": share(c0, c1)}}, f, indent=1)
+        print(f"raw spans in {args.json}")
+
+
+if __name__ == "__main__":
+    main()

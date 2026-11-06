@@ -13,6 +13,14 @@
 //!     its shell when it shrinks; a closing pane stays at its old box while
 //!     a clip closes in. Nothing is re-allocated per frame, so terminals
 //!     resize (and tell the host their grid) once per change;
+//!   - animation time is the frame clock's, advanced in `tick`: every
+//!     frame is drawn for the moment it is shown, so equal frames make
+//!     equal steps. The frames right after a change carry its cost (the
+//!     terminals resize and re-render); their extra time is not counted,
+//!     so the move starts late rather than skipping ahead. Offsets and
+//!     clips are snapped to device pixels;
+//!   - `perf.zig` records every animation and chase (WEBMUX.md ›
+//!     Performance);
 //!   - sessions are created and deleted on worker threads (`sessions.zig`);
 //!     the layout file is written debounced and atomically (`store.zig`).
 const std = @import("std");
@@ -29,6 +37,8 @@ const gtk = @import("gtk");
 const Common = @import("../class.zig").Common;
 const ext = @import("../ext.zig");
 const iface = @import("../iface.zig");
+const perf = @import("../perf.zig");
+const offload_wanted = @import("../render_surface.zig").offloadWanted;
 const scale_util = @import("../scale.zig");
 const global = @import("../../../global.zig");
 const conn = @import("../../../webmux/conn.zig");
@@ -78,6 +88,9 @@ const Item = struct {
     /// Final box, snapped, strip space: the frame's allocation.
     box: Box = .{},
     flight: ?Flight = null,
+    /// A new pane on its way in: it does not render until it has arrived
+    /// (`holdPanes`).
+    arriving: bool = false,
 
     fn deinit(self: *Item) void {
         alloc.free(self.id);
@@ -110,16 +123,62 @@ const Leaving = struct {
     cut: anim.Cut,
 };
 
+/// Frame clock time for an animation: how far it has come, advanced once
+/// per frame by the clock's own step.
+const Clock = struct {
+    /// Frame clock time of the last tick; null before the first.
+    last_us: ?i64 = null,
+    /// Monotonic time of the last tick (for the stall timeout).
+    last_wall_us: i64 = 0,
+    ticks: u32 = 0,
+
+    /// Time held back so far, ms.
+    absorbed_ms: f64 = 0,
+
+    /// A frame that comes late (the change's own cost: allocation, a new
+    /// terminal starting, the GPU busy with terminals re-rendering) does
+    /// not make the motion jump ahead by the time lost: a step longer
+    /// than `hitch_cap` refreshes counts as that much, so the move runs
+    /// late instead. At most `hitch_budget_ms` per animation, so a
+    /// display that is slow all the time still gets there.
+    const hitch_cap = 2;
+    const hitch_budget_ms = 250;
+
+    /// Milliseconds this frame advances the animation by. The first tick
+    /// counts one refresh: the frame it draws is the first to differ.
+    fn step(self: *Clock, fc: *gdk.FrameClock) f64 {
+        const now = fc.getFrameTime();
+        const refresh = @as(f64, @floatFromInt(frame_mod.refreshUs(fc))) / 1000;
+        var dt = if (self.last_us) |l| @as(f64, @floatFromInt(now - l)) / 1000 else refresh;
+        self.last_us = now;
+        self.last_wall_us = glib.getMonotonicTime();
+        self.ticks += 1;
+        const cap = hitch_cap * refresh;
+        if (dt > cap and self.absorbed_ms < hitch_budget_ms) {
+            const held = @min(dt - cap, hitch_budget_ms - self.absorbed_ms);
+            self.absorbed_ms += held;
+            dt -= held;
+        }
+        return @max(0, dt);
+    }
+};
+
 const Anim = struct {
-    start_us: i64,
     serial: u32,
+    /// How long this move takes, ms (before `time_scale`).
+    duration_ms: f64,
+    /// How far it has come, ms (after `time_scale`).
+    elapsed_ms: f64 = 0,
+    clock: Clock = .{},
     timeout: c_uint = 0,
+    perf_span: u32 = 0,
 };
 
 const Chase = struct {
     target: f64,
     pos: f64,
-    last_us: ?i64 = null,
+    clock: Clock = .{},
+    perf_span: u32 = 0,
 };
 
 /// Boxes as the eye saw them before a change (app.js snapshotStrip).
@@ -186,6 +245,14 @@ pub const Workspace = extern struct {
         items: std.ArrayList(*Item) = .empty,
         dividers: std.ArrayList(*Divider) = .empty,
         leaving: std.ArrayList(*Leaving) = .empty,
+        /// Panes whose closing animation has ended, until the frame that
+        /// ends it is drawn (`settleIn`).
+        doomed: std.ArrayList(*Item) = .empty,
+        /// The panes are to be released (`releasePanes`) once the frame
+        /// being drawn is out.
+        release_pending: bool = false,
+        /// The idle that does both, after the frame.
+        after_frame: c_uint = 0,
         ghosts: std.ArrayList(*Ghost) = .empty,
         geom: ?Geometry = null,
         vw: c_int = 0,
@@ -280,7 +347,7 @@ pub const Workspace = extern struct {
     pub fn setFront(self: *Self, front: bool) void {
         const priv = self.private();
         priv.front = front;
-        for (priv.items.items) |it| if (it.pane) |p| p.setShown(front);
+        for (priv.items.items) |it| self.applyShown(it);
     }
 
     pub fn reload(self: *Self) void {
@@ -431,7 +498,7 @@ pub const Workspace = extern struct {
             return;
         };
         _ = self.makeItem(id, .terminal, null, null);
-        self.commit(&pre, null);
+        self.commit(&pre, null, if (r.below) "new-terminal-below" else "new-terminal");
         self.focusKeyboard();
     }
 
@@ -449,7 +516,7 @@ pub const Workspace = extern struct {
             return;
         };
         _ = self.makeItem(id, .files, store.initial_files_state, null);
-        self.commit(&pre, null);
+        self.commit(&pre, null, "new-files");
         self.focusKeyboard();
     }
 
@@ -470,7 +537,7 @@ pub const Workspace = extern struct {
         // is going away; nothing it draws now matters).
         if (it.pane) |p| p.setShown(false);
         it.frame.detach();
-        self.commit(&pre, it);
+        self.commit(&pre, it, "close");
         self.focusKeyboard();
     }
 
@@ -495,18 +562,18 @@ pub const Workspace = extern struct {
         if (iface.factories.get(kind)) |factory| {
             if (factory.create(&c, id, state, self.paneHost())) |pane| {
                 it.pane = pane;
-                frame.setBody(pane.widget);
-                if (!priv.front) pane.setShown(false);
+                frame.setBody(pane.widget, pane);
+                self.applyShown(it);
             } else |err| {
                 log.err("{s}: pane {s} could not be created: {t}", .{ priv.name, id, err });
                 var buf: [160]u8 = undefined;
-                frame.setBody(placeholder(std.fmt.bufPrintSentinel(&buf, "This pane could not be opened ({t}).", .{err}, 0) catch "This pane could not be opened."));
+                frame.setBody(placeholder(std.fmt.bufPrintSentinel(&buf, "This pane could not be opened ({t}).", .{err}, 0) catch "This pane could not be opened."), null);
             }
         } else {
             frame.setBody(placeholder(switch (kind) {
                 .files => "File browser — not available in this build.",
                 .terminal => "Terminal — not available in this build.",
-            }));
+            }), null);
         }
         self.refreshTitle(it);
         return it;
@@ -749,7 +816,7 @@ pub const Workspace = extern struct {
                     pre.deinit();
                     return;
                 }
-                self.commit(&pre, null);
+                self.commit(&pre, null, cmd.name());
                 self.focusKeyboard();
             },
         }
@@ -802,11 +869,14 @@ pub const Workspace = extern struct {
 
     /// After the model changed (and new items exist, a removed one is
     /// `gone`): lay out the final geometry once and animate into it.
-    fn commit(self: *Self, pre: *Pre, gone: ?*Item) void {
+    /// `what` names the change for `perf`.
+    fn commit(self: *Self, pre: *Pre, gone: ?*Item, what: []const u8) void {
         defer pre.deinit();
         const priv = self.private();
         const animate = !self.reducedMotion() and self.as(gtk.Widget).getMapped() != 0 and priv.geom != null;
-        self.settle();
+        // Panes held for a move this change interrupts stay held if it
+        // starts another (decided below).
+        self.settleIn(.keep_holds);
 
         var after = layout.change.snapshot(alloc, &priv.model) catch return;
         defer after.deinit();
@@ -817,8 +887,12 @@ pub const Workspace = extern struct {
         self.relayout();
 
         var any = false;
+        var travel: f64 = 0;
         if (animate) {
-            any = self.planFlights(pre, &chg);
+            if (self.planFlights(pre, &chg)) |t| {
+                any = true;
+                travel = t;
+            }
             if (gone) |it| {
                 if (chg.leavingPane(it.id)) |l| if (pre.visual.oldPane(l.old)) |from| {
                     const above = if (l.above) |a| (if (self.itemById(a)) |x| x.box else null) else null;
@@ -827,6 +901,7 @@ pub const Workspace = extern struct {
                     lv.* = .{ .item = it, .from = from, .cut = anim.exitCut(from, l.alone, above, below) };
                     priv.leaving.append(alloc, lv) catch @panic("OOM");
                     any = true;
+                    travel = @max(travel, if (l.alone) from.w else from.h);
                 };
             }
         }
@@ -837,13 +912,23 @@ pub const Workspace = extern struct {
         }
         if (any) {
             priv.anim_serial +%= 1;
-            const now = self.frameTime();
-            priv.anim = .{ .start_us = now, .serial = priv.anim_serial };
-            // L-39: settled no later than 250 ms after it starts.
-            priv.anim.?.timeout = glib.timeoutAdd(@intFromFloat(anim.settle_ms * time_scale), settleTimeout, self);
+            perf.attach(self.as(gtk.Widget));
+            const duration = anim.moveMs(travel);
+            priv.anim = .{
+                .serial = priv.anim_serial,
+                .duration_ms = duration,
+                .perf_span = perf.spanBegin(.layout, what),
+            };
+            // L-39: the move ends on the frame clock (`tick`). This is
+            // for a clock that is not running (the window is not being
+            // drawn): settled no later than 50 ms after it should have.
+            priv.anim.?.timeout = glib.timeoutAdd(@intFromFloat((duration + anim.settle_slack_ms) * time_scale), settleTimeout, self);
+            self.holdPanes();
             // Hold the old scroll extent open while it runs.
             priv.keeper = pre.visual.extent;
             self.ensureTick();
+        } else if (priv.chase == null) {
+            self.releasePanes();
         }
 
         self.clampScrollNow();
@@ -857,10 +942,12 @@ pub const Workspace = extern struct {
     }
 
     /// Flights for every pane and divider of the new layout, and ghosts for
-    /// those that shrink. Returns whether anything moves.
-    fn planFlights(self: *Self, pre: *const Pre, chg: *const layout.Change) bool {
+    /// those that shrink. Returns how far the farthest edge travels, or
+    /// null if nothing moves.
+    fn planFlights(self: *Self, pre: *const Pre, chg: *const layout.Change) ?f64 {
         const priv = self.private();
         var any = false;
+        var travel: f64 = 0;
         const f = priv.model.focusedId();
         for (priv.items.items) |it| {
             const pc = chg.pane(it.id) orelse continue;
@@ -874,6 +961,7 @@ pub const Workspace = extern struct {
             const fl: Flight = .{ .from = from, .to = to, .fresh = fresh };
             it.flight = fl;
             any = true;
+            travel = @max(travel, fl.travel());
             if (fl.shrinks()) self.addGhost(fl, true, f != null and std.mem.eql(u8, f.?, it.id));
         }
         for (priv.dividers.items) |d| {
@@ -888,9 +976,10 @@ pub const Workspace = extern struct {
             const fl: Flight = .{ .from = from, .to = to };
             d.flight = fl;
             any = true;
+            travel = @max(travel, fl.travel());
             if (fl.shrinks()) self.addGhost(fl, false, false);
         }
-        return any;
+        return if (any) travel else null;
     }
 
     fn addGhost(self: *Self, fl: Flight, pane: bool, focused: bool) void {
@@ -911,9 +1000,31 @@ pub const Workspace = extern struct {
     /// End a layout animation (app.js settleStrip): flights cleared,
     /// ghosts and leaving panes gone. The allocations were final already.
     fn settle(self: *Self) void {
+        self.settleIn(.now);
+    }
+
+    const SettleMode = enum {
+        /// Everything at once.
+        now,
+        /// Called from the frame clock's tick, with this frame still to be
+        /// drawn: what would hold that frame back waits until it is out.
+        /// Tearing a closed terminal down waits for its socket's close
+        /// handshake (termio/webmux/Client.zig, 250 ms and more), and a
+        /// terminal released to its new size blocks GSK's submission
+        /// while it allocates (`holdPanes`); either would freeze the move
+        /// one frame short of its end.
+        in_frame,
+        /// As `now`, but the panes stay held: the caller is about to
+        /// start another move.
+        keep_holds,
+    };
+
+    fn settleIn(self: *Self, mode: SettleMode) void {
         const priv = self.private();
+        self.destroyDoomed();
         if (priv.anim) |a| {
             if (a.timeout != 0) _ = glib.Source.remove(a.timeout);
+            perf.spanEnd(a.perf_span);
             priv.anim = null;
         }
         for (priv.items.items) |it| it.flight = null;
@@ -924,43 +1035,148 @@ pub const Workspace = extern struct {
         }
         priv.ghosts.clearRetainingCapacity();
         for (priv.leaving.items) |l| {
-            self.destroyItem(l.item);
+            if (mode == .in_frame) {
+                l.item.frame.as(gtk.Widget).setChildVisible(0);
+                priv.doomed.append(alloc, l.item) catch @panic("OOM");
+            } else {
+                self.destroyItem(l.item);
+            }
             alloc.destroy(l);
         }
         priv.leaving.clearRetainingCapacity();
         if (priv.chase == null) {
             priv.keeper = null;
             self.clampScrollNow();
+            switch (mode) {
+                .now => self.releasePanes(),
+                .in_frame => priv.release_pending = true,
+                .keep_holds => {},
+            }
         }
+        self.scheduleAfterFrame();
         self.as(gtk.Widget).queueAllocate();
         self.as(gtk.Widget).queueDraw();
+    }
+
+    fn scheduleAfterFrame(self: *Self) void {
+        const priv = self.private();
+        if (priv.after_frame != 0) return;
+        if (priv.doomed.items.len == 0 and !priv.release_pending) return;
+        priv.after_frame = glib.idleAdd(afterFrame, self);
+    }
+
+    /// The frame that ended the move is out (an idle runs after the frame
+    /// clock's cycle).
+    fn afterFrame(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud.?));
+        const priv = self.private();
+        priv.after_frame = 0;
+        self.destroyDoomed();
+        if (priv.release_pending and priv.anim == null and priv.chase == null) self.releasePanes();
+        priv.release_pending = false;
+        return 0;
+    }
+
+    fn destroyDoomed(self: *Self) void {
+        const priv = self.private();
+        for (priv.doomed.items) |it| self.destroyItem(it);
+        priv.doomed.clearRetainingCapacity();
+    }
+
+    /// While the strip moves, the terminals hold still: a terminal that
+    /// takes a new size allocates its buffers again and renders from
+    /// scratch, and so does one that starts. On the GPU this was measured
+    /// on (xe, one DRM file for the whole process) those allocations
+    /// block GSK's own frame from being submitted for 50 to 150 ms each,
+    /// in the middle of the move. So from the change until the strip is
+    /// at rest (move and scroll both over), a resized terminal keeps
+    /// drawing at its old size (`iface.Pane.holdResize`; its allocation
+    /// is the final one already, and it takes the new size once, at the
+    /// end), and a new terminal attaches to its session at once but does
+    /// not render before it has arrived.
+    fn holdPanes(self: *Self) void {
+        const priv = self.private();
+        for (priv.items.items) |it| {
+            const p = it.pane orelse continue;
+            p.holdResize(true);
+            if (it.flight) |f| if (f.fresh) {
+                it.arriving = true;
+                self.applyShown(it);
+            };
+        }
+    }
+
+    fn releasePanes(self: *Self) void {
+        const priv = self.private();
+        priv.release_pending = false;
+        for (priv.items.items) |it| {
+            const p = it.pane orelse continue;
+            p.holdResize(false);
+            if (it.arriving) {
+                it.arriving = false;
+                self.applyShown(it);
+            }
+        }
+    }
+
+    /// A pane renders while its host is in front and it is not on its way
+    /// in.
+    fn applyShown(self: *Self, it: *Item) void {
+        const p = it.pane orelse return;
+        p.setShown(self.private().front and !it.arriving);
     }
 
     fn settleTimeout(ud: ?*anyopaque) callconv(.c) c_int {
         const self: *Self = @ptrCast(@alignCast(ud.?));
         const priv = self.private();
         if (priv.anim) |*a| {
+            // The frame clock is running and the move is only held up
+            // (its first frames were slow): it ends in `tick`. Look again
+            // in a moment in case the clock stops.
+            if (a.clock.ticks > 0 and glib.getMonotonicTime() - a.clock.last_wall_us < stall_us) {
+                a.timeout = glib.timeoutAdd(stall_us / 1000, settleTimeout, self);
+                return 0;
+            }
             a.timeout = 0;
             self.settle();
         }
         return 0;
     }
 
-    /// Eased progress of the running layout animation (1 when none).
+    /// A move whose clock has not drawn for this long is ended by its
+    /// timeout: the window is not being shown. Well above what a busy GPU
+    /// holds frames back for (over 100 ms was measured at 6K while a new
+    /// terminal started), or a slow start would cut the move short.
+    const stall_us = 500_000;
+
+    /// Eased progress of the running layout animation (1 when none), as
+    /// of the last frame.
     fn progress(self: *Self) f64 {
         const priv = self.private();
         const a = priv.anim orelse return 1;
-        const ms = @as(f64, @floatFromInt(self.frameTime() - a.start_us)) / 1000;
-        return anim.moveEase(ms / (anim.move_ms * time_scale));
+        return anim.moveEase(a.elapsed_ms / (a.duration_ms * time_scale));
     }
 
-    /// Animation time. Monotonic time rather than the frame clock's: after
-    /// the clock has been idle its frame time is stale, so the first frames
-    /// of an animation or a chase measured with it jumped ahead (audit:
-    /// the second chase step acted as if ~50 ms had passed).
-    fn frameTime(self: *Self) i64 {
-        _ = self;
-        return glib.getMonotonicTime();
+    /// The scale of the surface the strip is drawn on.
+    fn deviceScale(self: *Self) f64 {
+        return scale_util.widgetSurfaceScale(self.as(gtk.Widget));
+    }
+
+    /// The grid moving things are drawn on, as steps per CSS pixel:
+    /// device pixels, so a translated terminal stays sharp and clips are
+    /// plain scissors. An offloaded terminal has to sit on whole CSS
+    /// pixels as well (GTK does not hand a subsurface anything else).
+    fn pixelGrid(self: *Self) f64 {
+        return if (offload_wanted()) 1 else self.deviceScale();
+    }
+
+    fn snapTo(v: f64, grid: f64) f64 {
+        return @round(v * grid) / grid;
+    }
+
+    /// The scroll offset as drawn.
+    fn scrollPx(self: *Self) f64 {
+        return snapTo(self.private().scroll, self.pixelGrid());
     }
 
     pub fn reducedMotion(self: *Self) bool {
@@ -992,19 +1208,16 @@ pub const Workspace = extern struct {
     fn tick(w: *gtk.Widget, fc: *gdk.FrameClock, _: ?*anyopaque) callconv(.c) c_int {
         const self = gobject.ext.cast(Self, w).?;
         const priv = self.private();
-        _ = fc;
-        const now = glib.getMonotonicTime();
-        if (priv.anim) |a| {
-            const ms = @as(f64, @floatFromInt(now - a.start_us)) / 1000;
-            if (ms >= anim.move_ms * time_scale) self.settle() else w.queueDraw();
+        if (priv.anim) |*a| {
+            a.elapsed_ms += a.clock.step(fc);
+            if (a.elapsed_ms >= a.duration_ms * time_scale) self.settleIn(.in_frame) else w.queueDraw();
         }
         if (priv.chase) |*c| {
-            const dt: f64 = if (c.last_us) |l| @as(f64, @floatFromInt(now - l)) / 1000 else 16;
-            c.last_us = now;
+            const dt = c.clock.step(fc);
             const step = width.chaseStep(c.pos, c.target, dt / time_scale);
             c.pos = step.pos;
             priv.scroll = step.pos;
-            if (step.done) self.endChase();
+            if (step.done) self.endChaseIn(true);
             w.queueAllocate();
         }
         if (priv.anim == null and priv.chase == null) {
@@ -1103,17 +1316,33 @@ pub const Workspace = extern struct {
             return;
         }
         if (target == priv.scroll) return;
-        priv.chase = .{ .target = target, .pos = priv.scroll, .last_us = glib.getMonotonicTime() };
+        perf.attach(self.as(gtk.Widget));
+        priv.chase = .{ .target = target, .pos = priv.scroll, .perf_span = perf.spanBegin(.scroll, "chase") };
         self.ensureTick();
     }
 
     /// The chase is over (arrived, or the hand took over).
     fn endChase(self: *Self) void {
+        self.endChaseIn(false);
+    }
+
+    /// `in_frame`: from the tick, with the frame that ends it still to be
+    /// drawn (see `SettleMode.in_frame`).
+    fn endChaseIn(self: *Self, in_frame: bool) void {
         const priv = self.private();
+        if (priv.chase) |c| perf.spanEnd(c.perf_span);
         priv.chase = null;
-        if (priv.anim == null and priv.keeper != null) {
-            priv.keeper = null;
-            self.clampScrollNow();
+        if (priv.anim == null) {
+            if (in_frame) {
+                priv.release_pending = true;
+                self.scheduleAfterFrame();
+            } else {
+                self.releasePanes();
+            }
+            if (priv.keeper != null) {
+                priv.keeper = null;
+                self.clampScrollNow();
+            }
         }
     }
 
@@ -1170,7 +1399,7 @@ pub const Workspace = extern struct {
 
     fn kindAt(self: *Self, x: f64, y: f64) ?layout.Kind {
         const priv = self.private();
-        const sx = x + @round(priv.scroll);
+        const sx = x + self.scrollPx();
         for (priv.items.items) |it| {
             const b = it.box;
             if (sx >= b.x and sx < b.right() and y >= b.y and y < b.bottom()) return it.kind;
@@ -1232,7 +1461,7 @@ pub const Workspace = extern struct {
         const max = @max(1, extent - vw);
         const len = @min(vw, @max(20, vw * vw / extent));
         const travel = @max(1, vw - len);
-        const pos = std.math.clamp(@round(priv.scroll) / max, 0, 1) * travel;
+        const pos = std.math.clamp(self.scrollPx() / max, 0, 1) * travel;
         return .{
             .track = .{ .x = 0, .y = vh - geometry.scrollbar_px, .w = vw, .h = geometry.scrollbar_px },
             .thumb = .{ .x = pos, .y = vh - geometry.scrollbar_px, .w = len, .h = geometry.scrollbar_px },
@@ -1498,13 +1727,14 @@ pub const Workspace = extern struct {
         if (w != priv.vw or h != priv.vh) {
             priv.vw = w;
             priv.vh = h;
+            perf.attach(self.as(gtk.Widget));
             // L-16: a resize refits and re-reveals (no layout animation).
             self.settle();
             self.relayout();
             self.clampScrollNow();
             self.reveal();
         }
-        const sx = @round(priv.scroll);
+        const sx = self.scrollPx();
         for (priv.items.items) |it| allocBox(it.frame.as(gtk.Widget), it.box, sx);
         for (priv.dividers.items) |d| allocBox(d.widget, d.box, sx);
         for (priv.ghosts.items) |g| allocBox(g.widget, g.flight.ghostBox(), sx);
@@ -1538,68 +1768,79 @@ pub const Workspace = extern struct {
 
     /// One element of the strip at its in-flight box: its allocation is
     /// the final box `a`; it is translated back to `v`'s origin, clipped to
-    /// `v`'s size while it grows, and faded in when it is fresh.
-    fn drawMoving(self: *Self, snap: *gtk.Snapshot, child: *gtk.Widget, a: Box, fl: ?Flight, p: f64, radius: f64) void {
+    /// `v`'s size while it grows, and faded in when it is fresh. Offset
+    /// and clip sit on the pixel grid. The fade-in is the strip's colour
+    /// over the element at 1 − p rather than a group opacity, which GSK
+    /// renders through an offscreen texture the size of the pane; a new
+    /// pane opens over the strip (or a ghost of its own colour), so the
+    /// two look the same.
+    fn drawMoving(self: *Self, snapshot_: *gtk.Snapshot, child: *gtk.Widget, a: Box, fl: ?Flight, p: f64, radius: f64) void {
         const w = self.as(gtk.Widget);
         const f = fl orelse {
-            w.snapshotChild(child, snap);
+            w.snapshotChild(child, snapshot_);
             return;
         };
-        const sx = @round(self.private().scroll);
+        const grid = self.pixelGrid();
+        const sx = self.scrollPx();
         const v = f.at(p);
-        snap.save();
-        var off: graphene.Point = .{ .f_x = @floatCast(v.x - a.x), .f_y = @floatCast(v.y - a.y) };
-        snap.translate(&off);
-        var pushes: usize = 0;
-        if (f.grows()) {
-            pushRoundedClip(snap, rect(a.x - sx, a.y, @min(a.w, v.w), @min(a.h, v.h)), radius);
-            pushes += 1;
+        snapshot_.save();
+        var off: graphene.Point = .{ .f_x = @floatCast(snapTo(v.x - a.x, grid)), .f_y = @floatCast(snapTo(v.y - a.y, grid)) };
+        snapshot_.translate(&off);
+        const cw = snapTo(@min(a.w, v.w), grid);
+        const ch = snapTo(@min(a.h, v.h), grid);
+        const grows = f.grows();
+        if (grows) pushRoundedClip(snapshot_, rect(a.x - sx, a.y, cw, ch), radius);
+        w.snapshotChild(child, snapshot_);
+        if (f.fresh and p < 1) {
+            var cover = frame_mod.stripColor(frame_mod.isDark());
+            cover.f_alpha = @floatCast(1 - p);
+            // One pixel wider than the element: its focus ring.
+            snapshot_.appendColor(&cover, &rect(a.x - sx - 1, a.y - 1, (if (grows) cw else a.w) + 2, (if (grows) ch else a.h) + 2));
         }
-        if (f.fresh) {
-            snap.pushOpacity(p);
-            pushes += 1;
-        }
-        w.snapshotChild(child, snap);
-        for (0..pushes) |_| snap.pop();
-        snap.restore();
+        if (grows) snapshot_.pop();
+        snapshot_.restore();
     }
 
-    fn snapshot(self: *Self, snap: *gtk.Snapshot) callconv(.c) void {
+    fn snapshot(self: *Self, snapshot_: *gtk.Snapshot) callconv(.c) void {
         const priv = self.private();
         const w = self.as(gtk.Widget);
         const W: f64 = @floatFromInt(w.getWidth());
         const H: f64 = @floatFromInt(w.getHeight());
         const p = self.progress();
-        const sx = @round(priv.scroll);
+        const grid = self.pixelGrid();
+        const sx = self.scrollPx();
         const k = self.fadeStrength();
-        snap.pushClip(&rect(0, 0, W, H));
+        // The frame clock is alive and this cycle got as far as drawing
+        // (see `settleTimeout`; a slow first cycle is not a stalled one).
+        if (priv.anim) |*a| a.clock.last_wall_us = glib.getMonotonicTime();
+        snapshot_.pushClip(&rect(0, 0, W, H));
 
         // Ghosts under everything, then dividers, leaving panes, panes,
         // and the focused pane on top (app.js z-index -1/1/1/2/3).
         for (priv.ghosts.items) |g| {
             const a = g.flight.ghostBox();
             const v = g.flight.at(p);
-            snap.save();
-            var off: graphene.Point = .{ .f_x = @floatCast(v.x - a.x), .f_y = @floatCast(v.y - a.y) };
-            snap.translate(&off);
-            const clip = rect(a.x - sx, a.y, v.w, v.h);
-            pushRoundedClip(snap, clip, if (g.pane) anim.pane_radius else anim.divider_radius);
-            w.snapshotChild(g.widget, snap);
-            if (g.pane and !g.focused) frame_mod.appendFade(snap, clip, k, false);
-            snap.pop();
-            snap.restore();
+            snapshot_.save();
+            var off: graphene.Point = .{ .f_x = @floatCast(snapTo(v.x - a.x, grid)), .f_y = @floatCast(snapTo(v.y - a.y, grid)) };
+            snapshot_.translate(&off);
+            const clip = rect(a.x - sx, a.y, snapTo(v.w, grid), snapTo(v.h, grid));
+            pushRoundedClip(snapshot_, clip, if (g.pane) anim.pane_radius else anim.divider_radius);
+            w.snapshotChild(g.widget, snapshot_);
+            if (g.pane and !g.focused) frame_mod.appendFade(snapshot_, clip, k);
+            snapshot_.pop();
+            snapshot_.restore();
         }
-        for (priv.dividers.items) |d| self.drawMoving(snap, d.widget, d.box, d.flight, p, anim.divider_radius);
+        for (priv.dividers.items) |d| self.drawMoving(snapshot_, d.widget, d.box, d.flight, p, anim.divider_radius);
         for (priv.leaving.items) |l| {
             const a = l.item.box;
             const c = anim.exitClip(l.from, l.cut, p);
-            snap.save();
-            var off: graphene.Point = .{ .f_x = @floatCast(l.from.x - a.x), .f_y = @floatCast(l.from.y - a.y) };
-            snap.translate(&off);
-            pushRoundedClip(snap, rect(c.x - l.from.x + a.x - sx, c.y - l.from.y + a.y, c.w, c.h), anim.pane_radius);
-            w.snapshotChild(l.item.frame.as(gtk.Widget), snap);
-            snap.pop();
-            snap.restore();
+            snapshot_.save();
+            var off: graphene.Point = .{ .f_x = @floatCast(snapTo(l.from.x - a.x, grid)), .f_y = @floatCast(snapTo(l.from.y - a.y, grid)) };
+            snapshot_.translate(&off);
+            pushRoundedClip(snapshot_, rect(snapTo(c.x - l.from.x + a.x, grid) - sx, snapTo(c.y - l.from.y + a.y, grid), snapTo(c.w, grid), snapTo(c.h, grid)), anim.pane_radius);
+            w.snapshotChild(l.item.frame.as(gtk.Widget), snapshot_);
+            snapshot_.pop();
+            snapshot_.restore();
         }
         var focused: ?*Item = null;
         const fid = priv.model.focusedId();
@@ -1608,12 +1849,12 @@ pub const Workspace = extern struct {
                 focused = it;
                 continue;
             }
-            self.drawMoving(snap, it.frame.as(gtk.Widget), it.box, it.flight, p, anim.pane_radius);
+            self.drawMoving(snapshot_, it.frame.as(gtk.Widget), it.box, it.flight, p, anim.pane_radius);
         }
-        if (focused) |it| self.drawMoving(snap, it.frame.as(gtk.Widget), it.box, it.flight, p, anim.pane_radius);
-        self.drawScrollbar(snap);
-        if (priv.message.as(gtk.Widget).getVisible() != 0) w.snapshotChild(priv.message.as(gtk.Widget), snap);
-        snap.pop();
+        if (focused) |it| self.drawMoving(snapshot_, it.frame.as(gtk.Widget), it.box, it.flight, p, anim.pane_radius);
+        self.drawScrollbar(snapshot_);
+        if (priv.message.as(gtk.Widget).getVisible() != 0) w.snapshotChild(priv.message.as(gtk.Widget), snapshot_);
+        snapshot_.pop();
     }
 
     // =====================================================================
@@ -1709,6 +1950,12 @@ pub const Workspace = extern struct {
                 alloc.destroy(l);
             }
             priv.leaving.deinit(alloc);
+            if (priv.after_frame != 0) {
+                _ = glib.Source.remove(priv.after_frame);
+                priv.after_frame = 0;
+            }
+            self.destroyDoomed();
+            priv.doomed.deinit(alloc);
             for (priv.items.items) |it| self.destroyItem(it);
             priv.items.deinit(alloc);
             for (priv.dividers.items) |d| {
@@ -1777,6 +2024,9 @@ pub const Workspace = extern struct {
         col_min: f64,
         col_max: f64,
         animating: bool,
+        /// The running move's length and how far it has come, ms.
+        anim_duration_ms: ?f64,
+        anim_elapsed_ms: ?f64,
         chasing: bool,
         reduced_motion: bool,
         pending_creates: u32,
@@ -1884,6 +2134,8 @@ pub const Workspace = extern struct {
             .col_min = if (priv.geom) |g| g.strip.widths.min else 0,
             .col_max = if (priv.geom) |g| g.strip.widths.max else 0,
             .animating = priv.anim != null,
+            .anim_duration_ms = if (priv.anim) |an| an.duration_ms * time_scale else null,
+            .anim_elapsed_ms = if (priv.anim) |an| an.elapsed_ms else null,
             .chasing = priv.chase != null,
             .reduced_motion = self.reducedMotion(),
             .pending_creates = priv.pending_creates,
@@ -1903,7 +2155,7 @@ pub const Workspace = extern struct {
     /// list in flight, and the session list has been read.
     pub fn settled(self: *Self) bool {
         const priv = self.private();
-        return priv.loaded and priv.anim == null and priv.chase == null and priv.pending_creates == 0 and !priv.list_inflight;
+        return priv.loaded and priv.anim == null and priv.chase == null and priv.pending_creates == 0 and !priv.list_inflight and priv.doomed.items.len == 0 and !priv.release_pending;
     }
 
     pub fn paneFrame(self: *Self, id: []const u8) ?*PaneFrame {

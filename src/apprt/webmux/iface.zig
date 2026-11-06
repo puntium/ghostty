@@ -85,6 +85,9 @@ pub const Pane = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
 
+    /// A rectangle in the pane widget's coordinates.
+    pub const Rect = struct { x: f64, y: f64, w: f64, h: f64 };
+
     pub const VTable = struct {
         /// Move keyboard focus into the pane.
         grabFocus: *const fn (ctx: *anyopaque) void,
@@ -103,6 +106,25 @@ pub const Pane = struct {
         /// font and scale, or null if this pane cannot say (file
         /// browsers). The width rule needs one terminal's answer.
         cellWidthPx: *const fn (ctx: *anyopaque) ?u32,
+        /// The container's unfocused fade: every pixel of the pane is to
+        /// show as `scale * pixel + add` per colour channel (scale 1, add
+        /// 0: no fade). A pane that covers part of its widget with opaque
+        /// pixels of its own, and can apply the fade to them for less
+        /// than a blended quad on top, does so and returns that part (a
+        /// terminal: its texture, faded in the pass that draws it). The
+        /// container then draws no background under that part and fades
+        /// only the rest. Null: the container paints the background under
+        /// the whole pane and fades all of it. Called whenever the fade
+        /// changes and on every draw of the container.
+        fade: *const fn (ctx: *anyopaque, scale: f32, add: [3]f32) ?Rect,
+        /// The container is moving the pane to a new size (`true`) and
+        /// has arrived (`false`). The widget is allocated its final size
+        /// when the move starts; a pane for which taking a new size is
+        /// expensive (a terminal: new buffers, a full re-render, a resize
+        /// sent to the host) keeps drawing at its old size until the move
+        /// ends and takes the new one then, once, so that work does not
+        /// compete with the animation's frames.
+        holdResize: *const fn (ctx: *anyopaque, hold: bool) void,
     };
 
     pub fn grabFocus(self: Pane) void {
@@ -119,6 +141,12 @@ pub const Pane = struct {
     }
     pub fn cellWidthPx(self: Pane) ?u32 {
         return self.vtable.cellWidthPx(self.ctx);
+    }
+    pub fn fade(self: Pane, scale: f32, add: [3]f32) ?Rect {
+        return self.vtable.fade(self.ctx, scale, add);
+    }
+    pub fn holdResize(self: Pane, hold: bool) void {
+        self.vtable.holdResize(self.ctx, hold);
     }
 };
 

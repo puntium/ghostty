@@ -82,7 +82,10 @@ const PaneDump = struct {
     content_scale: f32,
     renderer_health: []const u8,
     /// Frames presented per path: tells DMABUF from CPU fallback.
-    frames: struct { dmabuf: u64, memory: u64, dmabuf_import_failures: u64 },
+    /// `opaque`: DMABUF frames imported without an alpha channel.
+    frames: struct { dmabuf: u64, memory: u64, dmabuf_import_failures: u64, @"opaque": u64 },
+    /// The pane applies the unfocused fade in its texture's pass.
+    faded: bool,
     text: ?[]const u8,
 };
 
@@ -121,7 +124,9 @@ fn paneDump(req: *Request, pane: *TerminalPane, focused: bool) !PaneDump {
             .dmabuf = stats.frames_dmabuf,
             .memory = stats.frames_memory,
             .dmabuf_import_failures = stats.dmabuf_import_failures,
+            .@"opaque" = stats.frames_opaque,
         },
+        .faded = stats.faded,
         .text = if (req.boolean("text") orelse true) try pane.visibleText(alloc) else null,
     };
 }
@@ -165,6 +170,7 @@ fn dumpInner(req: *Request) !void {
             .active = gwin.isActive() != 0,
             .scale = if (surface) |s| s.getScale() else 1.0,
             .gsk_renderer = if (gsk_renderer) |r| typeNameOf(r) else null,
+            .offload = @import("../render_surface.zig").offloadWanted(),
             .display = std.mem.span(widget.getDisplay().getName()),
         },
         .scheme = @tagName(app.getScheme()),
@@ -177,10 +183,42 @@ fn dumpInner(req: *Request) !void {
 //---------------------------------------------------------------
 // screenshot
 
+/// The window's render node is gone from the moment anything queues a
+/// draw until the next paint is done. With a redraw every frame (a
+/// transition, a blinking cursor) and slow frames (the Debug binary; a
+/// shader built on first use) that is most of the time, so a screenshot
+/// that finds none waits for the next paint and tries again, for up to
+/// this long.
+const screenshot_wait_ms: i64 = 3000;
+
+const Shot = struct {
+    req: *Request,
+    deadline_us: i64,
+};
+
 fn screenshot(req: *Request) void {
-    const path = req.string("path") orelse return req.fail("missing \"path\"", .{});
+    const shot = req.allocator().create(Shot) catch return req.fail("out of memory", .{});
+    shot.* = .{ .req = req, .deadline_us = glib.getMonotonicTime() + screenshot_wait_ms * 1000 };
+    if (!takeScreenshot(shot)) _ = glib.timeoutAdd(20, screenshotTick, shot);
+}
+
+fn screenshotTick(ud: ?*anyopaque) callconv(.c) c_int {
+    const shot: *Shot = @ptrCast(@alignCast(ud.?));
+    return if (takeScreenshot(shot)) 0 else 1;
+}
+
+/// True when answered.
+fn takeScreenshot(shot: *Shot) bool {
+    const req = shot.req;
+    const path = req.string("path") orelse {
+        req.fail("missing \"path\"", .{});
+        return true;
+    };
     const app = Application.default();
-    const win = app.activeWindow() orelse return req.fail("no window", .{});
+    const win = app.activeWindow() orelse {
+        req.fail("no window", .{});
+        return true;
+    };
     const widget = win.as(gtk.Widget);
 
     // The window's last rendered node (what the compositor was sent),
@@ -191,10 +229,19 @@ fn screenshot(req: *Request) void {
     defer paintable.unref();
     const w: f64 = @floatFromInt(widget.getWidth());
     const h: f64 = @floatFromInt(widget.getHeight());
-    if (w <= 0 or h <= 0) return req.fail("window has no size yet", .{});
+    if (w <= 0 or h <= 0) {
+        req.fail("window has no size yet", .{});
+        return true;
+    }
 
-    const native = widget.getNative() orelse return req.fail("window not realized", .{});
-    const renderer = native.getRenderer() orelse return req.fail("window has no renderer", .{});
+    const native = widget.getNative() orelse {
+        req.fail("window not realized", .{});
+        return true;
+    };
+    const renderer = native.getRenderer() orelse {
+        req.fail("window has no renderer", .{});
+        return true;
+    };
 
     // Device pixels by default (HiDPI screenshots are full resolution);
     // {"scale": 1} for logical size.
@@ -207,7 +254,11 @@ fn screenshot(req: *Request) void {
     const snap = gtk.Snapshot.new();
     snap.scale(@floatCast(scale), @floatCast(scale));
     paintable.as(gdk.Paintable).snapshot(snap.as(gdk.Snapshot), w, h);
-    const node = snap.freeToNode() orelse return req.fail("window has not been drawn yet", .{});
+    const node = snap.freeToNode() orelse {
+        if (glib.getMonotonicTime() < shot.deadline_us) return false;
+        req.fail("window has not been drawn yet", .{});
+        return true;
+    };
     defer node.unref();
 
     const viewport: graphene.Rect = .{
@@ -217,14 +268,21 @@ fn screenshot(req: *Request) void {
     const texture = renderer.renderTexture(node, &viewport);
     defer texture.unref();
 
-    const path_z = req.allocator().dupeSentinel(u8, path, 0) catch return req.fail("out of memory", .{});
-    if (texture.saveToPng(path_z.ptr) == 0) return req.fail("could not write {s}", .{path});
+    const path_z = req.allocator().dupeSentinel(u8, path, 0) catch {
+        req.fail("out of memory", .{});
+        return true;
+    };
+    if (texture.saveToPng(path_z.ptr) == 0) {
+        req.fail("could not write {s}", .{path});
+        return true;
+    }
     req.ok(.{
         .path = path,
         .width = texture.getWidth(),
         .height = texture.getHeight(),
         .gsk_renderer = typeNameOf(renderer),
     });
+    return true;
 }
 
 //---------------------------------------------------------------
