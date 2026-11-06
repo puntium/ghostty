@@ -1,18 +1,18 @@
-//! The connection manager page (electron/connect.html): profile cards with
-//! live state and Connect / Show / Disconnect / Cancel, the ⋯ menu
-//! (Restart Sessions, Delete Profile, both confirmed in place), the
-//! profile form, per-connection status detail (deploy progress, retry
-//! countdown, ssh's stderr), notices, the Log button and the help text.
+//! The Connections page of the preferences dialog (deviation 67), and the
+//! landing view the window shows when no host is in front.
 //!
-//! Cards are updated in place on status pushes (an open ⋯ menu survives);
-//! the list is rebuilt only when the profiles change. Status pushes never
-//! touch an open form (W-29).
+//! One row per profile with its live state and Connect / Show / Disconnect
+//! / Cancel; a click on a row opens the profile form as a subpage, which
+//! also has Restart Sessions and Delete Profile. Below the rows: notices,
+//! per-connection status detail (deploy progress, retry countdown, ssh's
+//! stderr) and the help text.
+//!
+//! Rows are updated in place on status pushes; the list is rebuilt only
+//! when the profiles change. Status pushes never touch an open form (W-29).
 const std = @import("std");
-const gdk = @import("gdk");
-const glib = @import("glib");
-const gobject = @import("gobject");
-const gtk = @import("gtk");
 const adw = @import("adw");
+const glib = @import("glib");
+const gtk = @import("gtk");
 
 const conn = @import("../../../webmux/conn.zig");
 const iface = @import("../iface.zig");
@@ -22,29 +22,29 @@ const menu = @import("menu.zig");
 const header = @import("header.zig");
 const text_mod = @import("text.zig");
 const profile_mod = @import("../../../webmux/conn/profile.zig");
+const settings_panel = @import("../panels/settings_panel.zig");
 
-const log = std.log.scoped(.webmux_chrome);
 const alloc = std.heap.c_allocator;
 
 pub const HINT =
     "A host needs nothing but ssh: connecting pushes the webmux server (one small static binary) to " ++
     "<tt>~/.webmux/dist</tt> on the host and starts it — updates are pushed the same way, and sessions " ++
-    "survive them. Connect to several hosts at once — each connection gets a pill in the header bar above " ++
-    "(Ctrl+1…9 or Ctrl+PageUp/PageDown switch, Ctrl+Shift+O returns here). Key auth needs no prompt (use " ++
+    "survive them. Connect to several hosts at once — each connection gets a pill in the header bar " ++
+    "(Ctrl+1…9 or Ctrl+PageUp/PageDown switch, Ctrl+Shift+O opens this page). Key auth needs no prompt (use " ++
     "ssh-agent for passphrases); or save a password per profile — it is stored in the system keyring " ++
     "(GNOME Keyring or KWallet, via the Secret Service) and fed to ssh through an askpass helper. " ++
     "Ctrl+Shift+R reconnects the current host.";
 
 const Card = struct {
     name: []u8,
-    root: *gtk.Box,
+    root: *adw.ActionRow,
     dot: *gtk.Widget,
     dot_class: [:0]const u8 = "none",
-    name_label: *gtk.Label,
     state_label: *gtk.Label,
-    detail: *gtk.Label,
-    /// "connected on …; Reconnect to use the edit" (hidden unless so).
-    live: *gtk.Label,
+    /// `<host>[ -p <port>][ → <instance>]`, the row's subtitle.
+    detail: [:0]u8,
+    /// "on …; Reconnect to use the edit", the subtitle's second line.
+    live: ?[]u8 = null,
     /// The stored profile's host, instance (or "default"), port.
     host: []u8,
     instance: []u8,
@@ -52,48 +52,52 @@ const Card = struct {
     buttons: *gtk.Box,
     /// Which button set is showing (rebuilt only when it changes).
     mode: enum { none, up, busy, idle } = .none,
-    menu_button: *gtk.MenuButton,
-    popover: *gtk.Popover,
-    restart_btn: *gtk.Button,
-    delete_btn: *gtk.Button,
 };
 
 pub const Form = struct {
     /// Original name of the profile being edited; "" for a new one.
     editing: []u8,
-    root: *gtk.Box,
-    name: *gtk.Entry,
-    host: *gtk.Entry,
-    ssh_port: *gtk.Entry,
-    identity: *gtk.Entry,
-    password: *gtk.Entry,
-    clear: ?*gtk.CheckButton,
-    instance: *gtk.Entry,
-    extra: *gtk.Entry,
-    advanced: *gtk.Expander,
+    page: *adw.NavigationPage,
+    name: *adw.EntryRow,
+    host: *adw.EntryRow,
+    ssh_port: *adw.EntryRow,
+    identity: *adw.EntryRow,
+    password: *adw.EntryRow,
+    clear: ?*adw.SwitchRow,
+    instance: *adw.EntryRow,
+    extra: *adw.EntryRow,
+    advanced: *adw.ExpanderRow,
     submit: *gtk.Button,
     cancel: *gtk.Button,
     err: *gtk.Label,
+    restart: ?*adw.ButtonRow,
+    delete: ?*adw.ButtonRow,
+    /// Where focus was when the dialog closed over the form (borrowed: a
+    /// widget of the dialog, which outlives the form).
+    back: ?*gtk.Widget = null,
     busy: bool = false,
 };
 
+const Confirm = enum { restart, delete };
+
 pub const Page = struct {
-    root: *gtk.ScrolledWindow,
-    wrap: *gtk.Box,
-    list: *gtk.Box,
-    form_holder: *gtk.Box,
+    landing: *adw.StatusPage,
+    landing_btn: *gtk.Button,
+    prefs: *adw.PreferencesPage,
+    problems: *adw.PreferencesGroup,
+    list: *adw.PreferencesGroup,
+    status_group: *adw.PreferencesGroup,
     status: *gtk.Box,
     log_btn: *gtk.Button,
     new_btn: *gtk.Button,
-    engine_error: ?*gtk.Label = null,
 
     cards: std.ArrayList(*Card) = .empty,
-    empty_label: ?*gtk.Label = null,
+    empty_row: ?*adw.ActionRow = null,
     form: ?*Form = null,
-    /// Profile whose ⋯ menu is open, and pending confirmations.
-    menu_for: ?[]u8 = null,
-    confirm_restart: ?[]u8 = null,
-    confirm_delete: ?[]u8 = null,
+    /// The open confirmation, what it is for, and for which profile.
+    confirm: ?*adw.AlertDialog = null,
+    confirm_kind: Confirm = .restart,
+    confirm_name: ?[]u8 = null,
     notice: ?[:0]u8 = null,
     notice_source: c_uint = 0,
     form_tag: u64 = 0,
@@ -104,73 +108,80 @@ pub const Page = struct {
     config_banner: ?*gtk.Label = null,
     alive: bool = true,
 
+    /// The view in the window's stack.
     pub fn widget(p: *Page) *gtk.Widget {
-        return p.root.as(gtk.Widget);
+        return p.landing.as(gtk.Widget);
     }
 
     pub fn create() *Page {
         const p = alloc.create(Page) catch @panic("OOM");
-        const root = gtk.ScrolledWindow.new();
-        root.setPolicy(.never, .automatic);
-        const rw = root.as(gtk.Widget);
-        rw.addCssClass("wm-page");
-        rw.setFocusable(1);
 
-        const clamp = adw.Clamp.new();
-        clamp.setMaximumSize(620);
-        clamp.setTighteningThreshold(620);
-        const wrap = gtk.Box.new(.vertical, 0);
-        wrap.as(gtk.Widget).addCssClass("wm-wrap");
-        clamp.setChild(wrap.as(gtk.Widget));
-        root.setChild(clamp.as(gtk.Widget));
+        const landing = adw.StatusPage.new();
+        landing.setTitle("webmux");
+        landing.setDescription("No host is open.");
+        landing.as(gtk.Widget).setFocusable(1);
+        const landing_btn = gtk.Button.newWithLabel("Connections…");
+        landing_btn.as(gtk.Widget).addCssClass("pill");
+        landing_btn.as(gtk.Widget).addCssClass("suggested-action");
+        landing_btn.as(gtk.Widget).setHalign(.center);
+        landing.setChild(landing_btn.as(gtk.Widget));
 
-        const topbar = gtk.Box.new(.horizontal, 12);
-        topbar.as(gtk.Widget).addCssClass("wm-topbar");
-        const title = gtk.Label.new("webmux");
-        title.as(gtk.Widget).addCssClass("wm-title");
-        const spacer = gtk.Box.new(.horizontal, 0);
-        spacer.as(gtk.Widget).setHexpand(1);
+        const prefs = adw.PreferencesPage.new();
+        prefs.setTitle("Connections");
+        prefs.setIconName("network-server-symbolic");
+
+        const problems = adw.PreferencesGroup.new();
+        problems.as(gtk.Widget).setVisible(0);
+        prefs.add(problems);
+
+        const list = adw.PreferencesGroup.new();
+        list.setTitle("Profiles");
+        const actions = gtk.Box.new(.horizontal, 6);
         const log_btn = gtk.Button.newWithLabel("Log");
         log_btn.as(gtk.Widget).setTooltipText("Connection log (Ctrl+Shift+G)");
         const new_btn = gtk.Button.newWithLabel("New Profile");
-        new_btn.as(gtk.Widget).addCssClass("primary");
-        topbar.append(title.as(gtk.Widget));
-        topbar.append(spacer.as(gtk.Widget));
-        topbar.append(log_btn.as(gtk.Widget));
-        topbar.append(new_btn.as(gtk.Widget));
-        wrap.append(topbar.as(gtk.Widget));
+        new_btn.as(gtk.Widget).addCssClass("suggested-action");
+        actions.append(log_btn.as(gtk.Widget));
+        actions.append(new_btn.as(gtk.Widget));
+        list.setHeaderSuffix(actions.as(gtk.Widget));
+        prefs.add(list);
 
-        const list = gtk.Box.new(.vertical, 10);
-        list.as(gtk.Widget).addCssClass("wm-list");
-        const form_holder = gtk.Box.new(.vertical, 0);
-        const status = gtk.Box.new(.vertical, 0);
-        status.as(gtk.Widget).addCssClass("wm-status-detail");
-        wrap.append(list.as(gtk.Widget));
-        wrap.append(form_holder.as(gtk.Widget));
-        wrap.append(status.as(gtk.Widget));
+        const status_group = adw.PreferencesGroup.new();
+        const status = gtk.Box.new(.vertical, 6);
+        status_group.add(status.as(gtk.Widget));
+        prefs.add(status_group);
 
+        const help = adw.PreferencesGroup.new();
         const hint = gtk.Label.new(null);
         text_mod.setMarkup(hint, HINT);
         hint.setWrap(1);
         hint.setWrapMode(.word_char);
         hint.setXalign(0);
-        hint.as(gtk.Widget).addCssClass("wm-hint");
-        wrap.append(hint.as(gtk.Widget));
+        hint.as(gtk.Widget).addCssClass("dim-label");
+        hint.as(gtk.Widget).addCssClass("caption");
+        help.add(hint.as(gtk.Widget));
+        prefs.add(help);
 
         p.* = .{
-            .root = root,
-            .wrap = wrap,
+            .landing = landing,
+            .landing_btn = landing_btn,
+            .prefs = prefs,
+            .problems = problems,
             .list = list,
-            .form_holder = form_holder,
+            .status_group = status_group,
             .status = status,
             .log_btn = log_btn,
             .new_btn = new_btn,
         };
+        _ = gtk.Button.signals.clicked.connect(landing_btn, *Page, onLanding, p, .{});
         _ = gtk.Button.signals.clicked.connect(log_btn, *Page, onLog, p, .{});
         _ = gtk.Button.signals.clicked.connect(new_btn, *Page, onNew, p, .{});
-        const keys = gtk.EventControllerKey.new();
-        _ = gtk.EventControllerKey.signals.key_pressed.connect(keys, *Page, onKey, p, .{});
-        rw.addController(keys.as(gtk.EventController));
+
+        // Connections goes first, then General.
+        settings_panel.dialog().add(prefs);
+        _ = settings_panel.ensure();
+        settings_panel.on_closing = onDialogClosing;
+        settings_panel.on_closed = onDialogClosed;
 
         p.rebuildList();
         p.update();
@@ -181,40 +192,63 @@ pub const Page = struct {
         p.alive = false;
         if (p.notice_source != 0) _ = glib.Source.remove(p.notice_source);
         p.notice_source = 0;
+        settings_panel.on_closing = null;
+        settings_panel.on_closed = null;
+        settings_panel.reset();
         for (p.cards.items) |c| freeCard(c);
         p.cards.deinit(alloc);
         if (p.form) |f| freeForm(f);
-        freeOpt(&p.menu_for);
-        freeOpt(&p.confirm_restart);
-        freeOpt(&p.confirm_delete);
+        freeOpt(&p.confirm_name);
         if (p.notice) |n| alloc.free(n);
         p.pending.deinit();
         alloc.destroy(p);
     }
 
-    pub fn focus(p: *Page) void {
+    /// Show the dialog on this page. An open form stays as it was.
+    pub fn present(p: *Page) void {
+        const win = hub.hub.window orelse return;
+        const was_open = settings_panel.isOpen();
+        settings_panel.dialog().setVisiblePage(p.prefs);
+        settings_panel.present(win.as(gtk.Widget));
+        if (was_open) return;
+        // Back to the field the user was in, as it was.
         if (p.form) |f| {
-            // Back to the field the user was in, as it was (Connections,
-            // a dialog closing); the first field only for a fresh form.
-            if (hub.contentFocusIn(f.root.as(gtk.Widget))) |w| {
-                if (hub.refocus(w)) return;
-            }
-            _ = f.name.as(gtk.Widget).grabFocus();
-            return;
+            _ = hub.refocus(f.back orelse f.name.as(gtk.Widget));
+            f.back = null;
         }
-        _ = p.root.as(gtk.Widget).grabFocus();
+    }
+
+    /// Keyboard focus for the landing view.
+    pub fn focus(p: *Page) void {
+        _ = p.landing.as(gtk.Widget).grabFocus();
+    }
+
+    fn onDialogClosing() void {
+        const p = hub.hub.page orelse return;
+        if (p.form) |f| f.back = settings_panel.dialog().as(adw.Dialog).getFocus();
+    }
+
+    fn onDialogClosed() void {
+        hub.focusContent();
+    }
+
+    fn addProblem(p: *Page, text: []const u8) *gtk.Label {
+        const l = gtk.Label.new(null);
+        text_mod.set(l, text);
+        l.setWrap(1);
+        l.setWrapMode(.word_char);
+        l.setXalign(0);
+        l.setSelectable(1);
+        l.as(gtk.Widget).addCssClass("error");
+        p.problems.add(l.as(gtk.Widget));
+        p.problems.as(gtk.Widget).setVisible(1);
+        return l;
     }
 
     pub fn showEngineError(p: *Page, msg: []const u8) void {
         var buf: [512]u8 = undefined;
-        const t = std.fmt.bufPrintSentinel(&buf, "The connection engine failed to start: {s}. See the application log.", .{msg}, 0) catch "The connection engine failed to start.";
-        const l = gtk.Label.new(null);
-        text_mod.set(l, t);
-        l.setWrap(1);
-        l.setWrapMode(.word_char);
-        l.as(gtk.Widget).addCssClass("wm-form-error");
-        p.wrap.insertChildAfter(l.as(gtk.Widget), p.wrap.as(gtk.Widget).getFirstChild());
-        p.engine_error = l;
+        const t = std.fmt.bufPrint(&buf, "The connection engine failed to start: {s}. See the application log.", .{msg}) catch "The connection engine failed to start.";
+        _ = p.addProblem(t);
     }
 
     /// config.json could not be loaded (engine.configProblem): say so above
@@ -222,16 +256,7 @@ pub const Page = struct {
     pub fn showConfigProblem(p: *Page, msg: []const u8) void {
         if (p.config_banner != null) return;
         const t = std.fmt.allocPrint(alloc, "{s}. Fix or restore the file and restart to get the old profiles back; the connection log has the details.", .{msg}) catch "config.json could not be read; see the connection log.";
-        const l = gtk.Label.new(null);
-        text_mod.set(l, t);
-        l.setWrap(1);
-        l.setWrapMode(.word_char);
-        l.setXalign(0);
-        l.setSelectable(1);
-        l.as(gtk.Widget).addCssClass("wm-form-error");
-        l.as(gtk.Widget).addCssClass("wm-config-problem");
-        p.wrap.insertChildAfter(l.as(gtk.Widget), p.wrap.as(gtk.Widget).getFirstChild());
-        p.config_banner = l;
+        p.config_banner = p.addProblem(t);
     }
 
     // -- top buttons ------------------------------------------------------
@@ -241,10 +266,12 @@ pub const Page = struct {
     }
 
     pub fn clickNew(p: *Page) void {
-        p.closeMenu();
         p.openForm("");
     }
 
+    fn onLanding(_: *gtk.Button, _: *Page) callconv(.c) void {
+        hub.userShow(null);
+    }
     fn onLog(_: *gtk.Button, p: *Page) callconv(.c) void {
         p.clickLog();
     }
@@ -252,165 +279,93 @@ pub const Page = struct {
         p.clickNew();
     }
 
-    fn onKey(_: *gtk.EventControllerKey, keyval: c_uint, _: c_uint, _: gdk.ModifierType, p: *Page) callconv(.c) c_int {
-        if (keyval != gdk.KEY_Escape) return 0;
-        return @intFromBool(p.escape());
-    }
-
-    /// Escape: close the ⋯ menu, else cancel the form (W-24, W-28).
+    /// Escape, for the control socket: cancel the form (W-28).
     pub fn escape(p: *Page) bool {
-        if (p.menu_for != null) {
-            p.closeMenu();
-            return true;
-        }
-        if (p.form != null) {
-            p.closeForm();
-            return true;
-        }
-        return false;
+        if (p.form == null) return false;
+        p.closeForm();
+        return true;
     }
 
     // -- the list -----------------------------------------------------------
 
-    /// The profiles changed: rebuild the cards (closes an open ⋯ menu).
+    /// The profiles changed: rebuild the rows.
     pub fn rebuildList(p: *Page) void {
         for (p.cards.items) |c| {
             p.list.remove(c.root.as(gtk.Widget));
             freeCard(c);
         }
         p.cards.clearRetainingCapacity();
-        if (p.empty_label) |l| p.list.remove(l.as(gtk.Widget));
-        p.empty_label = null;
-        freeOpt(&p.menu_for);
-        freeOpt(&p.confirm_restart);
-        freeOpt(&p.confirm_delete);
+        if (p.empty_row) |r| p.list.remove(r.as(gtk.Widget));
+        p.empty_row = null;
 
         const engine = hub.hub.engine orelse return;
         var profiles = engine.listProfiles(alloc) catch return;
         defer profiles.deinit();
         if (profiles.profiles.len == 0) {
-            const l = gtk.Label.new("No profiles yet — create one to connect.");
-            l.as(gtk.Widget).addCssClass("wm-empty");
-            p.list.append(l.as(gtk.Widget));
-            p.empty_label = l;
+            const r = adw.ActionRow.new();
+            r.as(adw.PreferencesRow).setTitle("No profiles yet — create one to connect.");
+            p.list.add(r.as(gtk.Widget));
+            p.empty_row = r;
         }
         for (profiles.profiles) |prof| {
-            const c = p.newCard(prof) catch continue;
+            const c = newCard(prof) catch continue;
             p.cards.append(alloc, c) catch continue;
-            p.list.append(c.root.as(gtk.Widget));
+            p.list.add(c.root.as(gtk.Widget));
         }
         p.update();
     }
 
-    fn newCard(p: *Page, prof: conn.Profile) !*Card {
+    fn newCard(prof: conn.Profile) !*Card {
         const c = try alloc.create(Card);
-        const root = gtk.Box.new(.horizontal, 12);
-        root.as(gtk.Widget).addCssClass("wm-card");
-        const info = gtk.Box.new(.vertical, 0);
-        info.as(gtk.Widget).setHexpand(1);
-        info.as(gtk.Widget).addCssClass("info");
-        const name_row = gtk.Box.new(.horizontal, 8);
+        const row = adw.ActionRow.new();
+        // Profile names and hosts are text, not markup.
+        row.as(adw.PreferencesRow).setUseMarkup(0);
+        var nb: [4096]u8 = undefined;
+        row.as(adw.PreferencesRow).setTitle(cz(&nb, prof.name).ptr);
+        row.as(gtk.Widget).setTooltipText(cz(&nb, prof.name).ptr);
+        // Long names and hosts never widen the window (N3).
+        row.setTitleLines(1);
+        row.setSubtitleLines(2);
+        row.as(gtk.ListBoxRow).setActivatable(1);
+
         const dot = gtk.Box.new(.horizontal, 0);
         dot.as(gtk.Widget).addCssClass("wm-dot");
         dot.as(gtk.Widget).setValign(.center);
-        var nb: [4096]u8 = undefined;
-        const name_label = gtk.Label.new(cz(&nb, prof.name).ptr);
-        name_label.as(gtk.Widget).addCssClass("name");
-        name_label.setXalign(0);
-        // Long names and hosts never widen the page or the window (N3).
-        name_label.setEllipsize(.end);
-        name_label.as(gtk.Widget).setTooltipText(cz(&nb, prof.name).ptr);
+        row.addPrefix(dot.as(gtk.Widget));
+
         const state_label = gtk.Label.new(null);
-        state_label.as(gtk.Widget).addCssClass("state-label");
-        name_row.append(dot.as(gtk.Widget));
-        name_row.append(name_label.as(gtk.Widget));
-        name_row.append(state_label.as(gtk.Widget));
-        var db: [600]u8 = undefined;
-        const detail = gtk.Label.new(profileDetail(prof, &db).ptr);
-        detail.as(gtk.Widget).addCssClass("detail");
-        detail.setXalign(0);
-        detail.setEllipsize(.end);
-        detail.as(gtk.Widget).setTooltipText(profileDetail(prof, &db).ptr);
-        // N8: what a live connection is actually on, when an edit to the
-        // profile waits for Reconnect.
-        const live = gtk.Label.new(null);
-        live.as(gtk.Widget).addCssClass("live-pending");
-        live.setXalign(0);
-        live.setEllipsize(.end);
-        live.as(gtk.Widget).setVisible(0);
-        info.append(name_row.as(gtk.Widget));
-        info.append(detail.as(gtk.Widget));
-        info.append(live.as(gtk.Widget));
-
-        const buttons = gtk.Box.new(.horizontal, 8);
+        state_label.as(gtk.Widget).addCssClass("dim-label");
+        state_label.as(gtk.Widget).addCssClass("caption");
+        const buttons = gtk.Box.new(.horizontal, 6);
         buttons.as(gtk.Widget).setValign(.center);
+        row.addSuffix(state_label.as(gtk.Widget));
+        row.addSuffix(buttons.as(gtk.Widget));
+        row.addSuffix(gtk.Image.newFromIconName("go-next-symbolic").as(gtk.Widget));
 
-        const mb = gtk.MenuButton.new();
-        // A label child (not setLabel) so no dropdown arrow is drawn.
-        const dots = gtk.Label.new("⋯");
-        mb.setChild(dots.as(gtk.Widget));
-        mb.as(gtk.Widget).addCssClass("small");
-        mb.as(gtk.Widget).setTooltipText("More actions");
-        mb.as(gtk.Widget).setValign(.center);
-        const pop = gtk.Popover.new();
-        pop.as(gtk.Widget).addCssClass("wm-menu");
-        pop.setHasArrow(0);
-        const pbox = gtk.Box.new(.vertical, 0);
-        const restart_btn = gtk.Button.newWithLabel("Restart Sessions…");
-        const delete_btn = gtk.Button.newWithLabel("Delete Profile…");
-        delete_btn.as(gtk.Widget).addCssClass("danger");
-        restart_btn.as(gtk.Widget).addCssClass("wm-menu-item");
-        delete_btn.as(gtk.Widget).addCssClass("wm-menu-item");
-        for ([_]*gtk.Button{ restart_btn, delete_btn }) |b| {
-            if (b.getChild()) |l| if (gobject.ext.cast(gtk.Label, l)) |lab| lab.setXalign(0);
-        }
-        pbox.append(restart_btn.as(gtk.Widget));
-        pbox.append(delete_btn.as(gtk.Widget));
-        pop.setChild(pbox.as(gtk.Widget));
-        mb.setPopover(pop);
-
-        root.append(info.as(gtk.Widget));
-        root.append(buttons.as(gtk.Widget));
-        root.append(mb.as(gtk.Widget));
-
+        var db: [600]u8 = undefined;
         c.* = .{
             .name = try alloc.dupe(u8, prof.name),
-            .root = root,
+            .root = row,
             .dot = dot.as(gtk.Widget),
-            .name_label = name_label,
             .state_label = state_label,
-            .detail = detail,
-            .live = live,
+            .detail = try alloc.dupeSentinel(u8, profileDetail(prof, &db), 0),
             .host = try alloc.dupe(u8, prof.host),
             .instance = try alloc.dupe(u8, prof.instanceOrDefault()),
             .ssh_port = prof.ssh_port,
             .buttons = buttons,
-            .menu_button = mb,
-            .popover = pop,
-            .restart_btn = restart_btn,
-            .delete_btn = delete_btn,
         };
-        _ = gtk.Button.signals.clicked.connect(restart_btn, *Card, onRestart, c, .{});
-        _ = gtk.Button.signals.clicked.connect(delete_btn, *Card, onDelete, c, .{});
-        _ = gtk.Popover.signals.closed.connect(pop, *Card, onMenuClosed, c, .{});
-        _ = gobject.Object.signals.notify.connect(mb, *Card, onMenuActive, c, .{ .detail = "active" });
-        _ = p;
+        _ = adw.ActionRow.signals.activated.connect(row, *Card, onRow, c, .{});
         return c;
     }
 
-    fn cardFor(p: *Page, name: []const u8) ?*Card {
-        for (p.cards.items) |c| if (std.mem.eql(u8, c.name, name)) return c;
-        return null;
-    }
-
-    /// Status push: cards and the status area (never the form).
+    /// Status push: rows and the status area (never the form).
     pub fn update(p: *Page) void {
         if (!p.alive) return;
-        for (p.cards.items) |c| p.updateCard(c);
+        for (p.cards.items) |c| updateCard(c);
         p.renderStatus();
     }
 
-    fn updateCard(p: *Page, c: *Card) void {
+    fn updateCard(c: *Card) void {
         const e = hub.find(c.name);
         const dot_class: [:0]const u8 = if (e) |x| header.dotClass(x) else "none";
         if (!std.mem.eql(u8, dot_class, c.dot_class)) {
@@ -422,27 +377,27 @@ pub const Page = struct {
         const sl: [:0]const u8 = if (e) |x| stateLabel(x) else "";
         c.state_label.setText(sl.ptr);
         c.state_label.as(gtk.Widget).setVisible(@intFromBool(e != null));
+
         // N8: a live connection on something other than the stored
         // profile (edited while connected; applies at Reconnect).
-        var pending = false;
+        var lb: [700]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&lb);
         if (e) |x| if (x.status) |st| {
             if (!std.mem.eql(u8, st.host, c.host) or !std.mem.eql(u8, st.instance, c.instance) or st.ssh_port != c.ssh_port) {
-                pending = true;
-                var lb: [700]u8 = undefined;
-                var w: std.Io.Writer = .fixed(lb[0 .. lb.len - 1]);
                 w.print("on {s}", .{st.host}) catch {};
                 if (st.ssh_port > 0) w.print(" -p {d}", .{st.ssh_port}) catch {};
                 if (!std.mem.eql(u8, st.instance, "default")) w.print(" → {s}", .{st.instance}) catch {};
                 w.writeAll(" until Reconnect (Ctrl+Shift+R) applies the edit") catch {};
-                const n = w.end;
-                lb[n] = 0;
-                c.live.setText(lb[0..n :0].ptr);
-                c.live.as(gtk.Widget).setTooltipText(lb[0..n :0].ptr);
             }
         };
-        c.live.as(gtk.Widget).setVisible(@intFromBool(pending));
-        const up = if (e) |x| x.isUp() else false;
-        header.setClass(c.root.as(gtk.Widget), "active", up);
+        freeOpt(&c.live);
+        if (w.end > 0) setOpt(&c.live, lb[0..w.end]);
+        var sb: [1400]u8 = undefined;
+        const subtitle = if (c.live) |l|
+            std.fmt.bufPrintSentinel(&sb, "{s}\n{s}", .{ c.detail, l }, 0) catch c.detail
+        else
+            c.detail;
+        c.root.setSubtitle(subtitle.ptr);
 
         const mode: @TypeOf(c.mode) = if (e) |x| switch (x.state) {
             .connected => .up,
@@ -451,32 +406,24 @@ pub const Page = struct {
         } else .idle;
         if (mode != c.mode) {
             c.mode = mode;
-            while (c.buttons.as(gtk.Widget).getFirstChild()) |w| c.buttons.remove(w);
-            p.addCardButton(c, "Edit", .edit, false);
+            while (c.buttons.as(gtk.Widget).getFirstChild()) |b| c.buttons.remove(b);
             switch (mode) {
                 .up => {
-                    p.addCardButton(c, "Disconnect", .disconnect, false);
-                    p.addCardButton(c, "Show", .connect, true);
+                    addCardButton(c, "Disconnect", .disconnect, false);
+                    addCardButton(c, "Show", .connect, true);
                 },
-                .busy => p.addCardButton(c, "Cancel", .disconnect, false),
-                .idle, .none => p.addCardButton(c, "Connect", .connect, true),
+                .busy => addCardButton(c, "Cancel", .disconnect, false),
+                .idle, .none => addCardButton(c, "Connect", .connect, true),
             }
         }
-        // ⋯ menu labels follow the pending confirmations (rebuilt in place).
-        const confirm_r = if (p.confirm_restart) |n| std.mem.eql(u8, n, c.name) else false;
-        const confirm_d = if (p.confirm_delete) |n| std.mem.eql(u8, n, c.name) else false;
-        c.restart_btn.setLabel(if (confirm_r) "Sure? This kills every shell" else "Restart Sessions…");
-        c.delete_btn.setLabel(if (confirm_d) "Sure? Removes the profile" else "Delete Profile…");
     }
 
-    const CardAction = enum { edit, connect, disconnect };
+    const CardAction = enum { connect, disconnect };
 
-    fn addCardButton(_: *Page, c: *Card, label: [:0]const u8, action: CardAction, primary: bool) void {
+    fn addCardButton(c: *Card, label: [:0]const u8, action: CardAction, primary: bool) void {
         const b = gtk.Button.newWithLabel(label.ptr);
-        b.as(gtk.Widget).addCssClass("small");
-        if (primary) b.as(gtk.Widget).addCssClass("primary");
+        if (primary) b.as(gtk.Widget).addCssClass("suggested-action");
         const handler = switch (action) {
-            .edit => &onEdit,
             .connect => &onConnect,
             .disconnect => &onDisconnect,
         };
@@ -484,7 +431,7 @@ pub const Page = struct {
         c.buttons.append(b.as(gtk.Widget));
     }
 
-    // -- card actions (also the control socket's entry points) -----------
+    // -- row actions (also the control socket's entry points) -------------
 
     pub fn clickConnect(p: *Page, name: []const u8) void {
         if (hub.connectProfile(name)) |err| p.showNotice("{s}: {s}", .{ name, err });
@@ -495,41 +442,61 @@ pub const Page = struct {
     }
 
     pub fn clickEdit(p: *Page, name: []const u8) void {
-        p.closeMenu();
         p.openForm(name);
     }
 
-    pub fn clickMenu(p: *Page, name: []const u8) void {
-        const c = p.cardFor(name) orelse return;
-        const open = if (p.menu_for) |m| !std.mem.eql(u8, m, name) else true;
-        p.closeMenu();
-        if (open) c.menu_button.popup();
+    pub fn clickRestart(p: *Page, name: []const u8) void {
+        p.ask(.restart, name, "Restart sessions?", "This kills every shell on the host.", "Restart Sessions");
     }
 
-    /// First click relabels; the second restarts (W-24, W-25).
-    pub fn clickRestart(p: *Page, name: []const u8) void {
-        const pending = if (p.confirm_restart) |n| std.mem.eql(u8, n, name) else false;
-        if (!pending) {
-            setOpt(&p.confirm_restart, name);
-            freeOpt(&p.confirm_delete);
-            p.update();
-            return;
+    pub fn clickDelete(p: *Page, name: []const u8) void {
+        p.ask(.delete, name, "Delete this profile?", "This removes the profile and its saved password.", "Delete Profile");
+    }
+
+    fn ask(p: *Page, kind: Confirm, name: []const u8, heading: [:0]const u8, body: [:0]const u8, label: [:0]const u8) void {
+        if (p.confirm != null) return;
+        const win = hub.hub.window orelse return;
+        setOpt(&p.confirm_name, name);
+        p.confirm_kind = kind;
+        const d = adw.AlertDialog.new(heading.ptr, body.ptr);
+        d.addResponse("cancel", "Cancel");
+        d.addResponse("ok", label.ptr);
+        d.setResponseAppearance("ok", .destructive);
+        d.setDefaultResponse("cancel");
+        d.setCloseResponse("cancel");
+        _ = adw.AlertDialog.signals.response.connect(d, *Page, onConfirm, p, .{});
+        p.confirm = d;
+        d.as(adw.Dialog).present(win.as(gtk.Widget));
+    }
+
+    /// Answer the open confirmation (the control socket).
+    pub fn answer(p: *Page, yes: bool) bool {
+        const d = p.confirm orelse return false;
+        d.setCloseResponse(if (yes) "ok" else "cancel");
+        _ = d.as(adw.Dialog).close();
+        return true;
+    }
+
+    fn onConfirm(_: *adw.AlertDialog, response: [*:0]const u8, p: *Page) callconv(.c) void {
+        p.confirm = null;
+        const name = p.confirm_name orelse return;
+        defer freeOpt(&p.confirm_name);
+        if (!std.mem.eql(u8, std.mem.span(response), "ok")) return;
+        // The notices live on the main page, under the form.
+        if (p.form != null) p.closeForm();
+        switch (p.confirm_kind) {
+            .restart => p.restart(name),
+            .delete => p.delete(name),
         }
-        p.closeMenu();
+    }
+
+    fn restart(p: *Page, name: []const u8) void {
         const engine = hub.hub.engine orelse return;
         p.showNotice("{s}: restarting sessions…", .{name});
         if (engine.restartSessions(name)) |err| p.showNotice("{s}: {s}", .{ name, err });
     }
 
-    pub fn clickDelete(p: *Page, name: []const u8) void {
-        const pending = if (p.confirm_delete) |n| std.mem.eql(u8, n, name) else false;
-        if (!pending) {
-            setOpt(&p.confirm_delete, name);
-            freeOpt(&p.confirm_restart);
-            p.update();
-            return;
-        }
-        p.closeMenu();
+    fn delete(p: *Page, name: []const u8) void {
         const engine = hub.hub.engine orelse return;
         var id_buf: [64]u8 = undefined;
         var id: ?[]const u8 = null;
@@ -540,25 +507,16 @@ pub const Page = struct {
             id = id_buf[0..n];
         }
         if (engine.deleteProfile(name)) |err| p.showNotice("{s}: {s}", .{ name, err });
-        // The saved password goes with the profile.
         // The saved password goes with the profile, keyring up or not.
         if (id) |i| if (i.len > 0) keyring.forget(i);
         hub.refresh();
         p.rebuildList();
     }
 
-    fn closeMenu(p: *Page) void {
-        const name = p.menu_for;
-        p.menu_for = null;
-        freeOpt(&p.confirm_restart);
-        freeOpt(&p.confirm_delete);
-        if (name) |n| {
-            if (p.cardFor(n)) |c| c.menu_button.popdown();
-            alloc.free(n);
-        }
-        p.update();
+    fn onRow(_: *adw.ActionRow, c: *Card) callconv(.c) void {
+        const p = hub.hub.page orelse return;
+        p.clickEdit(c.name);
     }
-
     fn onConnect(_: *gtk.Button, c: *Card) callconv(.c) void {
         const p = hub.hub.page orelse return;
         p.clickConnect(c.name);
@@ -566,36 +524,6 @@ pub const Page = struct {
     fn onDisconnect(_: *gtk.Button, c: *Card) callconv(.c) void {
         const p = hub.hub.page orelse return;
         p.clickDisconnect(c.name);
-    }
-    fn onEdit(_: *gtk.Button, c: *Card) callconv(.c) void {
-        const p = hub.hub.page orelse return;
-        p.clickEdit(c.name);
-    }
-    fn onRestart(_: *gtk.Button, c: *Card) callconv(.c) void {
-        const p = hub.hub.page orelse return;
-        p.clickRestart(c.name);
-    }
-    fn onDelete(_: *gtk.Button, c: *Card) callconv(.c) void {
-        const p = hub.hub.page orelse return;
-        p.clickDelete(c.name);
-    }
-    fn onMenuActive(mb: *gtk.MenuButton, _: *gobject.ParamSpec, c: *Card) callconv(.c) void {
-        const p = hub.hub.page orelse return;
-        if (mb.getActive() != 0) {
-            if (p.menu_for) |m| if (!std.mem.eql(u8, m, c.name)) p.closeMenu();
-            setOpt(&p.menu_for, c.name);
-        }
-    }
-    fn onMenuClosed(_: *gtk.Popover, c: *Card) callconv(.c) void {
-        hub.scheduleFocusRestore();
-        const p = hub.hub.page orelse return;
-        // Click outside / Escape: clear pending confirmations (W-24).
-        if (p.menu_for) |m| if (std.mem.eql(u8, m, c.name)) {
-            freeOpt(&p.menu_for);
-            freeOpt(&p.confirm_restart);
-            freeOpt(&p.confirm_delete);
-            p.update();
-        };
     }
 
     // -- notices (W-25) -----------------------------------------------------
@@ -626,7 +554,7 @@ pub const Page = struct {
     fn renderStatus(p: *Page) void {
         const box = p.status;
         while (box.as(gtk.Widget).getFirstChild()) |w| box.remove(w);
-        if (p.notice) |n| box.append(para(n, "notice"));
+        if (p.notice) |n| box.append(para(n, null));
         for (hub.hub.entries.items) |e| {
             const show = switch (e.state) {
                 .connecting, .retry, .failed => true,
@@ -634,13 +562,13 @@ pub const Page = struct {
             };
             if (!show) continue;
             const h = gtk.Box.new(.horizontal, 6);
-            h.as(gtk.Widget).addCssClass("heading");
             const dot = gtk.Box.new(.horizontal, 0);
             dot.as(gtk.Widget).addCssClass("wm-dot");
             dot.as(gtk.Widget).addCssClass(header.dotClass(e).ptr);
             dot.as(gtk.Widget).setValign(.center);
             var nb: [4096]u8 = undefined;
             const nl = gtk.Label.new(cz(&nb, e.name).ptr);
+            nl.as(gtk.Widget).addCssClass("heading");
             nl.setEllipsize(.end);
             nl.setXalign(0);
             h.append(dot.as(gtk.Widget));
@@ -648,9 +576,9 @@ pub const Page = struct {
             box.append(h.as(gtk.Widget));
             const st = e.status orelse continue;
             var mb: [1024]u8 = undefined;
-            if (st.msg.len > 0) box.append(para(std.fmt.bufPrintSentinel(&mb, "{s}", .{st.msg}, 0) catch "", null));
+            if (st.msg.len > 0) box.append(para(std.fmt.bufPrintSentinel(&mb, "{s}", .{st.msg}, 0) catch "", "dim-label"));
             if (e.state == .connected and e.offline) {
-                box.append(para("The tunnel is up but the workspace's session sockets are down and retrying — the server may be restarting. The client reconnects on its own if the server stops answering.", null));
+                box.append(para("The tunnel is up but the workspace's session sockets are down and retrying — the server may be restarting. The client reconnects on its own if the server stops answering.", "dim-label"));
             }
             if (e.state == .retry) {
                 var rb: [160]u8 = undefined;
@@ -658,13 +586,14 @@ pub const Page = struct {
                     std.fmt.bufPrintSentinel(&rb, "Connection interrupted — retrying in {d}s… (sessions keep running on the server)", .{s}, 0) catch ""
                 else
                     "Connection interrupted — retrying… (sessions keep running on the server)";
-                box.append(para(t, "retry"));
+                box.append(para(t, "dim-label"));
             }
             if (e.state == .failed) {
-                box.append(para("Not retrying automatically — hit Connect to try again. The connection log (Log button above) has the full sequence.", null));
+                box.append(para("Not retrying automatically — hit Connect to try again. The connection log (Log button above) has the full sequence.", "dim-label"));
             }
             if (st.stderr.len > 0) box.append(pre(st.stderr));
         }
+        p.status_group.as(gtk.Widget).setVisible(@intFromBool(box.as(gtk.Widget).getFirstChild() != null));
     }
 
     fn para(text: [:0]const u8, class: ?[:0]const u8) *gtk.Widget {
@@ -675,7 +604,6 @@ pub const Page = struct {
         l.setXalign(0);
         l.setSelectable(1);
         l.as(gtk.Widget).setFocusable(0);
-        l.as(gtk.Widget).addCssClass("para");
         if (class) |c| l.as(gtk.Widget).addCssClass(c.ptr);
         return l.as(gtk.Widget);
     }
@@ -685,7 +613,7 @@ pub const Page = struct {
         sw.setPolicy(.never, .automatic);
         sw.setMaxContentHeight(140);
         sw.setPropagateNaturalHeight(1);
-        sw.as(gtk.Widget).addCssClass("wm-pre");
+        sw.as(gtk.Widget).addCssClass("card");
         const z = alloc.dupeSentinel(u8, text, 0) catch return sw.as(gtk.Widget);
         defer alloc.free(z);
         const l = gtk.Label.new(null);
@@ -695,25 +623,21 @@ pub const Page = struct {
         l.setXalign(0);
         l.setYalign(0);
         l.setSelectable(1);
-        l.as(gtk.Widget).setFocusable(0);
-        sw.setChild(l.as(gtk.Widget));
+        const lw = l.as(gtk.Widget);
+        lw.setFocusable(0);
+        lw.addCssClass("monospace");
+        lw.setMarginStart(10);
+        lw.setMarginEnd(10);
+        lw.setMarginTop(8);
+        lw.setMarginBottom(8);
+        sw.setChild(lw);
         return sw.as(gtk.Widget);
-    }
-
-    /// The keyring's has-password set changed: refresh an open form's
-    /// placeholder (only if the user has not started typing).
-    pub fn keyringChanged(p: *Page) void {
-        _ = p;
     }
 
     // -- the form (W-27, W-28) ------------------------------------------
 
     pub fn openForm(p: *Page, editing: []const u8) void {
-        if (p.form) |f| {
-            p.form_holder.remove(f.root.as(gtk.Widget));
-            freeForm(f);
-            p.form = null;
-        }
+        if (p.form != null) p.closeForm();
         const engine = hub.hub.engine orelse return;
         var prof: conn.Profile = .{};
         var owned: ?conn.Profile = null;
@@ -725,26 +649,40 @@ pub const Page = struct {
         const has_pw = prof.id.len > 0 and keyring.has(prof.id);
         const f = buildForm(editing, prof, has_pw) catch return;
         p.form = f;
-        p.form_holder.append(f.root.as(gtk.Widget));
-        p.list.as(gtk.Widget).setVisible(0);
         _ = gtk.Button.signals.clicked.connect(f.submit, *Page, onSubmit, p, .{});
         _ = gtk.Button.signals.clicked.connect(f.cancel, *Page, onCancel, p, .{});
-        for ([_]*gtk.Entry{ f.name, f.host, f.ssh_port, f.identity, f.password, f.instance, f.extra }) |en| {
-            _ = gtk.Entry.signals.activate.connect(en, *Page, onEntryActivate, p, .{});
+        _ = adw.NavigationPage.signals.hidden.connect(f.page, *Page, onFormHidden, p, .{});
+        _ = adw.NavigationPage.signals.shown.connect(f.page, *Page, onFormShown, p, .{});
+        for ([_]*adw.EntryRow{ f.name, f.host, f.ssh_port, f.identity, f.password, f.instance, f.extra }) |en| {
+            _ = adw.EntryRow.signals.entry_activated.connect(en, *Page, onEntryActivate, p, .{});
         }
-        _ = f.name.as(gtk.Widget).grabFocus();
+        if (f.restart) |b| _ = adw.ButtonRow.signals.activated.connect(b, *Page, onFormRestart, p, .{});
+        if (f.delete) |b| _ = adw.ButtonRow.signals.activated.connect(b, *Page, onFormDelete, p, .{});
+        p.present();
+        settings_panel.dialog().pushSubpage(f.page);
     }
 
     pub fn closeForm(p: *Page) void {
         if (p.form) |f| {
-            p.form_holder.remove(f.root.as(gtk.Widget));
+            p.form = null;
             freeForm(f);
+            _ = settings_panel.dialog().popSubpage();
         }
-        p.form = null;
         p.form_tag += 1;
-        p.list.as(gtk.Widget).setVisible(1);
         p.rebuildList();
-        _ = p.root.as(gtk.Widget).grabFocus();
+    }
+
+    /// The first field takes focus (W-27), once the page has slid in: the
+    /// navigation view moves focus itself during the transition.
+    fn onFormShown(np: *adw.NavigationPage, p: *Page) callconv(.c) void {
+        const f = p.form orelse return;
+        if (f.page == np) _ = f.name.as(gtk.Widget).grabFocus();
+    }
+
+    /// The form left the screen some other way (Escape).
+    fn onFormHidden(np: *adw.NavigationPage, p: *Page) callconv(.c) void {
+        const f = p.form orelse return;
+        if (f.page == np) p.closeForm();
     }
 
     fn onSubmit(_: *gtk.Button, p: *Page) callconv(.c) void {
@@ -753,8 +691,16 @@ pub const Page = struct {
     fn onCancel(_: *gtk.Button, p: *Page) callconv(.c) void {
         p.closeForm();
     }
-    fn onEntryActivate(_: *gtk.Entry, p: *Page) callconv(.c) void {
+    fn onEntryActivate(_: *adw.EntryRow, p: *Page) callconv(.c) void {
         p.submit();
+    }
+    fn onFormRestart(_: *adw.ButtonRow, p: *Page) callconv(.c) void {
+        const f = p.form orelse return;
+        p.clickRestart(f.editing);
+    }
+    fn onFormDelete(_: *adw.ButtonRow, p: *Page) callconv(.c) void {
+        const f = p.form orelse return;
+        p.clickDelete(f.editing);
     }
 
     /// Set a field (control socket; the same widgets a user types into).
@@ -767,29 +713,27 @@ pub const Page = struct {
             c.setActive(@intFromBool(std.mem.eql(u8, value, "true")));
             return true;
         }
-        const en: *gtk.Entry = if (std.mem.eql(u8, field, "name")) f.name else if (std.mem.eql(u8, field, "host")) f.host else if (std.mem.eql(u8, field, "ssh_port")) f.ssh_port else if (std.mem.eql(u8, field, "identity_file")) f.identity else if (std.mem.eql(u8, field, "password")) f.password else if (std.mem.eql(u8, field, "instance")) f.instance else if (std.mem.eql(u8, field, "extra_options")) f.extra else return false;
+        const en: *adw.EntryRow = if (std.mem.eql(u8, field, "name")) f.name else if (std.mem.eql(u8, field, "host")) f.host else if (std.mem.eql(u8, field, "ssh_port")) f.ssh_port else if (std.mem.eql(u8, field, "identity_file")) f.identity else if (std.mem.eql(u8, field, "password")) f.password else if (std.mem.eql(u8, field, "instance")) f.instance else if (std.mem.eql(u8, field, "extra_options")) f.extra else return false;
         en.as(gtk.Editable).setText(z.ptr);
         return true;
     }
 
     fn setError(f: *Form, msg: []const u8) void {
         text_mod.set(f.err, msg);
+        f.err.as(gtk.Widget).setVisible(@intFromBool(msg.len > 0));
     }
 
-    /// Save (& Connect): validate through the engine, store or clear the
-    /// password in the keyring, then close the form (and connect a new
-    /// profile). Errors stay inline and the form stays open.
     /// Save (& Connect), as main.js profiles:save: validate first; with a
     /// new password, store it in the keyring before anything is saved and
     /// reject the whole save if that fails (the form keeps everything the
     /// user typed); then save, clear a password if asked, close the form
-    /// (and connect a new profile).
+    /// (and connect a new profile). Errors stay inline, the form open.
     pub fn submit(p: *Page) void {
         const f = p.form orelse return;
         if (f.busy) return;
         const engine = hub.hub.engine orelse return;
         const text = struct {
-            fn get(e: *gtk.Entry) []const u8 {
+            fn get(e: *adw.EntryRow) []const u8 {
                 return std.mem.span(e.as(gtk.Editable).getText());
             }
         }.get;
@@ -888,13 +832,9 @@ pub const Page = struct {
                 keyring.forget(prof.id);
             }
         }
-        p.finishSubmit(was_new, name_copy);
-        return true;
-    }
-
-    fn finishSubmit(p: *Page, was_new: bool, name: []const u8) void {
         p.closeForm();
-        if (was_new) p.clickConnect(name);
+        if (was_new) p.clickConnect(name_copy);
+        return true;
     }
 };
 
@@ -903,67 +843,86 @@ pub const Page = struct {
 fn buildForm(editing: []const u8, prof: conn.Profile, has_pw: bool) !*Form {
     const f = try alloc.create(Form);
     errdefer alloc.destroy(f);
-    const root = gtk.Box.new(.vertical, 10);
-    root.as(gtk.Widget).addCssClass("wm-form");
+    const content = adw.PreferencesPage.new();
 
-    const row1 = row();
-    const name = addField(row1, "Profile name", "devbox", prof.name, false);
-    const host = addField(row1, "Host (anything ssh accepts)", "me@devbox.example.com", prof.host, false);
-    root.append(row1.as(gtk.Widget));
-
-    const row2 = row();
-    var pb: [8]u8 = undefined;
-    const port_s: []const u8 = if (prof.ssh_port > 0) (std.fmt.bufPrint(&pb, "{d}", .{prof.ssh_port}) catch "") else "";
-    const ssh_port = addField(row2, "SSH port (opt.)", "22", port_s, true);
-    const identity = addField(row2, "Identity file (opt.)", "~/.ssh/id_ed25519", prof.identity_file, false);
-    root.append(row2.as(gtk.Widget));
-
-    const row3 = row();
-    const password = addField(row3, "Password (opt. — stored encrypted in the system keyring)", if (has_pw) "saved — leave blank to keep" else "blank = key auth (recommended)", "", false);
-    password.setVisibility(0);
-    password.setInputPurpose(.password);
-    var clear: ?*gtk.CheckButton = null;
-    if (has_pw) {
-        const c = gtk.CheckButton.newWithLabel("clear saved");
-        c.as(gtk.Widget).setValign(.end);
-        c.as(gtk.Widget).addCssClass("narrow");
-        c.as(gtk.Widget).setSizeRequest(130, -1);
-        row3.append(c.as(gtk.Widget));
-        clear = c;
-    }
-    root.append(row3.as(gtk.Widget));
-
-    const adv = gtk.Expander.new("Advanced");
-    adv.as(gtk.Widget).addCssClass("wm-advanced");
-    const advbox = gtk.Box.new(.vertical, 10);
-    const row4 = row();
-    const instance = addField(row4, "Instance name (blank = default — separate instances have separate sessions)", "default", prof.instance, false);
-    advbox.append(row4.as(gtk.Widget));
-    const row5 = row();
-    const extra = addField(row5, "Extra ssh options", "-o ProxyJump=bastion", prof.extra_options, false);
-    advbox.append(row5.as(gtk.Widget));
-    adv.setChild(advbox.as(gtk.Widget));
-    root.append(adv.as(gtk.Widget));
-
-    const actions = gtk.Box.new(.horizontal, 10);
-    actions.as(gtk.Widget).addCssClass("form-actions");
-    const submit = gtk.Button.newWithLabel(if (editing.len > 0) "Save" else "Save & Connect");
-    submit.as(gtk.Widget).addCssClass("primary");
-    const cancel = gtk.Button.newWithLabel("Cancel");
     const err = gtk.Label.new(null);
-    err.as(gtk.Widget).addCssClass("wm-form-error");
+    err.as(gtk.Widget).addCssClass("error");
+    err.as(gtk.Widget).setVisible(0);
     err.setWrap(1);
     err.setWrapMode(.word_char);
     err.setXalign(0);
-    err.as(gtk.Widget).setHexpand(1);
-    actions.append(submit.as(gtk.Widget));
-    actions.append(cancel.as(gtk.Widget));
-    actions.append(err.as(gtk.Widget));
-    root.append(actions.as(gtk.Widget));
+    const errors = adw.PreferencesGroup.new();
+    errors.add(err.as(gtk.Widget));
+    content.add(errors);
+
+    const main = adw.PreferencesGroup.new();
+    main.setDescription("The host is anything ssh accepts, such as me@devbox.example.com. Port and identity file are optional.");
+    const name = addEntry(main, "Profile name", prof.name);
+    const host = addEntry(main, "Host", prof.host);
+    var pb: [8]u8 = undefined;
+    const port_s: []const u8 = if (prof.ssh_port > 0) (std.fmt.bufPrint(&pb, "{d}", .{prof.ssh_port}) catch "") else "";
+    const ssh_port = addEntry(main, "SSH port", port_s);
+    const identity = addEntry(main, "Identity file", prof.identity_file);
+    const password = adw.PasswordEntryRow.new().as(adw.EntryRow);
+    password.as(adw.PreferencesRow).setTitle(if (has_pw) "Password (saved — leave blank to keep)" else "Password (blank = key auth, recommended)");
+    main.add(password.as(gtk.Widget));
+    var clear: ?*adw.SwitchRow = null;
+    if (has_pw) {
+        const c = adw.SwitchRow.new();
+        c.as(adw.PreferencesRow).setTitle("Clear saved password");
+        main.add(c.as(gtk.Widget));
+        clear = c;
+    }
+    content.add(main);
+
+    const more = adw.PreferencesGroup.new();
+    const adv = adw.ExpanderRow.new();
+    adv.as(adw.PreferencesRow).setTitle("Advanced");
+    adv.setSubtitle("Separate instances have separate sessions; blank is the default instance. Extra options go to ssh, such as -o ProxyJump=bastion.");
+    const instance = adw.EntryRow.new();
+    instance.as(adw.PreferencesRow).setTitle("Instance name");
+    setText(instance, prof.instance);
+    const extra = adw.EntryRow.new();
+    extra.as(adw.PreferencesRow).setTitle("Extra ssh options");
+    setText(extra, prof.extra_options);
+    adv.addRow(instance.as(gtk.Widget));
+    adv.addRow(extra.as(gtk.Widget));
+    more.add(adv.as(gtk.Widget));
+    content.add(more);
+
+    var restart: ?*adw.ButtonRow = null;
+    var delete: ?*adw.ButtonRow = null;
+    if (editing.len > 0) {
+        const danger = adw.PreferencesGroup.new();
+        const r = adw.ButtonRow.new();
+        r.as(adw.PreferencesRow).setTitle("Restart Sessions…");
+        const d = adw.ButtonRow.new();
+        d.as(adw.PreferencesRow).setTitle("Delete Profile…");
+        d.as(gtk.Widget).addCssClass("destructive-action");
+        danger.add(r.as(gtk.Widget));
+        danger.add(d.as(gtk.Widget));
+        content.add(danger);
+        restart = r;
+        delete = d;
+    }
+
+    const bar = adw.HeaderBar.new();
+    bar.setShowStartTitleButtons(0);
+    bar.setShowEndTitleButtons(0);
+    bar.setShowBackButton(0);
+    const cancel = gtk.Button.newWithLabel("Cancel");
+    const submit = gtk.Button.newWithLabel(if (editing.len > 0) "Save" else "Save & Connect");
+    submit.as(gtk.Widget).addCssClass("suggested-action");
+    bar.packStart(cancel.as(gtk.Widget));
+    bar.packEnd(submit.as(gtk.Widget));
+
+    const view = adw.ToolbarView.new();
+    view.addTopBar(bar.as(gtk.Widget));
+    view.setContent(content.as(gtk.Widget));
 
     f.* = .{
         .editing = try alloc.dupe(u8, editing),
-        .root = root,
+        .page = adw.NavigationPage.new(view.as(gtk.Widget), if (editing.len > 0) "Edit Profile" else "New Profile"),
         .name = name,
         .host = host,
         .ssh_port = ssh_port,
@@ -976,41 +935,29 @@ fn buildForm(editing: []const u8, prof: conn.Profile, has_pw: bool) !*Form {
         .submit = submit,
         .cancel = cancel,
         .err = err,
+        .restart = restart,
+        .delete = delete,
     };
     return f;
 }
 
-fn row() *gtk.Box {
-    const b = gtk.Box.new(.horizontal, 12);
-    b.as(gtk.Widget).addCssClass("row");
-    return b;
+fn addEntry(group: *adw.PreferencesGroup, title: [:0]const u8, value: []const u8) *adw.EntryRow {
+    const e = adw.EntryRow.new();
+    e.as(adw.PreferencesRow).setTitle(title.ptr);
+    setText(e, value);
+    group.add(e.as(gtk.Widget));
+    return e;
 }
 
-fn addField(parent: *gtk.Box, label: [:0]const u8, placeholder: [:0]const u8, value: []const u8, narrow: bool) *gtk.Entry {
-    const box = gtk.Box.new(.vertical, 3);
-    box.as(gtk.Widget).addCssClass("field");
-    if (narrow) {
-        box.as(gtk.Widget).setSizeRequest(130, -1);
-    } else box.as(gtk.Widget).setHexpand(1);
-    const l = gtk.Label.new(label.ptr);
-    l.setXalign(0);
-    l.setWrap(1);
-        l.setWrapMode(.word_char);
-    l.as(gtk.Widget).addCssClass("field-label");
-    const e = gtk.Entry.new();
-    e.setPlaceholderText(placeholder.ptr);
+fn setText(e: *adw.EntryRow, value: []const u8) void {
     var zb: [1024]u8 = undefined;
-    const z = cz(&zb, value);
-    e.as(gtk.Editable).setText(z.ptr);
-    if (narrow) e.as(gtk.Editable).setWidthChars(6);
-    box.append(l.as(gtk.Widget));
-    box.append(e.as(gtk.Widget));
-    parent.append(box.as(gtk.Widget));
-    return e;
+    e.as(gtk.Editable).setText(cz(&zb, value).ptr);
 }
 
 fn freeCard(c: *Card) void {
     alloc.free(c.name);
+    alloc.free(c.detail);
+    freeOpt(&c.live);
     alloc.free(c.host);
     alloc.free(c.instance);
     alloc.destroy(c);
@@ -1029,12 +976,6 @@ fn freeOpt(slot: *?[]u8) void {
 fn setOpt(slot: *?[]u8, v: []const u8) void {
     freeOpt(slot);
     slot.* = alloc.dupe(u8, v) catch null;
-}
-
-fn setOpt2(slot: *[]u8, v: []const u8) void {
-    const copy = alloc.dupe(u8, v) catch return;
-    alloc.free(slot.*);
-    slot.* = copy;
 }
 
 fn profileDetail(p: conn.Profile, buf: []u8) [:0]const u8 {

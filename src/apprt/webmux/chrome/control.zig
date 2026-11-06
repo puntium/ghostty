@@ -6,11 +6,12 @@
 //!                               pills, header buttons, page state, keyring
 //!   page   {action, name, field, value}
 //!          action = new | edit | cancel | set | submit | connect |
-//!                   disconnect | menu | restart | delete | escape | log
+//!                   disconnect | restart | delete | confirm | refuse |
+//!                   escape | log
 //!   pill   {action: click|close|drag, name, slot | x}
 //!          (drag-begin, drag-over {x}, drag-cancel: the steps of a drag)
 //!   header {button: new-terminal|new-files|settings|connections}
-//!   show   {name?}              userShow (no name: the connection page)
+//!   show   {name?}              userShow (no name: the Connections page)
 //!   connect / disconnect {name} straight to the engine (no reveal)
 //!   menu   {action: list|activate, label}
 //!   sleep-resume                as logind's PrepareForSleep(false)
@@ -18,6 +19,7 @@
 //!                               lookup never returns the secret: only its
 //!                               length and whether it equals `expect`
 const std = @import("std");
+const adw = @import("adw");
 const gtk = @import("gtk");
 const gobject = @import("gobject");
 const gdk = @import("gdk");
@@ -28,21 +30,22 @@ const hub_mod = @import("hub.zig");
 const hub = &hub_mod.hub;
 const header_mod = @import("header.zig");
 const page_mod = @import("page.zig");
+const settings_panel = @import("../panels/settings_panel.zig");
 const menu = @import("menu.zig");
 const keyring = @import("keyring.zig");
 const sleep = @import("sleep.zig");
 
 pub fn register() void {
     control.register(.{ .name = "conns", .help = "chrome state: title, front view, connections, pills, header, page, keyring", .handler = &conns });
-    control.register(.{ .name = "page", .help = "{action:new|edit|cancel|set|submit|connect|disconnect|menu|restart|delete|escape|log, name, field, value}: drive the connection page", .handler = &pageCmd });
+    control.register(.{ .name = "page", .help = "{action:new|edit|cancel|set|submit|connect|disconnect|restart|delete|confirm|refuse|escape|log, name, field, value}: drive the Connections page (restart and delete ask; confirm and refuse answer)", .handler = &pageCmd });
     control.register(.{ .name = "pill", .help = "{action:click|close|drag, name, slot|x}: a header pill", .handler = &pillCmd });
     control.register(.{ .name = "header", .help = "{button:new-terminal|new-files|settings|connections}: a header button", .handler = &headerCmd });
-    control.register(.{ .name = "show", .help = "{name?}: show a host (as a pill click) or, without a name, the connection page", .handler = &showCmd });
+    control.register(.{ .name = "show", .help = "{name?}: show a host (as a pill click) or, without a name, the Connections page", .handler = &showCmd });
     control.register(.{ .name = "connect", .help = "{name}: engine connect (no reveal)", .handler = &connectCmd });
     control.register(.{ .name = "disconnect", .help = "{name}: disconnect", .handler = &disconnectCmd });
     control.register(.{ .name = "menu", .help = "{action:list|activate, label}: the header menu's items", .handler = &menuCmd });
     control.register(.{ .name = "sleep-resume", .help = "act as if the system just woke from suspend", .handler = &sleepCmd });
-    control.register(.{ .name = "chrome-bounds", .help = "where the chrome's clickable widgets are, in window coordinates ({x,y,w,h} by name: header buttons, pills and their ✕, card buttons and ⋯, the ⋯ menu items, form entries and buttons), for webmux-dev/realpointer", .handler = &boundsCmd });
+    control.register(.{ .name = "chrome-bounds", .help = "where the chrome's clickable widgets are, in window coordinates ({x,y,w,h} by name: header buttons, pills and their ✕, profile rows and their buttons, form rows and buttons, the landing button), for webmux-dev/realpointer", .handler = &boundsCmd });
     control.register(.{ .name = "keyring", .help = "{action:state|store|lookup|clear, id, password, expect}: the Secret Service store (lookup never returns the secret)", .handler = &keyringCmd });
 }
 
@@ -80,10 +83,7 @@ const CardDump = struct {
     name: []const u8,
     state_label: []const u8,
     detail: []const u8,
-    active: bool,
     buttons: []const []const u8,
-    menu_open: bool,
-    menu_items: [2][]const u8,
     /// N8: what a live connection is on while an edit waits, else null.
     live: ?[]const u8,
 };
@@ -153,6 +153,8 @@ fn connsInner(req: *Request) !void {
     }
 
     var page: ?struct {
+        /// The dialog is up (on any of its pages).
+        open: bool,
         mode: []const u8,
         empty: bool,
         cards: []CardDump,
@@ -162,12 +164,13 @@ fn connsInner(req: *Request) !void {
             error_text: []const u8,
             submit: []const u8,
             has_clear: bool,
-            password_placeholder: []const u8,
+            password_title: []const u8,
             busy: bool,
             /// What the fields hold (the password only as its length).
             fields: struct { name: []const u8, host: []const u8, ssh_port: []const u8, identity_file: []const u8, instance: []const u8, extra_options: []const u8, password_len: usize },
         },
-        menu_for: ?[]const u8,
+        /// The profile a confirmation is open for.
+        confirm: ?[]const u8,
         /// Every wrapping label of the status area is set through
         /// hyphen-free markup (no '-' drawn that is not in the text).
         status_hyphen_free: bool,
@@ -183,22 +186,17 @@ fn connsInner(req: *Request) !void {
             try cards.append(a, .{
                 .name = c.name,
                 .state_label = if (c.state_label.as(gtk.Widget).getVisible() != 0) labelText(a, c.state_label) else "",
-                .detail = labelText(a, c.detail),
-                .active = c.root.as(gtk.Widget).hasCssClass("active") != 0,
+                .detail = c.detail,
                 .buttons = btns.items,
-                .menu_open = c.menu_button.getActive() != 0,
-                .live = if (c.live.as(gtk.Widget).getVisible() != 0) labelText(a, c.live) else null,
-                .menu_items = .{
-                    try a.dupe(u8, std.mem.span(c.restart_btn.getLabel() orelse "")),
-                    try a.dupe(u8, std.mem.span(c.delete_btn.getLabel() orelse "")),
-                },
+                .live = c.live,
             });
         }
         var texts: std.ArrayList([]const u8) = .empty;
         try collectLabels(a, p.status.as(gtk.Widget), &texts);
         page = .{
+            .open = settings_panel.isOpen(),
             .mode = if (p.form != null) "form" else "list",
-            .empty = p.empty_label != null,
+            .empty = p.empty_row != null,
             .cards = cards.items,
             .status_text = texts.items,
             .form = if (p.form) |f| .{
@@ -206,7 +204,7 @@ fn connsInner(req: *Request) !void {
                 .error_text = labelText(a, f.err),
                 .submit = try a.dupe(u8, std.mem.span(f.submit.getLabel() orelse "")),
                 .has_clear = f.clear != null,
-                .password_placeholder = try a.dupe(u8, std.mem.span(f.password.getPlaceholderText() orelse "")),
+                .password_title = try a.dupe(u8, std.mem.span(f.password.as(adw.PreferencesRow).getTitle())),
                 .fields = .{
                     .name = try entryText(a, f.name),
                     .host = try entryText(a, f.host),
@@ -218,7 +216,7 @@ fn connsInner(req: *Request) !void {
                 },
                 .busy = f.busy,
             } else null,
-            .menu_for = p.menu_for,
+            .confirm = p.confirm_name,
             .status_hyphen_free = hyphenFree(p.status.as(gtk.Widget)),
         };
     }
@@ -272,12 +270,12 @@ fn pageCmd(req: *Request) void {
         p.clickConnect(name);
     } else if (eq(u8, action, "disconnect")) {
         p.clickDisconnect(name);
-    } else if (eq(u8, action, "menu")) {
-        p.clickMenu(name);
     } else if (eq(u8, action, "restart")) {
         p.clickRestart(name);
     } else if (eq(u8, action, "delete")) {
         p.clickDelete(name);
+    } else if (eq(u8, action, "confirm") or eq(u8, action, "refuse")) {
+        if (!p.answer(eq(u8, action, "confirm"))) return req.fail("nothing to answer", .{});
     } else if (eq(u8, action, "escape")) {
         return req.ok(.{ .consumed = p.escape() });
     } else if (eq(u8, action, "log")) {
@@ -528,18 +526,17 @@ fn boundsCmd(req: *Request) void {
         }
     }
     if (hub.page) |p| {
+        addBox(a, &out, win, p.landing_btn.as(gtk.Widget), "landing.open");
         addBox(a, &out, win, p.log_btn.as(gtk.Widget), "page.log");
         addBox(a, &out, win, p.new_btn.as(gtk.Widget), "page.new");
         for (p.cards.items) |c| {
+            addBox(a, &out, win, c.root.as(gtk.Widget), std.fmt.allocPrint(a, "card.{s}", .{c.name}) catch continue);
             var child = c.buttons.as(gtk.Widget).getFirstChild();
             while (child) |w| : (child = w.getNextSibling()) {
                 const b = gobject.ext.cast(gtk.Button, w) orelse continue;
                 const label = std.mem.span(b.getLabel() orelse "");
                 addBox(a, &out, win, w, std.fmt.allocPrint(a, "card.{s}.{s}", .{ c.name, label }) catch continue);
             }
-            addBox(a, &out, win, c.menu_button.as(gtk.Widget), std.fmt.allocPrint(a, "card.{s}.menu", .{c.name}) catch continue);
-            addBox(a, &out, win, c.restart_btn.as(gtk.Widget), std.fmt.allocPrint(a, "card.{s}.restart", .{c.name}) catch continue);
-            addBox(a, &out, win, c.delete_btn.as(gtk.Widget), std.fmt.allocPrint(a, "card.{s}.delete", .{c.name}) catch continue);
         }
         if (p.form) |f| {
             addBox(a, &out, win, f.name.as(gtk.Widget), "form.name");
@@ -551,6 +548,8 @@ fn boundsCmd(req: *Request) void {
             addBox(a, &out, win, f.instance.as(gtk.Widget), "form.instance");
             addBox(a, &out, win, f.submit.as(gtk.Widget), "form.submit");
             addBox(a, &out, win, f.cancel.as(gtk.Widget), "form.cancel");
+            if (f.restart) |b| addBox(a, &out, win, b.as(gtk.Widget), "form.restart");
+            if (f.delete) |b| addBox(a, &out, win, b.as(gtk.Widget), "form.delete");
         }
     }
     req.ok(out.items);
@@ -564,7 +563,7 @@ fn focusName(a: std.mem.Allocator) ?[]const u8 {
     return std.fmt.allocPrint(a, "{s}{s}", .{ if (in_pop) "popover:" else "", name }) catch null;
 }
 
-fn entryText(a: std.mem.Allocator, e: *gtk.Entry) ![]const u8 {
+fn entryText(a: std.mem.Allocator, e: *adw.EntryRow) ![]const u8 {
     return a.dupe(u8, std.mem.span(e.as(gtk.Editable).getText()));
 }
 

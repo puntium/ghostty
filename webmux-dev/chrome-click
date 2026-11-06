@@ -12,8 +12,7 @@
 #   webmux-dev/chrome-click DIR --where NAME      print the screen point
 #
 # Names: `wmctl chrome-bounds` (header.*, pill.<name>, pill.<name>.x,
-# card.<name>.<label>, card.<name>.menu, card.<name>.restart|delete,
-# form.*, page.*).
+# card.<name>, card.<name>.<label>, form.*, page.*, landing.open).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 dir="${1:?usage: chrome-click DIR NAME}"; shift
@@ -59,6 +58,8 @@ case "${1:-}" in
   *)
     dx=0
     [[ "${2:-}" == "--dx" ]] && dx="$3"
+    sleep 0.35   # the dialog's page slide settles
     read -r x y < <(point "$1" "$dx")
-    "$here/realpointer" "$dir" "abs $x $y, sleep 60, down, sleep 60, up, sleep 60" ;;
+    "$here/realpointer" "$dir" "abs $x $y, sleep 60, down, sleep 60, up, sleep 60"
+    sleep 0.35 ;;  # … and after a click that opens a page
 esac

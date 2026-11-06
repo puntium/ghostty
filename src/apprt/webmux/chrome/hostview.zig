@@ -96,7 +96,7 @@ pub const View = struct {
         const t: [:0]const u8 = switch (e.state) {
             .connecting => std.fmt.bufPrintSentinel(&buf, "{s}: connecting…", .{e.name}, 0) catch "connecting…",
             .retry => std.fmt.bufPrintSentinel(&buf, "{s}: interrupted — retrying…", .{e.name}, 0) catch "retrying…",
-            .failed => std.fmt.bufPrintSentinel(&buf, "{s}: connection failed — the connection page (Ctrl+Shift+O) has the details", .{e.name}, 0) catch "connection failed",
+            .failed => std.fmt.bufPrintSentinel(&buf, "{s}: connection failed — Connections (Ctrl+Shift+O) has the details", .{e.name}, 0) catch "connection failed",
             .connected => return,
         };
         v.setPlaceholder(t);

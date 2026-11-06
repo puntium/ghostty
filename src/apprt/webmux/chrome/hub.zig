@@ -9,15 +9,15 @@
 //! one `refresh()` (a `snapshot()` reconciled against the entries).
 //!
 //! View rules (main.js show/userShow/surfaceFailure/onServerUp):
-//!   - startup shows the connection page; nothing connects by itself;
+//!   - startup opens the Connections page; nothing connects by itself;
 //!   - connecting from the page marks the entry `reveal`: its view comes to
 //!     the front when the server first answers, unless the user navigated
 //!     anywhere in the meantime (`userShow` clears every reveal);
 //!   - a connection whose content never came up and fails while in front
-//!     sends the window back to the connection page; one with content
+//!     sends the window back to the Connections page; one with content
 //!     rides out retries in place, and background failures only recolour
 //!     its pill;
-//!   - disconnecting the front host shows the connection page.
+//!   - disconnecting the front host opens the Connections page.
 const std = @import("std");
 const adw = @import("adw");
 const gio = @import("gio");
@@ -36,6 +36,7 @@ const TerminalPane = @import("../pane.zig").TerminalPane;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const ext = @import("../ext.zig");
 const panels_settings = @import("../panels/settings.zig");
+const settings_panel = @import("../panels/settings_panel.zig");
 const toast = @import("../panels/toast.zig");
 
 const keyring = @import("keyring.zig");
@@ -92,7 +93,7 @@ pub const Hub = struct {
     engine: ?conn.Engine = null,
     engine_error: ?[]const u8 = null,
     entries: std.ArrayList(*Entry) = .empty,
-    /// The host in front; null = the connection page.
+    /// The host in front; null = the landing view.
     active: ?*Entry = null,
     next_id: u64 = 1,
 
@@ -151,7 +152,6 @@ pub fn start(app: *Application) void {
     iface.engine = &(hub.engine.?);
 
     keyring.init(engine.stateDir());
-    keyring.on_change = onKeyringChanged;
     // N2: ids config.json gave to several profiles were re-issued; the
     // secret stored under such an id is never offered to any of them.
     for (engine.droppedPasswordIds()) |id| keyring.forget(id);
@@ -201,8 +201,8 @@ pub fn shutdown() void {
 // The window frame
 // ---------------------------------------------------------------------------
 
-/// Fill a new main window: header strip + content stack (connection page
-/// first). Main thread.
+/// Fill a new main window: header strip + content stack (the landing view
+/// first, under the preferences dialog). Main thread.
 pub fn populate(win: *Window) void {
     hub.window = win;
     _ = gtk.Widget.signals.destroy.connect(win.as(gtk.Widget), ?*anyopaque, onWindowDestroy, null, .{});
@@ -236,7 +236,7 @@ pub fn populate(win: *Window) void {
     // Entries that exist already (a second window after a reopen).
     for (hub.entries.items) |e| addView(e);
     show(null);
-    // Status messages: the connection page is in front at start.
+    // Status messages: no host is in front at start.
     toast.setFront(if (hub.active) |x| x.name else null);
     if (hub.engine == null) page.showEngineError(hub.engine_error orelse "unknown error");
     if (hub.engine) |engine| if (engine.configProblem()) |msg| page.showConfigProblem(msg);
@@ -439,7 +439,9 @@ fn addView(e: *Entry) void {
 /// cancels every pending reveal-on-connect first (X-28).
 pub fn userShow(e: ?*Entry) void {
     for (hub.entries.items) |x| x.reveal = false;
-    show(e);
+    if (e != null) return show(e);
+    // Connections opens over whatever is in front (deviation 67).
+    if (hub.page) |p| p.present();
 }
 
 pub fn show(e_: ?*Entry) void {
@@ -454,6 +456,11 @@ pub fn show(e_: ?*Entry) void {
         toast.setFront(if (e) |x| x.name else null);
     }
     syncChoosers();
+    // A host in front closes the dialog; with none, Connections is where
+    // the user goes next (startup, a disconnect, a failed connect).
+    if (e != null) {
+        settings_panel.close();
+    } else if (hub.page) |p| p.present();
     focusContent();
     if (old != e) if (e) |x| clipboardSync(x);
     changed();
@@ -461,13 +468,14 @@ pub fn show(e_: ?*Entry) void {
 
 /// Keyboard focus belongs to the visible content view (W-05).
 pub fn focusContent() void {
+    if (settings_panel.isOpen()) return;
     if (hub.active) |e| {
         e.view.grabFocus();
     } else if (hub.page) |p| p.focus();
 }
 
 /// Ctrl+PageUp/PageDown: previous/next host, wrapping; from the
-/// connection page the last/first.
+/// landing view the last/first.
 pub fn showAdjacent(dir: i32) void {
     const n: i32 = @intCast(hub.entries.items.len);
     if (n == 0) return;
@@ -951,10 +959,6 @@ pub fn retrySeconds(e: *const Entry) ?u32 {
 // ---------------------------------------------------------------------------
 // Settings, keyring, sleep
 // ---------------------------------------------------------------------------
-
-fn onKeyringChanged() void {
-    if (hub.page) |p| p.keyringChanged();
-}
 
 fn onResume() void {
     if (hub.engine) |e| e.notifyResume();

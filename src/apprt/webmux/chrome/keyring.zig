@@ -71,8 +71,6 @@ var job_mutex: std.Io.Mutex = .init;
 var saved: IdSet = .{};
 var cleared: IdSet = .{};
 var hint_path: ?[]u8 = null;
-/// Called on the main thread after the set changed (UI refresh).
-pub var on_change: ?*const fn () void = null;
 
 /// Whether the service answered the last time we asked.
 pub const Service = enum(u8) { unknown, available, absent };
@@ -146,7 +144,6 @@ fn setHas(id: []const u8, value: bool) void {
         if (value) saved.put(id) else saved.remove(id);
     }
     saveHint();
-    notifyChange();
 }
 
 /// Main thread: the password of this profile must never be used again
@@ -161,7 +158,6 @@ pub fn forget(id: []const u8) void {
         saved.remove(id);
     }
     saveHint();
-    notifyChange();
     clearAsync(id, 0, null);
 }
 
@@ -173,17 +169,6 @@ fn replaceAll(new: []const []const u8) void {
         for (new) |id| if (!cleared.contains(id)) saved.put(id);
     }
     saveHint();
-    notifyChange();
-}
-
-fn notifyChange() void {
-    const Changed = struct {
-        _: u8 = 0,
-        fn run(_: *@This()) void {
-            if (on_change) |f| f();
-        }
-    };
-    mainloop.post(Changed{}, Changed.run);
 }
 
 const Hint = struct {

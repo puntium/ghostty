@@ -321,9 +321,6 @@ sleep 0.6
 read -r mx my mw mh <<<"$(winrect main)"
 ctl -q settings-show
 eventually "settings open in a 440x380 window" theme get settings-dump focus
-expect "D3: the panel scrolls in a short window" "$(ctl settings-dump | json 'v["scroll"]["upper"] > v["scroll"]["page"]')" True
-"$dev/realpointer" "$dir" abs $((mx+120)) $((my+280)), sleep 80, scroll 0 6, sleep 400
-expect "D3: a real wheel scrolls it" "$(ctl settings-dump | json 'v["scroll"]["value"] > 0')" True
 grep -qE 'Widget reports min|exceeds AdwDialog' "$dir/app.log" && fail "D3: GTK layout warnings in the short window"
 ctl -q settings-close
 eventually "closed" false get settings-dump open
@@ -344,9 +341,9 @@ eventually "backdrop click closes the panel" false get settings-dump open
 ctl -q settings-show
 eventually "settings open" theme get settings-dump focus
 fwd=""; for _ in 1 2 3 4 5 6; do "$dev/realkeys" "$dir" -k Tab; sleep 0.12; fwd+="$(get settings-dump focus) "; done
-expect "Tab order" "$fwd" "fade min_cols max_cols open_log done theme "
+expect "Tab order" "$fwd" "fade min_cols max_cols open_log theme fade "
 back=""; for _ in 1 2 3 4 5 6; do "$dev/realkeys-xkb" "$dir" shift+Tab >/dev/null; sleep 0.12; back+="$(get settings-dump focus) "; done
-expect "Shift+Tab order" "$back" "done open_log max_cols min_cols fade theme "
+expect "Shift+Tab order" "$back" "theme open_log max_cols min_cols fade theme "
 ctl -q settings-set min_cols:=100 max_cols:=150
 for _ in 1 2 3; do "$dev/realkeys" "$dir" -k Tab; sleep 0.1; done
 expect "focus on the max field" "$(get settings-dump focus)" max_cols

@@ -157,7 +157,7 @@ pub const Header = struct {
         if (hub.hub.active == null) return;
         hub.paneCommand("new-files");
     }
-    /// Settings open from the connection page too (deviation 32, ruling on
+    /// Settings open with no host in front too (deviation 32, ruling on
     /// E-10).
     pub fn clickSettings(_: *Header) void {
         menu.activateApp(iface.actions.show_settings);
