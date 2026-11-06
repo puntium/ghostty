@@ -9,10 +9,26 @@
 const std = @import("std");
 const layout = @import("../../../webmux/layout.zig");
 
-/// app.js MOVE_MS: every structural move.
+/// app.js MOVE_MS: a structural move of up to `move_ref_px`.
 pub const move_ms: f64 = 200;
-/// app.js: the timeout that ends an animation whose end event never came.
-pub const settle_ms: f64 = move_ms + 50;
+/// The longest a move takes, however far it goes.
+pub const move_max_ms: f64 = 320;
+/// Travel (CSS px) up to which a move takes `move_ms`.
+pub const move_ref_px: f64 = 600;
+/// app.js: the timeout that ends an animation whose end event never came
+/// fires this long after the move should have ended.
+pub const settle_slack_ms: f64 = 50;
+
+/// How long a move whose farthest edge travels `travel` px takes. app.js
+/// moves everything in 200 ms, which on a wide display is hundreds of
+/// pixels per frame for a pane crossing it: each frame lands far from the
+/// last and the motion reads as a flicker rather than a slide however
+/// evenly the frames arrive. So the time grows with the square root of
+/// the distance (the speed still grows, more slowly), up to `move_max_ms`.
+pub fn moveMs(travel: f64) f64 {
+    if (!(travel > move_ref_px)) return move_ms;
+    return @min(move_max_ms, move_ms * @sqrt(travel / move_ref_px));
+}
 /// CSS `transition: opacity 0.12s` on the unfocused fade.
 pub const fade_ms: f64 = 120;
 /// app.js STACK_GAP_PX: divider + its margins, pane to pane in a stack.
@@ -111,6 +127,13 @@ pub const Flight = struct {
     pub fn shrinks(self: Flight) bool {
         return self.from.w > self.to.w or self.from.h > self.to.h;
     }
+    /// How far its farthest edge goes, px.
+    pub fn travel(self: Flight) f64 {
+        return @max(
+            @max(@abs(self.to.x - self.from.x), @abs(self.to.right() - self.from.right())),
+            @max(@abs(self.to.y - self.from.y), @abs(self.to.bottom() - self.from.bottom())),
+        );
+    }
     /// The ghost's box: at the final top-left, the larger of both sizes.
     pub fn ghostBox(self: Flight) Box {
         return .{ .x = self.to.x, .y = self.to.y, .w = @max(self.from.w, self.to.w), .h = @max(self.from.h, self.to.h) };
@@ -194,6 +217,21 @@ test "moveEase matches the CSS curve's ends and middle" {
         try t.expect(y >= prev - 1e-9);
         prev = y;
     }
+}
+
+test "moveMs grows with the distance, within its bounds" {
+    const t = std.testing;
+    try t.expectEqual(move_ms, moveMs(0));
+    try t.expectEqual(move_ms, moveMs(move_ref_px));
+    try t.expectApproxEqAbs(move_ms * @sqrt(2.0), moveMs(2 * move_ref_px), 1e-9);
+    try t.expectEqual(move_max_ms, moveMs(100 * move_ref_px));
+    try t.expectEqual(move_ms, moveMs(std.math.nan(f64)));
+}
+
+test "flight travel is its farthest edge" {
+    const t = std.testing;
+    const f: Flight = .{ .from = .{ .x = 0, .y = 0, .w = 100, .h = 50 }, .to = .{ .x = 10, .y = 0, .w = 300, .h = 50 } };
+    try t.expectEqual(@as(f64, 210), f.travel());
 }
 
 test "flight grows, shrinks, ghost box" {

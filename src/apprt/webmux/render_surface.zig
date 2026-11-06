@@ -1,5 +1,17 @@
 //! Copied from src/apprt/gtk/class/render_surface.zig (Ghostty f54340ad).
-//! Changes: type name, import paths, presentation-path counters (`stats`).
+//! Changes: type name, import paths, presentation-path counters (`stats`),
+//! and what the strip needs to draw a pane in as few passes as possible:
+//!   - an opaque terminal's DMABUF is imported under the alpha-less twin
+//!     of its format (`setBackground`), so GSK and the compositor know
+//!     nothing shows through it (needed for an offloaded pane that sits
+//!     below the window's surface, and it lets GSK skip what is under it);
+//!   - the unfocused fade is a colour matrix on the texture (`setFade`):
+//!     the same pixels as a quad over the pane, without a second pass;
+//!   - where the texture does not cover the widget (before the first
+//!     frame, or for a moment after the pane grew) the terminal's
+//!     background is drawn, so nothing has to be painted under the pane;
+//!   - a texture larger than the widget is clipped to it;
+//!   - texture builds are timed for `perf.zig`.
 const std = @import("std");
 
 const glib = @import("glib");
@@ -15,6 +27,37 @@ const rendererpkg = @import("../../renderer.zig");
 const ExportedFrame = rendererpkg.Renderer.ExportedFrame;
 const Dmabuf = @import("../../renderer/Dmabuf.zig");
 const Planes = Dmabuf.Planes;
+const graphene = @import("graphene");
+const perf = @import("perf.zig");
+
+/// `WEBMUX_GTK_OFFLOAD=1`: each terminal's frames go to the compositor on
+/// a subsurface of their own (GtkGraphicsOffload) instead of being copied
+/// into the window by GSK. Off by default; see WEBMUX.md › Performance.
+pub fn offloadWanted() bool {
+    const S = struct {
+        var cached: ?bool = null;
+    };
+    if (S.cached) |c| return c;
+    const on = if (std.c.getenv("WEBMUX_GTK_OFFLOAD")) |v| v[0] != 0 and v[0] != '0' else false;
+    S.cached = on;
+    return on;
+}
+
+/// The alpha-less DRM format with the same layout, if there is one.
+fn opaqueFourcc(fourcc: u32) ?u32 {
+    const f = struct {
+        fn cc(comptime s: *const [4]u8) u32 {
+            return @as(u32, s[0]) | (@as(u32, s[1]) << 8) | (@as(u32, s[2]) << 16) | (@as(u32, s[3]) << 24);
+        }
+    };
+    return switch (fourcc) {
+        f.cc("AR24") => f.cc("XR24"),
+        f.cc("AB24") => f.cc("XB24"),
+        f.cc("RA24") => f.cc("RX24"),
+        f.cc("BA24") => f.cc("BX24"),
+        else => null,
+    };
+}
 
 const log = std.log.scoped(.webmux_render_surface);
 
@@ -78,6 +121,22 @@ pub const RenderSurface = extern struct {
         frames_dmabuf: u64 = 0,
         frames_memory: u64 = 0,
         dmabuf_import_failures: u64 = 0,
+        /// webmux: DMABUF frames imported under an alpha-less format.
+        frames_opaque: u64 = 0,
+
+        /// webmux: the terminal's background colour, drawn where the
+        /// texture does not reach.
+        background: gdk.RGBA = .{ .f_red = 0, .f_green = 0, .f_blue = 0, .f_alpha = 1 },
+        /// webmux: the terminal draws no transparent pixel, so its frames
+        /// can be imported as opaque.
+        opaque_frames: bool = false,
+        /// webmux: the display refused the alpha-less format once; frames
+        /// keep their own format from then on.
+        opaque_refused: bool = false,
+        /// webmux: the unfocused fade, as `out = fade_scale * in +
+        /// fade_add` per colour channel. Scale 1 is no fade.
+        fade_scale: f32 = 1,
+        fade_add: [3]f32 = .{ 0, 0, 0 },
 
         pub var offset: c_int = 0;
     };
@@ -164,6 +223,7 @@ pub const RenderSurface = extern struct {
         // currently displaying.
         if (priv.core_surface) |core| {
             if (core.renderer.takeFrame()) |frame| {
+                const t0 = glib.getMonotonicTime();
                 self.rebuildTexture(frame) catch |err| switch (err) {
                     // GTK can't import our DMABUFs, e.g. due to an
                     // incompatible format modifier on multi-GPU setups.
@@ -180,14 +240,25 @@ pub const RenderSurface = extern struct {
 
                     else => log.warn("error building texture from frame err={}", .{err}),
                 };
+                perf.noteTexture(glib.getMonotonicTime() - t0);
             }
         }
 
-        // If we have a texture, draw it.
-        const texture = priv.texture orelse return;
-
         const widget = self.as(gtk.Widget);
-        if (widget.getWidth() == 0 or widget.getHeight() == 0) return;
+        const width: f32 = @floatFromInt(widget.getWidth());
+        const height: f32 = @floatFromInt(widget.getHeight());
+        if (width <= 0 or height <= 0) return;
+
+        // webmux: nothing is painted under this widget, so whatever the
+        // texture does not cover gets the terminal's background here.
+        const bg = self.fadedBackground();
+        const texture = priv.texture orelse {
+            snap.appendColor(&bg, &.{
+                .f_origin = .{ .f_x = 0, .f_y = 0 },
+                .f_size = .{ .f_width = width, .f_height = height },
+            });
+            return;
+        };
 
         // Map one texture texel to one device pixel. Widget CSS size would
         // stretch a fractionally scaled buffer. Snap the surface-relative
@@ -197,6 +268,34 @@ pub const RenderSurface = extern struct {
         const scale: f32 = @floatCast(layout.scale);
         const css_w: f32 = @as(f32, @floatFromInt(texture.getWidth())) / scale;
         const css_h: f32 = @as(f32, @floatFromInt(texture.getHeight())) / scale;
+        const ox: f32 = @floatCast(origin.x);
+        const oy: f32 = @floatCast(origin.y);
+
+        // The strips right of and below a texture smaller than the widget
+        // (the renderer has not caught up with a resize yet). Less than
+        // a device pixel is rounding, not a strip.
+        const slack = 1 / scale;
+        const right = @min(width, ox + css_w);
+        const bottom = @min(height, oy + css_h);
+        if (width - right >= slack) snap.appendColor(&bg, &.{
+            .f_origin = .{ .f_x = right, .f_y = 0 },
+            .f_size = .{ .f_width = width - right, .f_height = height },
+        });
+        if (height - bottom >= slack) snap.appendColor(&bg, &.{
+            .f_origin = .{ .f_x = 0, .f_y = bottom },
+            .f_size = .{ .f_width = right, .f_height = height - bottom },
+        });
+
+        // webmux: a texture larger than the widget (the pane shrank and
+        // the renderer has not caught up, or is told to wait until the
+        // move ends) stops at the widget's edge: nothing around the pane
+        // clips it any more.
+        const over = ox + css_w - width >= slack or oy + css_h - height >= slack;
+        if (over) snap.pushClip(&.{
+            .f_origin = .{ .f_x = 0, .f_y = 0 },
+            .f_size = .{ .f_width = width, .f_height = height },
+        });
+        defer if (over) snap.pop();
 
         // GTK, Metal, Vulkan, etc. all have their origin points in the
         // top left, but not OpenGL!
@@ -208,10 +307,66 @@ pub const RenderSurface = extern struct {
             snap.scale(1, -1);
         }
 
+        // webmux: the fade wraps the texture node itself (inside the
+        // flip), which GSK draws in the texture's own pass; around the
+        // flip it would be rendered to an offscreen first.
+        const faded = priv.fade_scale < 1;
+        if (faded) {
+            // Filled in by hand: the binary links no graphene function
+            // (only its types), and graphene's own are 16-byte aligned.
+            const k = priv.fade_scale;
+            const m: graphene.Matrix align(16) = .{ .f_value = .{
+                .f_x = .{ .f_x = k, .f_y = 0, .f_z = 0, .f_w = 0 },
+                .f_y = .{ .f_x = 0, .f_y = k, .f_z = 0, .f_w = 0 },
+                .f_z = .{ .f_x = 0, .f_y = 0, .f_z = k, .f_w = 0 },
+                .f_w = .{ .f_x = 0, .f_y = 0, .f_z = 0, .f_w = 1 },
+            } };
+            const add: graphene.Vec4 align(16) = .{ .f_value = .{
+                .f_x = priv.fade_add[0],
+                .f_y = priv.fade_add[1],
+                .f_z = priv.fade_add[2],
+                .f_w = 0,
+            } };
+            snap.pushColorMatrix(&m, &add);
+        }
+        defer if (faded) snap.pop();
+
         snap.appendTexture(texture, &.{
-            .f_origin = .{ .f_x = @floatCast(origin.x), .f_y = @floatCast(origin.y) },
+            .f_origin = .{ .f_x = ox, .f_y = oy },
             .f_size = .{ .f_width = css_w, .f_height = css_h },
         });
+    }
+
+    /// webmux: the terminal's background as the fade leaves it.
+    fn fadedBackground(self: *Self) gdk.RGBA {
+        const priv = self.private();
+        const b = priv.background;
+        return .{
+            .f_red = priv.fade_scale * b.f_red + priv.fade_add[0],
+            .f_green = priv.fade_scale * b.f_green + priv.fade_add[1],
+            .f_blue = priv.fade_scale * b.f_blue + priv.fade_add[2],
+            .f_alpha = 1,
+        };
+    }
+
+    /// webmux: the terminal's background colour, and whether everything
+    /// the renderer draws is opaque (background-opacity 1).
+    pub fn setBackground(self: *Self, color: gdk.RGBA, opaque_frames: bool) void {
+        const priv = self.private();
+        priv.background = color;
+        priv.background.f_alpha = 1;
+        priv.opaque_frames = opaque_frames;
+        self.as(gtk.Widget).queueDraw();
+    }
+
+    /// webmux: draw every pixel as `scale * pixel + add` (the unfocused
+    /// fade; scale 1 and add 0 for none).
+    pub fn setFade(self: *Self, scale: f32, add: [3]f32) void {
+        const priv = self.private();
+        if (priv.fade_scale == scale and std.mem.eql(f32, &priv.fade_add, &add)) return;
+        priv.fade_scale = scale;
+        priv.fade_add = add;
+        self.as(gtk.Widget).queueDraw();
     }
 
     //---------------------------------------------------------------
@@ -310,6 +465,8 @@ pub const RenderSurface = extern struct {
         frames_dmabuf: u64,
         frames_memory: u64,
         dmabuf_import_failures: u64,
+        frames_opaque: u64,
+        faded: bool,
     };
 
     /// webmux: presentation counters (see `Private.frames_dmabuf`).
@@ -319,6 +476,8 @@ pub const RenderSurface = extern struct {
             .frames_dmabuf = priv.frames_dmabuf,
             .frames_memory = priv.frames_memory,
             .dmabuf_import_failures = priv.dmabuf_import_failures,
+            .frames_opaque = priv.frames_opaque,
+            .faded = priv.fade_scale < 1,
         };
     }
 
@@ -354,10 +513,14 @@ pub const RenderSurface = extern struct {
         const builder = gdk.DmabufTextureBuilder.new();
         defer builder.unref();
 
+        // webmux: an opaque terminal's frame goes in under the alpha-less
+        // twin of its format, unless the display has refused that before.
+        const opaque_fourcc: ?u32 = if (priv.opaque_frames and !priv.opaque_refused) opaqueFourcc(frame.fourcc) else null;
+
         builder.setDisplay(display);
         builder.setWidth(frame.width);
         builder.setHeight(frame.height);
-        builder.setFourcc(frame.fourcc);
+        builder.setFourcc(opaque_fourcc orelse frame.fourcc);
         builder.setModifier(frame.modifier);
         builder.setPremultiplied(@intFromBool(frame.premultiplied));
         builder.setNPlanes(@intCast(frame.planes.count));
@@ -386,11 +549,24 @@ pub const RenderSurface = extern struct {
             dmabufDestroy,
             planes,
             &err_,
-        ) orelse {
+        ) orelse retry: {
+            // webmux: the alpha-less format was not accepted; the frame's
+            // own format is what worked before this was tried.
+            if (opaque_fourcc != null) {
+                if (err_) |err| {
+                    log.info("opaque dmabuf import refused ({s}); keeping the frame's own format", .{err.f_message orelse "(unknown)"});
+                    err.free();
+                    err_ = null;
+                }
+                priv.opaque_refused = true;
+                builder.setFourcc(frame.fourcc);
+                if (builder.build(dmabufDestroy, planes, &err_)) |t| break :retry t;
+            }
             if (err_) |err|
                 log.warn("failed to build dmabuf err={s}", .{err.f_message orelse "(unknown)"});
             return error.DmabufBuildFailed;
         };
+        if (opaque_fourcc != null and !priv.opaque_refused) priv.frames_opaque += 1;
 
         // Swap out the old texture.
         if (priv.texture) |old| old.as(gobject.Object).unref();

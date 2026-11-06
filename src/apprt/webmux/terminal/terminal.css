@@ -38,11 +38,14 @@ terminal-pane.light scrollbar.webmux-terminal-scrollbar > range > trough > slide
 }
 
 /* The scrollbar column sits on the terminal's own background, as xterm's
-   viewport does (config.zig's two scheme backgrounds). */
-terminal-pane {
+   viewport does (config.zig's two scheme backgrounds). Only the column
+   (the scrollbar itself is transparent while there is nothing to scroll):
+   the terminal is the render surface's texture, and a background under
+   the whole pane would be a second full pass over it on every frame. */
+terminal-pane .webmux-terminal-scrollbar-column {
   background-color: #1f1f2b;
 }
 
-terminal-pane.light {
+terminal-pane.light .webmux-terminal-scrollbar-column {
   background-color: #f4f5f9;
 }

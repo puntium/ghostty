@@ -27,6 +27,8 @@ need the toolchain go through Ghostty's nix dev shell
 | Stop | `webmux-dev/headless stop $D` |
 | Every smoke, one line each | `webmux-dev/smoke --all` (two at a time, `-j N` to change; logs in a fresh `/tmp/wm-smokes-*`) |
 | The edit-and-try subset, about a minute | `webmux-dev/smoke --quick` (integration, workspace, host side by side) |
+| How smooth the animations are | `nix develop . -c webmux-dev/perf` (a 6K output by default; see Performance) |
+| Frame metrics of a running app | `wmctl perf`, or start it with `WEBMUX_GTK_PERF=1` for one line per animation on stderr |
 | The app (chrome) | `webmux-dev/smoke` (Connections → fake ssh → freshly deployed host → terminal, retry, sleep, quit) |
 | The areas together | `webmux-dev/smoke --integration` (two hosts, workspaces, settings, clipboard, URLs, K-18, resilience) |
 | Dev mode, remote pane | `webmux-dev/smoke --host` |
@@ -120,7 +122,9 @@ src/apprt/webmux/
   panels/                     settings (owner of iface.settings and the colour scheme),
                               connection log window, status toast, URL service; its own smoke.sh
   dev.zig                     dev mode: one connection view on WEBMUX_GTK_DEV_SOCKET
-  render_surface.zig          WebmuxRenderSurface: shows the renderer's DMABUF/CPU frames (copied)
+  render_surface.zig          WebmuxRenderSurface: shows the renderer's DMABUF/CPU frames (copied, plus
+                              opaque import, the fade and its own background; see Performance)
+  perf.zig                    frame metrics: every frame clock cycle, animation spans, GPU share
   key_event.zig               KeyEvent (real or synthesized), chord parsing
   key.zig                     GDK ↔ Ghostty key translation (copied, Wayland-only)
   shortcuts.zig               the shell's shortcut table (chord → GAction)
@@ -271,7 +275,7 @@ connection: `{"cmd":"dump","id":1}` → `{"id":1,"ok":true,"result":…}` or
 | --- | --- | --- |
 | `help` | | name + help of every registered command |
 | `dump` | `text` (bool, default true) | window size/title/scale/GSK renderer, scheme, `focused_pane`, `last_shortcut`, and per pane (every `TerminalPane` in the window's widget tree): `session_id`, `link` (`connecting`\|`up`\|`down`), `snapshots` (1 + one per reconnect), `last_replay` (`bytes`, wall `ms` of the last snapshot replay), `exit_code` (all null for a local pane), title, pwd, `size_px`, `grid` (what the shell told the core), `terminal` (cols/rows/cursor as the io thread applied them), `cell_px`, `content_scale`, `renderer_health`, `frames`, `text` (visible screen) |
-| `screenshot` | `path`, `scale` (default: surface scale) | path, width, height |
+| `screenshot` | `path`, `scale` (default: surface scale) | path, width, height (waits up to 3 s for the window's next paint if a redraw is pending) |
 | `text` | `text` | types it key by key (press+release per character; `\n` → Return, `\t` → Tab) through the same path as `key` |
 | `key` | `key` ("ctrl+shift+w", "Return", "alt+Left", "a"), `action` tap\|press\|release | `consumed`, `shortcut` |
 | `mouse` | `action` move\|press\|release\|click\|drag\|scroll, `x`,`y` (CSS px in the pane) or `col`,`row`; `x2`,`y2`/`col2`,`row2` for drag; `button`; `mods` ("ctrl+shift"); `dx`,`dy` for scroll | `consumed`, `has_selection`, `mouse_reporting` |
@@ -282,6 +286,7 @@ connection: `{"cmd":"dump","id":1}` → `{"id":1,"ok":true,"result":…}` or
 | `clipboard-sync` | | runs `iface.hooks.clipboardSync` for the focused pane's connection (what the chrome does on window focus) |
 | `focus` | `value` (bool) | focuses the focused pane, or clears the window's focus (unfocused cursor) |
 | `shown` | `value` (bool) | `setShown` on the focused pane; `dump` → `visible` |
+| `perf` | `window_ms` (5000), `frames` (0), `reset` (bool) | frame metrics (Performance): `window` (stats of every frame clock cycle of the last `window_ms`), `spans` (one per layout animation and scroll chase, with `stats`), `frames` (the newest N cycles as recorded), `gpu` (this process's render-engine counters) |
 | `quit` | | answers, then quits |
 
 Synthesized keys (`key`, `text`) go through `KeyEvent.synthesize` →
@@ -292,6 +297,119 @@ key encoder: the same code as a real key after GDK, minus the input method
 `wmctl`: `wmctl [-s SOCK] CMD key=value key:=json …`, `--get a.0.b` prints
 one field of the result, `-q` silences, exit status 1 if a reply failed.
 String values interpret `\n \t \e \\`.
+
+## Performance
+
+The strip is drawn for a 6K display on an integrated GPU: about 20
+million pixels, 16.7 ms a frame. Two things decide whether an animation is
+smooth there, and neither is GTK's layout (the strip allocates once per
+change and only translates and clips after that):
+
+1. **How often each pixel is touched per frame.** A terminal pane used to
+   be six layers: the strip's background, the frame's (under a rounded
+   clip), the pane's, the texture, and two blended fade quads; a pane that
+   grew or was new went through an offscreen texture of its own size on
+   top of that. Now it is the strip's background and the texture:
+   - the frame has no rounded clip; its corners are painted over the
+     square content (`frame.zig` `drawCorners`);
+   - nothing is painted under what a pane paints itself (`iface.Pane.fade`
+     returns that part);
+   - the unfocused fade is a colour matrix on the texture node, drawn in
+     the texture's own pass (`render_surface.zig` `setFade`), with one
+     quad for the scrollbar column;
+   - an opaque terminal's DMABUF is imported under the alpha-less twin of
+     its format (`dump` → `panes[i].frames.opaque`);
+   - in-flight clips and offsets sit on device pixels, a new pane fades in
+     under a quad of the strip's colour instead of a group opacity.
+2. **What else wants the GPU during the move.** A terminal that takes a
+   new size allocates its render targets again (two textures the size of
+   the pane for each of the three frames of its swap chain, as it draws
+   them), and so does one that starts. With the xe driver all of the process's GL contexts share one
+   DRM file, and while a renderer thread sits in `DRM_IOCTL_XE_GEM_CREATE`
+   the main thread's `DRM_IOCTL_XE_EXEC` (GSK submitting its frame) waits:
+   50 to 150 ms per allocation at 6K (seen with `strace -f -T -e
+   trace=ioctl`). So while the strip moves the terminals hold still
+   (`workspace.zig` `holdPanes`): a resized terminal draws at its old size
+   and takes the new one after the move's last frame is out, a new one
+   attaches at once but renders only when it has arrived, and a closed
+   one is torn down after that frame too.
+
+Animation time is the frame clock's (`workspace.zig` `Clock`), so equal
+frames make equal steps; a frame that comes late does not make the motion
+skip the time lost (up to 250 ms per move), it runs late instead.
+
+Still there, and not ours to fix here:
+
+- The first time GSK draws a kind of node under a kind of clip in a
+  process, it builds the shader program for it: 5 to 25 ms on the main
+  thread with a warm Mesa cache, far more with a cold one. The first few
+  animations after launch have one long `paint` each.
+- A terminal's own frame is two passes over the pane in Ghostty's
+  renderer (render to an sRGB texture, blit to an exportable one), then
+  GSK's, then the compositor's. A full-width terminal printing at 60 Hz
+  uses about 40% of this GPU at 6K.
+- A new terminal frame is a new texture, so GSK redraws the whole pane for
+  one changed cell (`GdkDmabufTextureBuilder`'s update region is not
+  used; the renderer does not say what changed).
+
+### Measuring
+
+`perf.zig` records every frame clock cycle of the window: the clock's
+time, the main-thread time of each phase (`update`: tick callbacks;
+`layout`: allocation, where a terminal resize lands; `paint`: snapshot and
+GSK's submission), the textures built in it, and when the compositor
+showed it. Each layout animation and scroll chase is a span with stats
+over its frames, and with this process's share of the GPU's render engine
+(from the DRM fdinfo counters of its own file descriptors).
+
+- `wmctl perf` on a running app (the control socket).
+- `WEBMUX_GTK_PERF=1` in the environment: one line per animation on
+  stderr. For a session on the real display: `WEBMUX_GTK_PERF=1
+  zig-out-release/bin/webmux-gtk 2>perf.log`.
+- `nix develop . -c webmux-dev/perf`: a repeatable run in a nested
+  headless compositor at a 6K output (`--size`, `--scale`), one row per
+  change; `-- VAR=value` runs it with something changed, `--json` keeps
+  the spans. Its header explains the columns. It keeps a Mesa shader
+  cache of its own in `/tmp/wm-perf-shader-cache`; the first run on a
+  machine fills it and is not representative.
+
+How to read a slow animation: a long `layout` or `update` is our code
+(or a terminal starting); a long `paint` with nothing else is GSK waiting
+(a shader program, or the DRM file, see above); short phases with `missed`
+frames and the app's and compositor's GPU shares adding up to most of the
+engine is fill rate. `step` uneven while nothing is missed would be a
+timing fault in the animation clock.
+
+Measured on this machine (Core Ultra X7 358H, Arc B390, xe; sway headless
+at 6016x3384 scale 2, five columns, 36 animations, warm shader cache,
+2026-11-06), the rendering before this work against after (two runs).
+What is left is in the first three new terminals of the process, where
+GSK builds shader programs; every other animation missed nothing:
+
+| | before | after |
+| --- | --- | --- |
+| refreshes missed during animations | 53 | 3 to 5 |
+| longest gap between two frames shown | 150 ms | 44 to 50 ms |
+| longest main-thread cycle | 149 ms | 41 to 49 ms |
+| app's GPU share while animating | 33% | 28% |
+
+### Offload (`WEBMUX_GTK_OFFLOAD=1`)
+
+Off by default. With it each terminal sits in a `GtkGraphicsOffload`, and
+GTK hands the frames of a pane to the compositor on a subsurface of their
+own instead of copying them into the window, when it can: the node must
+not be under a colour matrix (so only the focused pane, which has no
+fade), must lie whole inside every clip around it (so not a pane that is
+partly scrolled out or growing), and must sit on whole CSS pixels (the
+strip snaps to those when offload is on). The corners painted over the
+pane put the subsurface below the window, which needs the opaque import.
+`GDK_DEBUG=offload` prints every decision.
+
+It works (checked through the compositor with `grim`), and in the
+headless run above it changed nothing that matters: the same passes, done
+by the compositor instead of GSK. Whether mutter does better with it on a
+real display has not been measured; `WEBMUX_GTK_PERF=1` with and without
+it is the way to find out.
 
 ## Conventions
 
@@ -555,6 +673,14 @@ What it does not say, for terminal panes:
   and frees everything.
 - `setShown(false)` pauses rendering (the terminal stays attached;
   deviation 4); `setShown(true)` resumes.
+- `fade(scale, add)` applies the container's unfocused fade to the
+  terminal's texture and returns the render surface's rectangle: the
+  container paints no background under it and fades only the rest (the
+  scrollbar column).
+- `holdResize(true)` makes the terminal keep its size, whatever it is
+  allocated, until `holdResize(false)`, when it takes the last size it
+  was given. The workspace holds every terminal while the strip moves
+  (Performance).
 - `cellWidthPx()` is null until the terminal started; it changes with the
   scale and font size.
 - Put pane chrome around the widget, never inside it. The widget is the
