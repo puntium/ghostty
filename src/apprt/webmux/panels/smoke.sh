@@ -206,7 +206,7 @@ ctl -q url target=https://example.com/copied action=copy
 expect "copy: clipboard" "$("$dev/in-session" "$dir" wl-paste)" "https://example.com/copied"
 expect "copy: status" "$(get status-dump text)" "link copied"
 ctl -q url target=https://example.com/chosen action=choose
-eventually "chooser open, Open in browser focused" open get url-chooser focus
+eventually "chooser open, Open in browser focused" "Open in browser" get url-chooser focus
 expect "chooser label" "$(get url-chooser open_label)" "Open in browser"
 ctl -q screenshot path="$dir/chooser.png"
 ctl -q url-chooser press=copy
@@ -328,13 +328,15 @@ ctl -q resize width:=1400 height:=900
 sleep 0.6
 read -r mx my mw mh <<<"$(winrect main)"
 
-# Backdrop click (real pointer) closes the panel; a click inside does not.
+# Floating dialogs stay up on a click, inside or on the backdrop (real pointer).
 ctl -q settings-show
 eventually "settings open" theme get settings-dump focus
 "$dev/realpointer" "$dir" abs $((mx+mw/2)) $((my+mh/2)), sleep 60, down, sleep 50, up, sleep 300
 expect "a click inside the panel keeps it" "$(get settings-dump open)" true
 "$dev/realpointer" "$dir" abs $((mx+40)) $((my+mh-40)), sleep 60, down, sleep 50, up, sleep 500
-eventually "backdrop click closes the panel" false get settings-dump open
+expect "a backdrop click keeps the panel" "$(get settings-dump open)" true
+ctl -q settings-close
+eventually "settings closed" false get settings-dump open
 
 # Tab order (real keys, both directions; Shift+Tab is ISO_Left_Tab on a
 # real keyboard) and E-13 typed values.
@@ -429,32 +431,32 @@ ctl -q log-close
 # opens; focus goes back to the pane the URL came from.
 long="https://example.com/$(python3 -c 'print("x"*600)')?q=a-b"
 ctl -q url target="$long" action=choose
-eventually "chooser open" open get url-chooser focus
+eventually "chooser open" "Open in browser" get url-chooser focus
 expect "M-04: shown text is the URL" "$(get url-chooser shown_text)" "$long"
 ctl url-chooser --get markup | grep -q 'insert_hyphens="false"' || fail "M-04: Pango may insert hyphens at wraps"
 "$dev/realkeys" "$dir" -k Tab
-expect "M-04: Tab from Open goes to Cancel" "$(get url-chooser focus)" cancel
+expect "M-04: Tab from Open goes to Cancel" "$(get url-chooser focus)" Cancel
 "$dev/realkeys" "$dir" -k Escape
 eventually "chooser closed" false get url-chooser open
 ctl -q url-sink clear:=true
 ctl -q url target=https://example.com/return action=choose
-eventually "chooser open" open get url-chooser focus
+eventually "chooser open" "Open in browser" get url-chooser focus
 "$dev/realkeys" "$dir" -k Return
 eventually "Return opens" "https://example.com/return" get url-sink recorded.0.target
 "$dev/realkeys-xkb" "$dir" ctrl+shift+Return >/dev/null
 eventually "a second pane" 2 sh -c "\"$dev/wmctl\" -s \"$dir/ctl.sock\" dump text:=false | python3 -I -c \"import json,sys; print(len(json.load(sys.stdin)['result']['panes']))\""
 eventually "the new pane has focus" 1 ctl dump text:=false --get focused_pane
 ctl -q url target=https://example.com/from-pane-0 action=choose pane:=0
-eventually "chooser open" open get url-chooser focus
+eventually "chooser open" "Open in browser" get url-chooser focus
 "$dev/realkeys" "$dir" -k Escape
 eventually "M-04: focus back on the source pane (Escape)" 0 ctl dump text:=false --get focused_pane
 "$dev/realkeys-xkb" "$dir" ctrl+shift+l >/dev/null   # chords: realkeys-xkb (physical keys, real modifiers), not realkeys
 eventually "focus moved to pane 1" 1 ctl dump text:=false --get focused_pane
 ctl -q url target=https://example.com/from-pane-0 action=choose pane:=0
-eventually "chooser open" open get url-chooser focus
-"$dev/realpointer" "$dir" abs $((mx+40)) $((my+mh-40)), sleep 60, down, sleep 50, up, sleep 400
-eventually "backdrop click closes the chooser" false get url-chooser open
-eventually "M-04: focus back on the source pane (backdrop)" 0 ctl dump text:=false --get focused_pane
+eventually "chooser open" "Open in browser" get url-chooser focus
+ctl -q url-chooser press=cancel
+eventually "chooser closed" false get url-chooser open
+eventually "M-04: focus back on the source pane (Cancel)" 0 ctl dump text:=false --get focused_pane
 "$dev/realkeys" "$dir" 'echo typed-into-0' -k Return
 ctl -q wait contains=typed-into-0 timeout_ms:=3000 || fail "M-04: typed keys did not reach the source pane"
 echo "smoke-panels: ok  M-04 keys go to the source pane"

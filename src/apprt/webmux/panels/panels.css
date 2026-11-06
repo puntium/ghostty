@@ -1,7 +1,7 @@
-/* The panels' stylesheet (link chooser, status toast, log
-   window), loaded once for the display by panels/style.zig. Values are
-   electron/ui/index.html's palette tokens and component rules (toast,
-   .modal*, .link-modal) and electron/logs.html's. The
+/* The panels' stylesheet (status toast, log window), loaded once for
+   the display by panels/style.zig. Values are
+   electron/ui/index.html's palette tokens and toast rule and
+   electron/logs.html's. The
    dark scheme is the default; the light one overrides under
    prefers-color-scheme (libadwaita's forced scheme, which Settings ›
    Color scheme sets). */
@@ -26,76 +26,6 @@
 .webmux-toast.show {
   opacity: 1;
   transform: none;
-}
-
-/* --- modals (index.html .modal-overlay / .modal) ----------------------- */
-
-/* Only the modal's sheet is painted; the rest of the full-window
-   dialog node stays transparent so the panes show through the dim
-   (index.html .modal-overlay). */
-dialog.webmux-modal floating-sheet > dimming {
-  background-color: rgba(0, 0, 0, 0.55);
-}
-dialog.webmux-modal sheet {
-  background-color: #1f1f2b;
-  color: #c8c8d8;
-}
-dialog.webmux-modal sheet {
-  border: 1px solid #34344a;
-  border-radius: 10px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
-}
-dialog.webmux-modal .modal-body {
-  padding: 16px 18px;
-}
-
-.modal-button {
-  border: 1px solid #34344a;
-  background: none;
-  box-shadow: none;
-  color: #c8c8d8;
-  border-radius: 6px;
-  padding: 6px 12px;
-  min-height: 0;
-  font-size: 13px;
-  font-weight: normal;
-}
-.modal-button:hover {
-  border-color: #7aa2f7;
-  color: #7aa2f7;
-  background: none;
-}
-.modal-button.primary {
-  background-color: #7aa2f7;
-  border-color: #7aa2f7;
-  color: #10101a;
-  font-weight: 600;
-}
-.modal-button.primary:hover {
-  filter: brightness(1.1);
-  color: #10101a;
-  background-color: #7aa2f7;
-}
-.modal-button.danger {
-  background-color: #c34f5e;
-  border-color: #c34f5e;
-  color: #fff;
-  font-weight: 600;
-}
-.modal-button.danger:hover {
-  filter: brightness(1.1);
-  color: #fff;
-  background-color: #c34f5e;
-}
-
-/* link chooser (.link-modal .link-url) */
-.link-url {
-  font-family: monospace;
-  font-size: 12.5px;
-  color: #7aa2f7;
-}
-.link-scroll {
-  margin-bottom: 14px;
 }
 
 /* --- log window (logs.html) -------------------------------------------- */

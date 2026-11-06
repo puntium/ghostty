@@ -9,37 +9,6 @@
   box-shadow: 0 10px 32px rgba(30, 34, 60, 0.25), 0 0 0 1px rgba(0, 0, 0, 0.08);
 }
 
-/* Only the modal's sheet is painted; the rest of the full-window
-   dialog node stays transparent so the panes show through the dim
-   (index.html .modal-overlay). */
-dialog.webmux-modal floating-sheet > dimming {
-  background-color: rgba(40, 44, 70, 0.35);
-}
-dialog.webmux-modal sheet {
-  background-color: #f4f5f9;
-  color: #343b58;
-}
-dialog.webmux-modal sheet {
-  border-color: #c4c8d8;
-  box-shadow: 0 8px 32px rgba(30, 34, 60, 0.25);
-}
-.modal-button {
-  border-color: #c4c8d8;
-  color: #343b58;
-}
-.modal-button:hover {
-  border-color: #2e7de9;
-  color: #2e7de9;
-}
-.modal-button.primary,
-.modal-button.primary:hover {
-  background-color: #2e7de9;
-  border-color: #2e7de9;
-  color: #ffffff;
-}
-.link-url {
-  color: #2e7de9;
-}
 window.webmux-log-window {
   background-color: #f4f5f9;
   color: #343b58;
