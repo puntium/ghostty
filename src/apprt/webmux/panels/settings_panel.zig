@@ -24,7 +24,6 @@ const conn = @import("../../../webmux/conn.zig");
 const Application = @import("../application.zig").Application;
 const model = @import("model.zig");
 const settings = @import("settings.zig");
-const ui = @import("ui.zig");
 
 const log = std.log.scoped(.webmux_panels);
 const alloc = std.heap.c_allocator;
@@ -66,9 +65,6 @@ pub fn dialog() *adw.PreferencesDialog {
     if (shared) |d| return d;
     const d = adw.PreferencesDialog.new();
     _ = d.as(gobject.Object).refSink();
-    // Always floating: ui.present hooks the backdrop of the sheet it finds,
-    // which a switch to a bottom sheet would replace.
-    d.as(adw.Dialog).setPresentationMode(.floating);
     // Tall enough for the whole profile form in a normal window.
     d.as(adw.Dialog).setContentHeight(720);
     _ = adw.Dialog.signals.closed.connect(d.as(adw.Dialog), ?*anyopaque, onClosed, null, .{});
@@ -90,7 +86,7 @@ pub fn isOpen() bool {
 /// Show the dialog on `parent`, or leave it up if it is.
 pub fn present(parent: *gtk.Widget) void {
     is_open = true;
-    ui.present(dialog().as(adw.Dialog), parent);
+    dialog().as(adw.Dialog).present(parent);
 }
 
 /// `app.show-settings`: the dialog, on General.
@@ -155,7 +151,8 @@ pub fn ensure() *Panel {
     fade.setDigits(0);
     fade.as(gtk.Widget).setSizeRequest(170, -1);
     fade.as(gtk.Widget).setValign(.center);
-    const fade_value = ui.label("", "numeric");
+    const fade_value = gtk.Label.new("");
+    fade_value.as(gtk.Widget).addCssClass("numeric");
     fade_value.setWidthChars(4);
     fade_value.setXalign(1);
     const fade_row = adw.ActionRow.new();

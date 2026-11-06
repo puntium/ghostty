@@ -3,6 +3,7 @@
 //! window's key handler), so the headless seat (no pointer) can exercise
 //! them. `wmctl help` lists them with their arguments.
 const std = @import("std");
+const adw = @import("adw");
 const gdk = @import("gdk");
 const gobject = @import("gobject");
 const graphene = @import("graphene");
@@ -353,10 +354,8 @@ fn urlChooser(req: *Request) void {
     }
     const c = url.topChooser() orelse return req.ok(.{ .open = false, .count = url.choosers.items.len });
     const focus: ?[]const u8 = blk: {
-        const f = c.dialog.getFocus() orelse break :blk null;
-        if (c.open_button) |o| if (f == o.as(gtk.Widget)) break :blk "open";
-        if (c.copy_button) |o| if (f == o.as(gtk.Widget)) break :blk "copy";
-        if (c.cancel_button) |o| if (f == o.as(gtk.Widget)) break :blk "cancel";
+        const f = c.dialog.as(adw.Dialog).getFocus() orelse break :blk null;
+        if (gobject.ext.cast(gtk.Button, f)) |b| if (b.getLabel()) |l| break :blk std.mem.span(l);
         break :blk std.mem.span(f.getCssName());
     };
     req.ok(.{
@@ -366,8 +365,8 @@ fn urlChooser(req: *Request) void {
         .kind = @tagName(c.kind),
         .open_label = model.chooserOpenLabel(c.kind),
         .focus = focus,
-        .shown_text = if (c.label) |l| std.mem.span(l.getText()) else null,
-        .markup = if (c.label) |l| std.mem.span(l.getLabel()) else null,
+        .shown_text = std.mem.span(c.label.getText()),
+        .markup = std.mem.span(c.label.getLabel()),
     });
 }
 
