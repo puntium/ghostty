@@ -16,34 +16,72 @@
 #                               (webmux-dev/smoke-integration)
 #   webmux-dev/smoke --all      every smoke above plus each area's own
 #                               (src/apprt/webmux/<area>/smoke or smoke.sh),
-#                               one after the other, one line per smoke;
-#                               logs in a fresh /tmp/wm-smokes-* directory;
-#                               exit 1 if any failed
+#                               2 at a time, one line per smoke; logs in a
+#                               fresh /tmp/wm-smokes-* directory; exit 1 if
+#                               any failed. Run before a final commit.
+#   webmux-dev/smoke --quick    about a minute, for the edit-and-try loop:
+#                               integration, workspace and host together.
+#                               Leaves out what only the other smokes cover
+#                               (gtk/README.md › Test).
+#
+# --all and --quick take -j N, how many smokes run at once. Each has its
+# own compositor, bus, host and run directory.
 #
 # Build first: webmux-dev/build
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ "${1:-}" == "--all" ]]; then
-  fork="$(cd "$here/.." && pwd)"
+fork="$(cd "$here/.." && pwd)"
+
+run_one() { # run_one LOGS SMOKE
+  local name="${2#"$fork"/}" log t0
+  log="$1/$(echo "$name" | tr '/' '_').log"
+  t0=$(date +%s)
+  if "$2" >"$log" 2>&1; then
+    printf 'PASS  %-40s %4ss  %s\n' "$name" "$(( $(date +%s) - t0 ))" "$(tail -n1 "$log")"
+  else
+    printf 'FAIL  %-40s %4ss  %s\n' "$name" "$(( $(date +%s) - t0 ))" "$(grep -m1 FAIL "$log" || tail -n1 "$log")"
+    return 1
+  fi
+}
+
+run_set() { # run_set JOBS SMOKE...: started in order, so list the longest first
+  local jobs="$1" logs failed=0 running=0 t0 s; shift
   logs="$(mktemp -d /tmp/wm-smokes-XXXXXX)"
-  smokes=("$here/smoke-chrome" "$here/smoke-host" "$here/smoke-pane" "$here/smoke-files" "$here/smoke-integration")
+  t0=$(date +%s)
+  for s in "$@"; do
+    if (( running >= jobs )); then
+      wait -n || failed=1
+      running=$(( running - 1 ))
+    fi
+    run_one "$logs" "$s" &
+    running=$(( running + 1 ))
+  done
+  while (( running > 0 )); do
+    wait -n || failed=1
+    running=$(( running - 1 ))
+  done
+  echo "logs: $logs ($(( $(date +%s) - t0 ))s)"
+  exit "$failed"
+}
+
+jobs_arg() { # jobs_arg DEFAULT [-j N]
+  if [[ "${2:-}" == "-j" && "${3:-}" =~ ^[1-9][0-9]*$ ]]; then echo "$3"
+  elif [[ -z "${2:-}" ]]; then echo "$1"
+  else echo "usage: webmux-dev/smoke --all|--quick [-j N]" >&2; exit 2
+  fi
+}
+
+if [[ "${1:-}" == "--all" ]]; then
+  jobs="$(jobs_arg 2 "${@:2}")"
+  smokes=("$here/smoke-chrome" "$here/smoke-files" "$here/smoke-pane")
   for s in "$fork"/src/apprt/webmux/*/smoke "$fork"/src/apprt/webmux/*/smoke.sh; do
     [[ -x "$s" ]] && smokes+=("$s")
   done
-  failed=0
-  for s in "${smokes[@]}"; do
-    name="${s#"$fork"/}"
-    log="$logs/$(echo "$name" | tr '/' '_').log"
-    t0=$(date +%s)
-    if "$s" >"$log" 2>&1; then
-      printf 'PASS  %-40s %4ss  %s\n' "$name" "$(( $(date +%s) - t0 ))" "$(tail -n1 "$log")"
-    else
-      failed=1
-      printf 'FAIL  %-40s %4ss  %s\n' "$name" "$(( $(date +%s) - t0 ))" "$(grep -m1 FAIL "$log" || tail -n1 "$log")"
-    fi
-  done
-  echo "logs: $logs"
-  exit "$failed"
+  run_set "$jobs" "${smokes[@]}" "$here/smoke-integration" "$here/smoke-host"
+fi
+if [[ "${1:-}" == "--quick" ]]; then
+  jobs="$(jobs_arg 3 "${@:2}")"
+  run_set "$jobs" "$fork/src/apprt/webmux/workspace/smoke" "$here/smoke-integration" "$here/smoke-host"
 fi
 if [[ "${1:-}" == "--host" ]]; then
   exec "$here/smoke-host"

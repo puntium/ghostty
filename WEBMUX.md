@@ -25,7 +25,8 @@ need the toolchain go through Ghostty's nix dev shell
 | Dev mode (local host, remote pane) | `D=$(webmux-dev/headless start --host)` |
 | Restart the dev host's server | `webmux-dev/headless host-restart $D` |
 | Stop | `webmux-dev/headless stop $D` |
-| Every smoke, one line each | `webmux-dev/smoke --all` (logs in a fresh `/tmp/wm-smokes-*`) |
+| Every smoke, one line each | `webmux-dev/smoke --all` (two at a time, `-j N` to change; logs in a fresh `/tmp/wm-smokes-*`) |
+| The edit-and-try subset, about a minute | `webmux-dev/smoke --quick` (integration, workspace, host side by side) |
 | The app (chrome) | `webmux-dev/smoke` (Connections → fake ssh → freshly deployed host → terminal, retry, sleep, quit) |
 | The areas together | `webmux-dev/smoke --integration` (two hosts, workspaces, settings, clipboard, URLs, K-18, resilience) |
 | Dev mode, remote pane | `webmux-dev/smoke --host` |
