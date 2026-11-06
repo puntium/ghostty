@@ -1,5 +1,5 @@
-/* The chrome: header strip (electron/header.html) and connection page
-   (electron/connect.html). Dark values first; the light scheme hangs
+/* The chrome: the header strip (electron/header.html) and the status
+   dots it shares with the Connections page. Dark values first; the light scheme hangs
    off the main window's `wm-light` class, which follows libadwaita's
    dark/light (hub.zig `syncScheme`). */
 
@@ -42,10 +42,10 @@ headerbar.wm-header button.wm-connections.active {
   background-color: #555;
 }
 @keyframes wm-pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
-.wm-header .wm-dot.connecting { background-color: #e0af68; animation: wm-pulse 1.2s ease-in-out infinite; }
-.wm-header .wm-dot.retry, .wm-header .wm-dot.failed { background-color: #f7768e; }
-.wm-header .wm-dot.connected { background-color: #9ece6a; }
-.wm-header .wm-dot.degraded { background-color: #e0af68; }
+.wm-dot.connecting { background-color: #e0af68; animation: wm-pulse 1.2s ease-in-out infinite; }
+.wm-dot.retry, .wm-dot.failed { background-color: #f7768e; }
+.wm-dot.connected { background-color: #9ece6a; }
+.wm-dot.degraded { background-color: #e0af68; }
 
 button.wm-x {
   background: none;
@@ -66,146 +66,12 @@ button.wm-x:hover { opacity: 1; color: #f7768e; }
 .wm-hostview { background-color: #16161e; }
 .wm-placeholder { color: #8a8aa0; font-size: 14px; }
 
-/* --- connection page (W-20…W-31) ------------------------------------- */
-.wm-page { background-color: #1e1e1e; color: #ccc; font-size: 14px; }
-.wm-wrap { margin: 48px 24px; }
-.wm-topbar { margin-bottom: 20px; }
-.wm-title { font-size: 18px; font-weight: 600; color: #eee; }
-
-.wm-page button {
-  font-size: 13px;
-  font-weight: normal;
-  color: #ddd;
-  background: #333;
-  border: 1px solid #444;
-  border-radius: 6px;
-  padding: 4px 14px;
-  min-height: 0;
-  box-shadow: none;
-  text-shadow: none;
-}
-.wm-page button:hover { background: #3c3c3c; }
-.wm-page button.primary { background: #2d5d8f; border-color: #3a6ea5; color: #fff; }
-.wm-page button.primary:hover { background: #356ba3; }
-.wm-page button.small, .wm-page menubutton.small > button { font-size: 12px; padding: 2px 10px; }
-.wm-page button:disabled { opacity: 0.5; }
-
-.wm-card {
-  background: #252525;
-  border: 1px solid #363636;
-  border-radius: 8px;
-  padding: 12px 16px;
-}
-.wm-card.active { border-color: #3a6ea5; }
-.wm-card .name { color: #eee; font-weight: 600; }
-.wm-card .state-label { font-size: 11px; color: #999; }
-.wm-card .live-pending { font-size: 11px; color: #d9a334; }
-.wm-card .detail { font-family: monospace; font-size: 12px; color: #999; }
-.wm-empty { color: #666; padding: 28px 0 20px; }
-
-.wm-page .wm-dot.connecting { background-color: #d9a334; animation: wm-pulse 1.2s ease-in-out infinite; }
-.wm-page .wm-dot.retry, .wm-page .wm-dot.failed { background-color: #c75450; }
-.wm-page .wm-dot.connected { background-color: #55a868; }
-.wm-page .wm-dot.degraded { background-color: #d9a334; }
-
-popover.wm-menu > contents {
-  background: #252525;
-  border: 1px solid #363636;
-  border-radius: 6px;
-  padding: 4px;
-  min-width: 190px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
-}
-popover.wm-menu button.wm-menu-item {
-  background: none;
-  border: none;
-  border-radius: 4px;
-  padding: 6px 10px;
-  color: #ddd;
-  font-size: 13px;
-}
-popover.wm-menu button.wm-menu-item label { min-width: 170px; }
-popover.wm-menu button.wm-menu-item:hover { background: #3c3c3c; }
-popover.wm-menu button.danger { color: #d98a87; }
-
-.wm-form {
-  background: #252525;
-  border: 1px solid #363636;
-  border-radius: 8px;
-  padding: 16px;
-  margin-bottom: 10px;
-}
-.wm-form .field-label { font-size: 12px; color: #999; }
-.wm-form entry {
-  font-family: monospace;
-  font-size: 13px;
-  color: #ddd;
-  background: #1a1a1a;
-  border: 1px solid #3a3a3a;
-  border-radius: 6px;
-  padding: 0 9px;
-  min-height: 30px;
-  box-shadow: none;
-  outline: none;
-}
-.wm-form entry:focus-within { border-color: #3a6ea5; }
-.wm-form entry text placeholder { color: #666; }
-.wm-form checkbutton { color: #999; font-size: 12px; margin-bottom: 4px; }
-.wm-advanced title, .wm-advanced title label { font-size: 12px; color: #666; }
-.wm-form .form-actions { margin-top: 4px; }
-.wm-form-error { color: #d98a87; font-size: 12px; }
-
-.wm-status-detail { margin-top: 18px; }
-.wm-status-detail .heading { margin: 14px 0 2px; font-size: 13px; color: #eee; font-weight: 600; }
-.wm-status-detail .para { margin: 4px 0; color: #999; font-size: 13px; }
-.wm-pre {
-  font-family: monospace;
-  font-size: 12px;
-  background: #161616;
-  border: 1px solid #333;
-  border-radius: 6px;
-  color: #a08080;
-  margin-top: 8px;
-}
-.wm-pre label { margin: 10px 12px; color: #a08080; }
-.wm-hint { font-size: 12px; color: #666; margin-top: 22px; }
-
 /* --- light scheme ---------------------------------------------------- */
 window.wm-main.wm-light, window.wm-light .wm-frame, window.wm-light .wm-hostview { background-color: #dfe1e8; }
 window.wm-light .wm-placeholder { color: #5e6482; }
 window.wm-light .wm-pill.active { border-color: rgba(140, 108, 62, 0.6); background-color: rgba(140, 108, 62, 0.14); color: #8c6c3e; }
 window.wm-light .wm-pill.drop-before { box-shadow: -4px 0 0 -1px #2e7de9; }
 window.wm-light .wm-pill.drop-after { box-shadow: 4px 0 0 -1px #2e7de9; }
-window.wm-light .wm-header .wm-dot.connecting, window.wm-light .wm-header .wm-dot.degraded { background-color: #8c6c3e; }
-window.wm-light .wm-header .wm-dot.retry, window.wm-light .wm-header .wm-dot.failed { background-color: #c8283f; }
+window.wm-light .wm-dot.connecting, window.wm-light .wm-dot.degraded { background-color: #8c6c3e; }
+window.wm-light .wm-dot.retry, window.wm-light .wm-dot.failed { background-color: #c8283f; }
 window.wm-light button.wm-x:hover { color: #c8283f; }
-window.wm-light .wm-page { background-color: #dfe1e8; color: #343b58; }
-window.wm-light .wm-title { color: #1b2140; }
-window.wm-light .wm-page button { color: #343b58; background: #eef0f5; border-color: #c4c8d8; }
-window.wm-light .wm-page button:hover { background: #e2e5ee; }
-window.wm-light .wm-page button.primary { background: #2e7de9; border-color: #2e7de9; color: #fff; }
-window.wm-light .wm-page button.primary:hover { background: #1c5fc4; }
-window.wm-light .wm-card { background: #f4f5f9; border-color: #c4c8d8; }
-window.wm-light .wm-card.active { border-color: #2e7de9; }
-window.wm-light .wm-card .name { color: #1b2140; }
-window.wm-light .wm-card .state-label, window.wm-light .wm-card .detail { color: #5e6482; }
-window.wm-light .wm-card .live-pending { color: #8c6c3e; }
-window.wm-light .wm-empty { color: #7d84a3; }
-window.wm-light .wm-page .wm-dot.none { background-color: #b0b4c8; }
-window.wm-light popover.wm-menu > contents { background: #f4f5f9; border-color: #c4c8d8; }
-window.wm-light popover.wm-menu button.wm-menu-item { color: #343b58; }
-window.wm-light popover.wm-menu button.wm-menu-item:hover { background: #e2e5ee; }
-window.wm-light popover.wm-menu button.danger { color: #c8283f; }
-window.wm-light .wm-form { background: #f4f5f9; border-color: #c4c8d8; }
-window.wm-light .wm-form .field-label { color: #5e6482; }
-window.wm-light .wm-form entry { color: #343b58; background: #ffffff; border-color: #c4c8d8; }
-window.wm-light .wm-form entry:focus-within { border-color: #2e7de9; }
-window.wm-light .wm-form entry text placeholder { color: #7d84a3; }
-window.wm-light .wm-form checkbutton { color: #5e6482; }
-window.wm-light .wm-advanced title, window.wm-light .wm-advanced title label { color: #7d84a3; }
-window.wm-light .wm-form-error { color: #c8283f; }
-window.wm-light .wm-status-detail .heading { color: #1b2140; }
-window.wm-light .wm-status-detail .para { color: #5e6482; }
-window.wm-light .wm-pre { background: #eceef4; border-color: #c4c8d8; }
-window.wm-light .wm-pre label { color: #9a3a3a; }
-window.wm-light .wm-hint { color: #7d84a3; }

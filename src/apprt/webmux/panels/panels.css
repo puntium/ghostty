@@ -1,7 +1,7 @@
-/* The panels' stylesheet (settings panel, link chooser, status toast, log
+/* The panels' stylesheet (link chooser, status toast, log
    window), loaded once for the display by panels/style.zig. Values are
    electron/ui/index.html's palette tokens and component rules (toast,
-   .modal*, .settings-modal, .link-modal) and electron/logs.html's. The
+   .modal*, .link-modal) and electron/logs.html's. The
    dark scheme is the default; the light one overrides under
    prefers-color-scheme (libadwaita's forced scheme, which Settings ›
    Color scheme sets). */
@@ -96,66 +96,6 @@ dialog.webmux-modal .modal-body {
 }
 .link-scroll {
   margin-bottom: 14px;
-}
-
-/* settings (.settings-modal, .setting) */
-.settings-heading {
-  margin-bottom: 6px;
-  font-size: 15px;
-  font-weight: 600;
-}
-.settings-lead {
-  margin-bottom: 10px;
-  font-size: 12px;
-  opacity: 0.6;
-}
-.setting {
-  padding: 11px 0;
-  border-top: 1px solid #34344a;
-  font-size: 13px;
-}
-.setting-label {
-  font-weight: 600;
-}
-.setting-desc {
-  font-size: 11.5px;
-  opacity: 0.6;
-  margin-top: 3px;
-}
-.setting-unit {
-  font-size: 12px;
-  opacity: 0.7;
-}
-.setting-output {
-  font-feature-settings: "tnum";
-  opacity: 0.8;
-}
-.setting-select > button,
-spinbutton.setting-number {
-  font-size: 13px;
-  color: #c8c8d8;
-  background-color: rgba(0, 0, 0, 0.4);
-  border: 1px solid #34344a;
-  border-radius: 6px;
-  box-shadow: none;
-  min-height: 0;
-}
-.setting-select > button {
-  padding: 5px 8px;
-}
-.setting-select > button:focus-within,
-spinbutton.setting-number:focus-within {
-  border-color: #7aa2f7;
-  outline: none;
-}
-.setting-range {
-  color: #7aa2f7;
-}
-.setting-range trough > highlight {
-  background-color: #7aa2f7;
-}
-.settings-actions {
-  margin-top: 12px;
 }
 
 /* --- log window (logs.html) -------------------------------------------- */

@@ -26,7 +26,7 @@ need the toolchain go through Ghostty's nix dev shell
 | Restart the dev host's server | `webmux-dev/headless host-restart $D` |
 | Stop | `webmux-dev/headless stop $D` |
 | Every smoke, one line each | `webmux-dev/smoke --all` (logs in a fresh `/tmp/wm-smokes-*`) |
-| The app (chrome) | `webmux-dev/smoke` (connection page → fake ssh → freshly deployed host → terminal, retry, sleep, quit) |
+| The app (chrome) | `webmux-dev/smoke` (Connections → fake ssh → freshly deployed host → terminal, retry, sleep, quit) |
 | The areas together | `webmux-dev/smoke --integration` (two hosts, workspaces, settings, clipboard, URLs, K-18, resilience) |
 | Dev mode, remote pane | `webmux-dev/smoke --host` |
 | Terminal-pane features | `webmux-dev/smoke --pane` |
@@ -110,7 +110,7 @@ src/apprt/webmux/
   iface.zig                   the seams between feature areas (the lead's; do not edit)
   iface_test.zig              analyses every iface declaration; registry tests
   features.zig                every area's register(), called once at startup
-  chrome/                     window frame, header strip, connection page, menu, engine wiring,
+  chrome/                     window frame, header strip, Connections page, menu, engine wiring,
                               keyring, sleep, first-run import (see The chrome)
   workspace/                  the strip of columns (iface.workspace_factory): layout, sessions,
                               pane frames, animations, persistence; its own smoke

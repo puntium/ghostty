@@ -36,7 +36,9 @@
 //! `MOD`).
 
 const std = @import("std");
+const Application = @import("application.zig").Application;
 const gdk = @import("gdk");
+const gio = @import("gio");
 const gtk = @import("gtk");
 const gobject = @import("gobject");
 const adw = @import("adw");
@@ -207,6 +209,17 @@ pub fn lookup(chord: Chord) ?[:0]const u8 {
     return null;
 }
 
+/// `app.` actions straight on the application: they run from anywhere,
+/// and a widget in a dialog that is closing no longer reaches them.
+fn activateApp(action: [:0]const u8) bool {
+    if (!std.mem.startsWith(u8, action, "app.")) return false;
+    const group = Application.default().as(gio.ActionGroup);
+    const name = action["app.".len..];
+    if (group.hasAction(name.ptr) == 0) return false;
+    group.activateAction(name.ptr, null);
+    return true;
+}
+
 /// Look the chord up and, if bound, activate the action on `widget`
 /// (which resolves `app.`/`win.`/widget groups from there upwards).
 /// Returns true if a shortcut matched; the key is then consumed even if
@@ -231,7 +244,7 @@ pub fn dispatch(widget: *gtk.Widget, chord: Chord) bool {
         }
     }
     log.debug("shortcut {s}", .{action});
-    if (widget.activateAction(action.ptr, null) == 0) {
+    if (widget.activateAction(action.ptr, null) == 0 and !activateApp(action)) {
         log.warn("shortcut action {s} not found from the focused widget", .{action});
     }
     last_action = action;

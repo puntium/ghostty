@@ -85,7 +85,7 @@ ctl -q key key=ctrl+1
 [[ "$(ws 0 'v["has_keyboard_focus_in"] == v["focused"]')" == True ]] || fail "focus not in a's focused pane"
 [[ "$(ws 1 'v["has_keyboard_focus_in"]')" == None ]] || fail "b kept keyboard focus"
 ctl -q key key=ctrl+shift+o
-[[ "$(ws 0 'v["front"]')" == False ]] || fail "page in front, a still front"
+[[ "$(ws 0 'v["front"]') $(get conns page.open)" == "True true" ]] || fail "Connections does not open over the host in front"
 ctl -q key key=ctrl+1
 [[ "$(ws 0 'v["pane_count"]')" == 2 ]] || fail "a's workspace torn down by a page visit"
 until_ 25 eq "webmux — 2 hosts · 3 panes" get conns title || fail "title $(get conns title)"
@@ -177,11 +177,14 @@ ctl -q key key=ctrl+shift+Return
 ctl -q key key=ctrl+1
 [[ "$(get conns front)" == a ]] || fail "Ctrl+1 from a form field"
 [[ "$(ws 0 'v["pane_count"]')" == "$n" ]] || fail "pane chord ran from a form field"
-ctl -q key key=ctrl+shift+o; ctl -q page action=escape; ctl -q key key=ctrl+1
+ctl -q key key=ctrl+shift+o   # at once: the dialog is still closing
+[[ "$(get conns page.open)" == true ]] || fail "Ctrl+Shift+O lost while the dialog closed"
+[[ "$(get conns page.mode)" == form ]] || fail "the form did not survive the dialog closing"
+ctl -q page action=escape; ctl -q key key=ctrl+1
 ctl -q key key=ctrl+shift+g
 until_ 25 eq true get log-dump open || fail "Ctrl+Shift+G did not open the log"
 [[ "$(get log-key handled key=ctrl+shift+Return)" == none ]] || fail "log window ran a pane chord"
-[[ "$(get log-key handled key=ctrl+shift+o)" == app_shortcut && "$(get conns front)" == null ]] || fail "app chord from the log window"
+[[ "$(get log-key handled key=ctrl+shift+o)" == app_shortcut && "$(get conns page.open)" == true ]] || fail "app chord from the log window"
 ctl -q log-key key=ctrl+1
 [[ "$(get conns front)" == a && "$(ws 0 'v["pane_count"]')" == "$n" ]] || fail "after the log window"
 ctl -q log-close
@@ -200,7 +203,7 @@ until_ 200 eq connected state 0 || fail "server restart never healed"
 until_ 100 eq False ws 0 'v["offline"]' || fail "workspace stayed offline"
 ok "tunnel blip and server restart heal in place (degraded → retry → connected)"
 ctl -q key key=ctrl+shift+o
-ctl -q page action=menu name=a; ctl -q page action=restart name=a; ctl -q page action=restart name=a
+ctl -q page action=restart name=a; ctl -q page action=confirm
 until_ 100 eval 'logl | grep -q "reloading workspace after session restart"' || fail "no reload after Restart Sessions"
 ctl -q key key=ctrl+1
 ctl -q workspace-wait panes:=1 timeout_ms:=15000 || fail "workspace did not reconcile to a fresh session ($(ws 0 'v["pane_count"]'))"

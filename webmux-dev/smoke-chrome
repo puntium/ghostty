@@ -31,6 +31,7 @@ until_field() {
   return 1
 }
 connlog() { cat "$dir/home/.local/state/webmux-gtk/logs/webmux.log" 2>/dev/null; }
+open_page() { ctl -q key key=ctrl+shift+o; sleep 0.5; }   # the Connections page, settled
 
 dir="$("$here/headless" start -- WEBMUX_GTK_SSH="$here/fake-ssh" WEBMUX_GTK_SLEEP_BUS=session | tail -n1)"
 echo "smoke-chrome: run dir $dir"
@@ -38,7 +39,8 @@ trap 'fail "unexpected error at line $LINENO: $BASH_COMMAND"' ERR
 
 # --- startup: connection page, nothing connects (W-04) -----------------
 [[ "$(conns title)" == webmux ]] || fail "title $(conns title)"
-[[ "$(conns front)" == null ]] || fail "not on the connection page"
+[[ "$(conns front)" == null ]] || fail "a host in front at startup"
+[[ "$(conns page.open)" == true ]] || fail "Connections not open at startup"
 [[ "$(conns page.empty)" == true ]] || fail "expected no profiles"
 [[ ! -e "$dir/home/.config/webmux-gtk/config.json" ]] || fail "config.json exists before any save"
 ctl -q screenshot path="$dir/1-empty.png"
@@ -138,12 +140,14 @@ until_conns entries.0.state connected 200 || fail "not reconnected after resume"
 echo "smoke-chrome: resume from sleep restarted the tunnel"
 
 # --- shortcuts: connection page and back (K-20, K-24) --------------------
-ctl -q key key=ctrl+shift+o
-[[ "$(conns front)" == null && "$(conns header.connections_active)" == true ]] || fail "Ctrl+Shift+O"
-[[ "$(conns header.new_terminal_enabled)" == false ]] || fail "header buttons enabled on the page"
+open_page
+[[ "$(conns page.open)" == true && "$(conns front)" == devbox ]] || fail "Ctrl+Shift+O: the dialog opens over the host"
 ctl -q screenshot path="$dir/5-page-connected.png"
 ctl -q key key=ctrl+1
 [[ "$(conns front)" == devbox ]] || fail "Ctrl+1"
+until_conns page.open false 30 || fail "Ctrl+1 left the dialog open"
+for _ in $(seq 1 30); do pane_has_focus && break; sleep 0.1; done
+pane_has_focus || fail "no keyboard focus in the pane after the dialog closed (focus $(conns focus))"
 ctl -q key key=ctrl+Page_Down
 [[ "$(conns front)" == devbox ]] || fail "Ctrl+PageDown with one host"
 
@@ -151,7 +155,14 @@ ctl -q key key=ctrl+Page_Down
 "$here/chrome-click" "$dir" --hover pill.devbox
 "$here/chrome-click" "$dir" pill.devbox.x
 [[ "$(conns entries)" == "[]" ]] || fail "still connected"
-[[ "$(conns front)" == null && "$(conns title)" == webmux ]] || fail "not back on the page"
+[[ "$(conns front)" == null && "$(conns title)" == webmux ]] || fail "not back on the landing view"
+[[ "$(conns page.open)" == true && "$(conns header.connections_active)" == true ]] || fail "Connections not open after the last disconnect"
+[[ "$(conns header.new_terminal_enabled)" == false ]] || fail "header buttons enabled with no host"
+# Closed, the landing view is left; its button brings Connections back.
+sleep 0.5; X Escape
+until_conns page.open false 30 || fail "Escape did not close Connections"
+"$here/chrome-click" "$dir" landing.open
+until_conns page.open true 30 || fail "the landing button did not open Connections"
 [[ "$(ctl dump text:=false --get panes)" == "[]" ]] || fail "terminal not torn down"
 for _ in $(seq 1 30); do pgrep -f "UNIX-LISTEN:$dir/run/webmux-gtk/" >/dev/null || break; sleep 0.1; done
 pgrep -f "UNIX-LISTEN:$dir/run/webmux-gtk/" >/dev/null && fail "tunnel still running after disconnect"
@@ -162,7 +173,7 @@ echo "smoke-chrome: disconnected"
 # real pointer wherever a user would act.
 # =========================================================================
 mk() { # mk NAME HOST: New Profile → type → Save & Connect, all real input
-  ctl -q key key=ctrl+shift+o
+  open_page
   "$here/chrome-click" "$dir" page.new
   "$here/realkeys" "$dir" "$1"
   "$here/chrome-click" "$dir" form.host
@@ -170,8 +181,8 @@ mk() { # mk NAME HOST: New Profile → type → Save & Connect, all real input
   "$here/chrome-click" "$dir" form.submit
 }
 edit_host() { # edit_host NAME NEWHOST (real input)
-  ctl -q key key=ctrl+shift+o
-  "$here/chrome-click" "$dir" "card.$1.Edit"
+  open_page
+  "$here/chrome-click" "$dir" "card.$1"
   "$here/chrome-click" "$dir" form.host
   "$here/realkeys-xkb" "$dir" ctrl+a >/dev/null
   "$here/realkeys" "$dir" "$2" -k Return
@@ -193,14 +204,17 @@ sleep 0.5
 grep -q 'is already connected to this host and instance' <<<"$(conns page.status_text)" || fail "no refusal notice: $(conns page.status_text)"
 # Ctrl+Shift+R (real keys) on a: adopts the edit (a new host: a new
 # workspace for it).
+X Escape; sleep 0.5
 "$here/chrome-click" "$dir" pill.a
 "$here/realkeys-xkb" "$dir" ctrl+shift+r >/dev/null   # chords: realkeys-xkb (physical keys, real modifiers), not realkeys
 until_state a connecting 50 || until_state a connected 1 || true
 until_state a connected 200 || fail "a did not come back after Ctrl+Shift+R"
 [[ "$(sock_of a)" == *hostc* ]] || fail "reconnect did not adopt the edited host ($(sock_of a))"
-ctl -q key key=ctrl+shift+o
+open_page
 "$here/chrome-click" "$dir" card.b.Connect
 until_state b connected || fail "b could not take the released host"
+until_conns page.open false 30 || fail "the reveal left the dialog open"
+sleep 0.4
 [[ "$(sock_of a)" != "$(sock_of b)" ]] || fail "a and b share a socket"
 echo "smoke-chrome: C-1 edit keeps the live socket, refusal shown, Ctrl+Shift+R adopts the edit"
 
@@ -216,33 +230,26 @@ until_conns header.pills.0.name a 30 || fail "dragging pill a back did not reord
 until_conns front b 30 || fail "a click on pill b did not show b"
 echo "smoke-chrome: a real drag reorders the pills in the title bar; a click still shows the host"
 
-# --- Third round 1: focus coming back to a text field keeps its content ----
-# (New Profile, type, ☰, Escape, type: GTK selected the whole field, so the
-# next key replaced it; same after ⚙ and Connections, and Edit › Paste.)
+# --- Third round 1: a form survives the dialog closing, fields as they were --
 fval() { ctl conns --get "page.form.fields.$1"; }
-ctl -q key key=ctrl+shift+o
+away_and_back() { X ctrl+1; sleep 0.5; open_page; }
+open_page
 "$here/chrome-click" "$dir" page.new
 "$here/realkeys" "$dir" hello
-"$here/chrome-click" "$dir" header.menu; sleep 0.4; X Escape; sleep 0.4
+away_and_back
 "$here/realkeys" "$dir" X
-[[ "$(fval name)" == helloX ]] || fail "☰ + Escape: the name field holds '$(fval name)', not helloX"
+[[ "$(fval name)" == helloX ]] || fail "Ctrl+1 and back: the name field holds '$(fval name)', not helloX"
 "$here/chrome-click" "$dir" form.password; "$here/realkeys" "$dir" abc
-"$here/chrome-click" "$dir" header.menu; sleep 0.4; X Escape; sleep 0.4
+away_and_back
 "$here/realkeys" "$dir" def
-[[ "$(fval password_len)" == 6 ]] || fail "☰ + Escape: the password field holds $(fval password_len) characters, not 6 (abcdef)"
+[[ "$(fval password_len)" == 6 ]] || fail "Ctrl+1 and back: the password field holds $(fval password_len) characters, not 6 (abcdef)"
 "$here/chrome-click" "$dir" form.host; "$here/realkeys" "$dir" hostx
-"$here/chrome-click" "$dir" header.settings; sleep 0.6; X Escape; sleep 0.6
-"$here/realkeys" "$dir" Y
-[[ "$(fval host)" == hostxY ]] || fail "⚙ + Escape: the host field holds '$(fval host)'"
-"$here/chrome-click" "$dir" header.connections; sleep 0.4
-"$here/realkeys" "$dir" Z
-[[ "$(fval host)" == hostxYZ ]] || fail "Connections: the host field holds '$(fval host)'"
 "$here/in-session" "$dir" wl-copy PP; sleep 0.3
-menu_item 85 226                                   # Edit > Paste into the field
-"$here/realkeys" "$dir" W
-[[ "$(fval host)" == hostxYZPPW ]] || fail "Edit > Paste: the host field holds '$(fval host)'"
-ctl -q page action=cancel
-echo "smoke-chrome: focus returns to text fields as they were (☰, ⚙, Connections, Edit › Paste; visible and password)"
+X ctrl+v; "$here/realkeys" "$dir" W
+[[ "$(fval host)" == hostxPPW ]] || fail "Ctrl+V: the host field holds '$(fval host)'"
+X Escape; sleep 0.6
+[[ "$(conns page.mode)" == list && "$(conns page.open)" == true ]] || fail "Escape did not leave the form for the list: $(conns page.mode)"
+echo "smoke-chrome: a form survives the dialog closing, fields as they were; Escape leaves it"
 
 # --- N8: the card says what a live connection is on while an edit waits ----
 card_live() { ctl conns | python3 -I -c 'import json,sys; print([c["live"] for c in json.load(sys.stdin)["result"]["page"]["cards"] if c["name"]==sys.argv[1]][0])' "$1"; }
@@ -252,24 +259,19 @@ edit_host b me@hosta
 [[ "$(card_live b)" == None ]] || fail "pending-edit line stayed after the edit was undone: $(card_live b)"
 echo "smoke-chrome: N8 a pending edit is shown on the card"
 
-# --- N1 for the card ⋯ menu: every way of closing leaves focus usable -------
-for how in escape button elsewhere; do
-  "$here/chrome-click" "$dir" card.b.menu; sleep 0.3
-  [[ "$(conns focus)" == popover:* ]] || fail "⋯ menu did not take focus"
-  case $how in
-    escape) X Escape ;;
-    button) "$here/chrome-click" "$dir" card.b.menu ;;
-    elsewhere) "$here/chrome-click" "$dir" --at 60 600 ;;
-  esac
-  sleep 0.4
-  f="$(conns focus)"
-  [[ "$f" != null && "$f" != popover:* ]] || fail "focus after closing the ⋯ menu by $how: $f"
-done
-echo "smoke-chrome: N1 the card ⋯ menu leaves focus on the page however it closes"
+# --- W-24: Delete asks first; Escape leaves everything as it was -----------
+"$here/chrome-click" "$dir" card.b
+"$here/chrome-click" "$dir" form.delete; sleep 0.5
+[[ "$(conns page.confirm)" == b ]] || fail "Delete Profile did not ask"
+X Escape
+until_conns page.confirm null 30 || fail "Escape did not answer the confirmation"
+[[ "$(conns page.mode)" == form && "$(state_of b)" == connected ]] || fail "a refused Delete changed something"
+"$here/chrome-click" "$dir" form.cancel
+echo "smoke-chrome: W-24 Delete Profile asks; Escape keeps the profile and the form"
 
 # --- N7: the port field takes 1-65535 in decimal or blank (real typing) -----
-ctl -q key key=ctrl+shift+o
-"$here/chrome-click" "$dir" card.b.Edit
+open_page
+"$here/chrome-click" "$dir" card.b
 for bad in 0 0x16 22.0 70000 abc; do
   "$here/chrome-click" "$dir" form.ssh_port; X ctrl+a; "$here/realkeys" "$dir" "$bad"
   "$here/chrome-click" "$dir" form.submit
@@ -296,16 +298,18 @@ ctl -q screenshot path="$dir/long-names.png"
 ctl -q page action=edit name="$long"; sleep 0.3
 [[ "$(ctl dump text:=false --get window.width)" == 560 ]] || fail "the form with a long name widened the window"
 ctl -q page action=cancel
-ctl -q page action=delete name="$long"; ctl -q page action=delete name="$long"
+ctl -q page action=delete name="$long"; ctl -q page action=confirm
+until_conns page.confirm null 30 || fail "the confirmed Delete never finished"
 ctl -q resize width:=1400 height:=900; sleep 0.5
 echo "smoke-chrome: N3 a 285-byte name (whole in its pill) and a long failed host keep a 560 px window; status text hyphen-free"
 
 # --- C-5: a live rename reaches every log entry ------------------------------
-ctl -q key key=ctrl+shift+o
-"$here/chrome-click" "$dir" card.a.Edit
+open_page
+"$here/chrome-click" "$dir" card.a
 "$here/realkeys-xkb" "$dir" ctrl+a >/dev/null
 "$here/realkeys" "$dir" arenamed -k Return
 until_conns header.pills.0.name arenamed 30 || fail "pill not renamed"
+sleep 0.5; X Escape; sleep 0.5
 "$here/chrome-click" "$dir" pill.arenamed
 mark="$(wc -l < "$dir/app.log")"
 "$here/realkeys-xkb" "$dir" ctrl+shift+r >/dev/null   # chords: realkeys-xkb (physical keys, real modifiers), not realkeys
@@ -320,10 +324,10 @@ connlog | grep -q '\[arenamed\] page: link down' || fail "workspace entries keep
 until_state arenamed connected 200 || fail "arenamed did not heal"
 echo "smoke-chrome: C-5 a renamed connection's workspace logs under the new name; S-13 reload on Ctrl+Shift+R"
 
-# --- E-10 / C-9: settings from the page, Open Config File recorded ------------
-ctl -q key key=ctrl+shift+o
-[[ "$(conns header.settings_enabled)" == true ]] || fail "settings button disabled on the page (E-10)"
-"$here/chrome-click" "$dir" header.settings
+# --- E-10 / C-9: settings over Connections, Open Config File recorded -----------
+open_page
+[[ "$(conns header.settings_enabled)" == true ]] || fail "settings button disabled (E-10)"
+ctl -q key key=ctrl+comma
 for _ in $(seq 1 20); do [[ "$(ctl settings-dump --get open)" == true ]] && break; sleep 0.1; done
 [[ "$(ctl settings-dump --get open)" == true ]] || fail "settings did not open from the page"
 ctl -q settings-close
@@ -338,10 +342,10 @@ ctl -q conns >/dev/null || fail "app died on a large float in log data"
 connlog | grep -q 'bigfloat x=100000000000000000000' || fail "large float not logged"
 
 # --- C-2 / C-4: passwords, keyring present, absent, back --------------------
+sleep 0.5; open_page
 "$here/chrome-click" "$dir" card.b.Disconnect 2>/dev/null || true
 mkdir -p "$dir/remote/me_pwbox"; printf 's3cret' > "$dir/remote/me_pwbox/password"
 before="$(cat "$dir/home/.config/webmux-gtk/config.json")"
-ctl -q key key=ctrl+shift+o
 "$here/chrome-click" "$dir" page.new
 "$here/realkeys" "$dir" pw
 "$here/chrome-click" "$dir" form.host; "$here/realkeys" "$dir" me@pwbox
@@ -357,8 +361,8 @@ grep -q 'password ok' "$dir/remote/ssh.log" || fail "askpass password not used"
 pid_="$(python3 -I -c 'import json,sys; print([p["id"] for p in json.load(open(sys.argv[1]))["profiles"] if p["name"]=="pw"][0])' "$dir/home/.config/webmux-gtk/config.json")"
 # keyring goes away; clear the password (real click on the checkbox)
 "$here/keyring" stop "$dir"; sleep 0.3
-ctl -q key key=ctrl+shift+o
-"$here/chrome-click" "$dir" card.pw.Edit
+open_page
+"$here/chrome-click" "$dir" card.pw
 "$here/chrome-click" "$dir" form.clear
 "$here/chrome-click" "$dir" form.submit
 [[ "$(conns page.mode)" == list ]] || fail "clear saved with no keyring: $(conns page.form)"
@@ -373,16 +377,17 @@ until_state pw failed 200 || fail "pw connected without its (cleared) password: 
 connlog | grep '\[pw\] connect requested' | tail -n1 | grep -q 'auth=key' || fail "auth not key after clearing"
 [[ "$(ctl keyring action=lookup id="$pid_" --get kind)" == none ]] || fail "cleared item still in the keyring"
 # delete a profile with a password while the keyring is down: no orphan
-ctl -q key key=ctrl+shift+o
-"$here/chrome-click" "$dir" card.pw.Edit
+open_page
+"$here/chrome-click" "$dir" card.pw
 "$here/chrome-click" "$dir" form.password; "$here/realkeys" "$dir" s3cret
 "$here/chrome-click" "$dir" form.submit
 for _ in $(seq 1 50); do [[ "$(conns page.mode)" == list ]] && break; sleep 0.1; done
 [[ "$(ctl keyring action=lookup id="$pid_" --get kind)" == found ]] || fail "password not stored again"
 "$here/keyring" stop "$dir"; sleep 0.3
-"$here/chrome-click" "$dir" card.pw.menu
-"$here/chrome-click" "$dir" card.pw.delete
-"$here/chrome-click" "$dir" card.pw.delete
+"$here/chrome-click" "$dir" card.pw
+"$here/chrome-click" "$dir" form.delete; sleep 0.5
+ctl -q page action=confirm
+until_conns page.confirm null 30 || fail "the confirmed Delete never finished"
 "$here/keyring" start "$dir" >/dev/null
 # any lookup purges cleared items once the keyring answers
 [[ "$(ctl keyring action=lookup id=0000000000000000 --get kind)" == none ]] || true
