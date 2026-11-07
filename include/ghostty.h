@@ -1224,6 +1224,10 @@ GHOSTTY_API void ghostty_config_load_file(ghostty_config_t, const char*);
 GHOSTTY_API void ghostty_config_load_default_files(ghostty_config_t);
 GHOSTTY_API void ghostty_config_load_recursive_files(ghostty_config_t);
 GHOSTTY_API void ghostty_config_finalize(ghostty_config_t);
+// webmux: load config-file text (len bytes, borrowed for the call) instead of a file.
+GHOSTTY_API void ghostty_config_load_string(ghostty_config_t, const char*, uintptr_t);
+// webmux: after finalize, URLs underline on hover and open on a plain click (xterm.js's regex).
+GHOSTTY_API void ghostty_config_webmux_links(ghostty_config_t);
 GHOSTTY_API bool ghostty_config_get(ghostty_config_t, void*, const char*, uintptr_t);
 GHOSTTY_API ghostty_input_trigger_s ghostty_config_trigger(ghostty_config_t,
                                                               const char*,
@@ -1259,6 +1263,15 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_su
 // Returns false if the surface is not a webmux surface or no socket is open (the frame is dropped).
 GHOSTTY_API bool ghostty_surface_webmux_send(ghostty_surface_t, ghostty_webmux_frame_e, const char* mime, const char* data);
 GHOSTTY_API bool ghostty_surface_webmux_attached(ghostty_surface_t);  // true if the surface was created with a webmux session
+// webmux: true while the program has the kitty keyboard protocol on (the shell then skips its xterm.js key fixups).
+GHOSTTY_API bool ghostty_surface_webmux_kitty_keyboard(ghostty_surface_t);
+// webmux: the OSC 8 hyperlink at the cell under a view position (as ghostty_surface_mouse_pos takes it);
+// ptr == NULL when none. Free with ghostty_string_free.
+GHOSTTY_API ghostty_string_s ghostty_surface_webmux_osc8_at(ghostty_surface_t, double x, double y);
+// webmux: Alt+click cursor move (xterm.js altClickMovesCursor): sends the arrow keys that take the shell's
+// cursor to the cell under the position. False (nothing sent) with mouse reporting on, the viewport
+// scrolled up, outside the grid, or already there.
+GHOSTTY_API bool ghostty_surface_webmux_alt_click(ghostty_surface_t, double x, double y);
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);

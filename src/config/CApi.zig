@@ -5,6 +5,8 @@ const global = @import("../global.zig");
 const String = @import("../main_c.zig").String;
 
 const Config = @import("Config.zig");
+const cli = @import("../cli.zig");
+const webmux = @import("webmux.zig");
 const c_get = @import("c_get.zig");
 const edit = @import("edit.zig");
 const Key = @import("key.zig").Key;
@@ -73,6 +75,26 @@ export fn ghostty_config_load_file(self: *Config, path: [*:0]const u8) void {
     self.loadFile(global.alloc(), path_slice) catch |err| {
         log.err("error loading config from file path={s} err={}", .{ path_slice, err });
     };
+}
+
+/// webmux: load configuration from `len` bytes of config-file text
+/// (the same syntax as a file, one `key = value` per line). The text is
+/// borrowed for the duration of the call; diagnostics name it
+/// `<string>`. The native macOS client builds its whole configuration
+/// from a string and never reads a file.
+export fn ghostty_config_load_string(self: *Config, text: [*]const u8, len: usize) void {
+    var reader: std.Io.Reader = .fixed(text[0..len]);
+    var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = "<string>" };
+    self.loadIter(global.alloc(), &iter) catch |err| {
+        log.err("error loading config from string err={}", .{err});
+    };
+}
+
+/// webmux: after `ghostty_config_finalize`, make the default URL link
+/// highlight on hover and open on a plain click, matched with xterm.js's
+/// URL regex (config/webmux.zig). A no-op when `link-url` is false.
+export fn ghostty_config_webmux_links(self: *Config) void {
+    webmux.links(self);
 }
 
 /// Load the configuration from the user-specified configuration

@@ -88,7 +88,9 @@ Every change to a pre-existing Ghostty file. Keep this list complete.
 | `src/Surface.zig` `childExitedAbnormally` | `.webmux => &.{"webmux"}` switch arm | exhaustiveness only; never reached |
 | `.gitignore` | `zig-out-release/` | the release build's output directory (`make linux-client` in the webmux repo) |
 | `src/apprt/embedded.zig` | `Surface.Options` gains four trailing fields (`webmux_socket_path`, `webmux_session_id`, `webmux_userdata`, `webmux_event_cb`); `Surface` declares `termioBackend()` (a `termio.Webmux.Config` when the socket path is set, else null), `links_while_mouse_reporting = true`, the C mirror types of the event (`WebmuxEvent`, `WebmuxEventTag`, `WebmuxSocketKind`, `WebmuxFrameKind`, `WebmuxEventCb`) and the trampoline that flattens `termio.Webmux.Event` into the C struct; `CAPI` exports `ghostty_surface_webmux_send` and `ghostty_surface_webmux_attached` (+231) | the same seam as the GTK shell, for the native macOS client built on GhosttyKit (see § macOS: GhosttyKit) |
-| `include/ghostty.h` | `ghostty_webmux_event_tag_e`, `ghostty_webmux_socket_kind_e`, `ghostty_webmux_event_s`, `ghostty_webmux_event_cb`, `ghostty_webmux_frame_e`; the four fields appended to `ghostty_surface_config_s`; `ghostty_surface_webmux_send`, `ghostty_surface_webmux_attached` in the Published API (+52) | the C side of the embedded seam; the stock fields keep their offsets |
+| `include/ghostty.h` | `ghostty_webmux_event_tag_e`, `ghostty_webmux_socket_kind_e`, `ghostty_webmux_event_s`, `ghostty_webmux_event_cb`, `ghostty_webmux_frame_e`; the four fields appended to `ghostty_surface_config_s`; `ghostty_surface_webmux_send`, `ghostty_surface_webmux_attached`, `ghostty_surface_webmux_kitty_keyboard`, `ghostty_surface_webmux_osc8_at`, `ghostty_surface_webmux_alt_click`, `ghostty_config_load_string`, `ghostty_config_webmux_links` in the Published API (+61) | the C side of the embedded seam; the stock fields keep their offsets |
+| `src/apprt/embedded.zig` `CAPI` | a `comptime { _ = @import("embedded/webmux.zig"); }` block (+6) | exports the macOS client's surface entry points (new file `src/apprt/embedded/webmux.zig`) with the rest of the C API |
+| `src/config/CApi.zig` | `ghostty_config_load_string` (config text through `loadIter`, no file) and `ghostty_config_webmux_links` (`config/webmux.zig` after finalize) (+20) | the macOS client builds its configuration from a string; the link rule has no config-file syntax |
 
 Not edited: `flake.nix` (tools come from the pinned nixpkgs via
 `--inputs-from .`), `SharedDeps.zig`, `GhosttyI18n.zig`.
@@ -129,6 +131,23 @@ the library. The seam is the pair of upstream edits listed above:
   the GTK shell does; the Mac shell opens the link itself on a click that
   is reported to the program (the core only reports it through the
   `mouse_over_link` action).
+- `ghostty_config_load_string(cfg, text, len)` loads config-file text
+  (diagnostics name it `<string>`); `ghostty_config_webmux_links(cfg)`,
+  after `ghostty_config_finalize`, applies the link rule the GTK shell's
+  `config.zig` applies (`src/config/webmux.zig`: URLs underline on hover
+  and open on a plain click, xterm.js's regex, http(s) only).
+- `src/apprt/embedded/webmux.zig` (pulled in by a `comptime` reference in
+  `CAPI`) exports what the GTK pane reads from the core's state and the
+  C API did not expose, each the mirror of one `pane.zig` function:
+  `ghostty_surface_webmux_kitty_keyboard` (the active screen's kitty
+  keyboard flags; the shell skips its xterm.js key fixups while set),
+  `ghostty_surface_webmux_osc8_at(surface, x, y)` (the OSC 8 URI at the
+  cell under an unscaled view position, as `ghostty_surface_mouse_pos`
+  takes it; a `ghostty_string_s` to free with `ghostty_string_free`) and
+  `ghostty_surface_webmux_alt_click(surface, x, y)` (T-20: the arrow keys
+  from `terminal/links.zig` `moveToCell` to the clicked cell; nothing with
+  mouse reporting on or the viewport scrolled up). The pure helpers in
+  `src/apprt/webmux/terminal/links.zig` are shared with the GTK shell.
 
 Build (Homebrew zig 0.17.x, Xcode with the Metal toolchain, no nix):
 

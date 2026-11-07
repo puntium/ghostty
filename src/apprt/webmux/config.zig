@@ -39,6 +39,7 @@ const Allocator = std.mem.Allocator;
 const configpkg = @import("../../config.zig");
 const cli = @import("../../cli.zig");
 const CoreConfig = configpkg.Config;
+const config_webmux = @import("../../config/webmux.zig");
 
 /// The terminal colour scheme (Electron: settings.theme).
 pub const Scheme = enum {
@@ -157,14 +158,9 @@ pub fn text(scheme: Scheme) []const u8 {
     };
 }
 
-/// xterm.js web-links addon's URL regex (@xterm/addon-web-links,
-/// `strictUrlRegex`), in Oniguruma syntax: http(s) only, no trailing
-/// punctuation. NUL is excluded as well: the renderer writes an empty
-/// cell as U+0000 (`RenderState.string`), so without it the underline of
-/// a URL that ends its row would run on to the right edge.
-pub const url_regex =
-    \\(?:https?|HTTPS?)://[^\s\x00"'!*(){}|\\\^<>`]*[^\s\x00"':,.!?{}|\\\^~\[\]`()<>]
-;
+/// xterm.js web-links addon's URL regex (config/webmux.zig, shared with
+/// the native macOS client).
+pub const url_regex = config_webmux.url_regex;
 
 /// Build the finalized Ghostty configuration. Caller owns the result
 /// (`deinit`). Parse problems end up in `_diagnostics` and are logged by
@@ -178,13 +174,8 @@ pub fn build(alloc: Allocator, scheme: Scheme) !CoreConfig {
     try config.loadIter(alloc, &iter);
     try config.finalize();
     // URLs underline and click without a modifier, like xterm.js's
-    // web-links addon (Ghostty's default needs Ctrl).
-    // Only http(s) URLs, matched like the web-links addon (anything else
-    // is inert in the Electron client, PARITY T-25).
-    if (config.@"link-url" and config.link.links.items.len > 0) {
-        config.link.links.items[0].highlight = .hover;
-        config.link.links.items[0].regex = url_regex;
-    }
+    // web-links addon (config/webmux.zig, shared with the macOS client).
+    config_webmux.links(&config);
     return config;
 }
 

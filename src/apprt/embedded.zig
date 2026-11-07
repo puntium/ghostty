@@ -1714,6 +1714,12 @@ pub const Inspector = struct {
 
 // C API
 pub const CAPI = struct {
+    // webmux: the surface entry points of the native macOS client
+    // (embedded/webmux.zig) are exported with the rest of this API.
+    comptime {
+        _ = @import("embedded/webmux.zig");
+    }
+
     /// This is the same as Surface.KeyEvent but this is the raw C API version.
     const KeyEvent = extern struct {
         action: input.Action,
