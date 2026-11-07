@@ -82,11 +82,6 @@ pub const Entry = struct {
         if (e.state == .connected and e.offline) return "degraded";
         return @tagName(e.state);
     }
-
-    /// True when the tunnel is up (connected or degraded).
-    pub fn isUp(e: *const Entry) bool {
-        return e.state == .connected;
-    }
 };
 
 pub const Hub = struct {
@@ -400,14 +395,6 @@ fn restoreFocus(_: ?*anyopaque) callconv(.c) c_int {
     }
     focusContent();
     return 0;
-}
-
-/// The remembered content focus if it lies inside `container` (borrowed).
-pub fn contentFocusIn(container: *gtk.Widget) ?*gtk.Widget {
-    const w = content_focus.get() orelse return null;
-    w.unref();
-    if (w == container or w.isAncestor(container) != 0) return w;
-    return null;
 }
 
 /// The widget the user was working in before a popover took focus

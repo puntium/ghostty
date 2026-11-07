@@ -14,8 +14,6 @@ pub fn Result(comptime T: type) type {
 
 /// Upload limit per file (host: `uploadLimit`, 200 MiB).
 pub const upload_limit: u64 = 200 * 1024 * 1024;
-/// Listing cap (host: `fsListMax`).
-pub const list_max = 2000;
 
 pub const Entry = struct {
     name: []const u8,

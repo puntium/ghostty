@@ -397,11 +397,12 @@ click_at act-rename
 "$here/realkeys" "$dir" -k Escape; idle rename-esc
 click_at act-delete
 expect "$(st confirm)" "Delete “big.txt”?" "real click on ✕"
-click_at backdrop
-expect "$(st confirm)" "null" "real click on the backdrop"
-[[ -e "$H/big.txt" ]] || fail "backdrop click deleted"
+click_at confirm-cancel
+expect "$(st confirm)" "null" "real click on Cancel"
+[[ -e "$H/big.txt" ]] || fail "Cancel deleted"
 
-# D5: Tab stays inside the confirmation; Escape still closes it.
+# D5: Tab stays inside the confirmation (an alert dialog); Escape still
+# closes it.
 "$here/realkeys" "$dir" d; sleep 0.3
 "$here/realkeys" "$dir" -k Tab; sleep 0.2
 [[ "$(st confirm)" != null ]] || fail "D5: Tab closed the confirmation"
@@ -409,12 +410,20 @@ expect "$(st confirm)" "null" "real click on the backdrop"
 "$here/realkeys" "$dir" -k Escape; sleep 0.3
 expect "$(st confirm)" "null" "D5: Escape after Tab"
 [[ -e "$H/big.txt" ]] || fail "D5: Tab+Escape deleted"
-# Item 7: the confirmation never stays behind when focus leaves the pane.
+# Item 7: the confirmation never stays behind when its pane is hidden
+# (deviation 71: it is window-modal, so it stays up while the pane is
+# shown, whatever has the focus).
 "$here/realkeys" "$dir" d; sleep 0.3
-ctl -q pane-command name=new-terminal # takes the focus
+ctl -q pane-command name=new-terminal
 ctl -q workspace-wait panes:=2 timeout_ms:=15000 || fail "no second pane"
 sleep 0.3
-expect "$(st confirm)" "null" "confirmation left behind after focus moved away"
+[[ "$(st confirm)" != null ]] || fail "the confirmation went away while its pane was still shown"
+ctl -q files-confirm answer=cancel
+sleep 0.3
+expect "$(st confirm)" "null" "confirmation left behind"
+# Closing the dialog put the focus back on the file browser (where it was
+# when the dialog opened): focus the terminal before closing it.
+ctl -q workspace-click id="$(ctl workspace --get columns.1.panes.0.id)" part=bar; sleep 0.2
 ctl -q pane-command name=close-pane
 ctl -q workspace-wait panes:=1 timeout_ms:=15000 || fail "terminal pane not closed"
 sleep 0.3

@@ -138,11 +138,6 @@ pub fn position(self: *const Layout, pane: *const Pane) ?Position {
     return null;
 }
 
-pub fn positionOf(self: *const Layout, id: []const u8) ?Position {
-    const p = self.find(id) orelse return null;
-    return self.position(p);
-}
-
 pub fn columnIndexOf(self: *const Layout, pane: *const Pane) ?usize {
     return if (self.position(pane)) |pos| pos.col else null;
 }

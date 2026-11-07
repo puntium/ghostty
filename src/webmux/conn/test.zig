@@ -827,12 +827,6 @@ test "engine: config.json round-trip, settings, lastProfile, payload lookup" {
 // Deploy end to end through the engine (fake ssh)
 // ---------------------------------------------------------------------------
 
-fn lineWith(hay: []const u8, needle: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, hay, '\n');
-    while (it.next()) |l| if (std.mem.indexOf(u8, l, needle) != null) return l;
-    return null;
-}
-
 test "deploy: fresh push, reuse, outdated server replaced, failures surface stderr" {
     const f = try Fixture.init(testing.allocator);
     defer f.deinit();

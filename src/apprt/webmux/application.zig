@@ -116,7 +116,6 @@ pub const Application = extern struct {
             );
             slot.* = provider;
         }
-        @import("panels/style.zig").install(display);
         @import("files/css.zig").install(display);
 
         const self = gobject.ext.newInstance(Self, .{

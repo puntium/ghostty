@@ -1,21 +1,26 @@
 //! The connection log window (PARITY G-20…G-29; electron/logs.html,
 //! electron/main.js openLogWindow).
 //!
-//! One window of its own (900×560, `webmux — connection log`), themed with
-//! the client. Opening it again presents the existing one; after it is
-//! closed a new one can be opened; it goes away with the last main window.
-//! It loads the engine's ring and then tails it live: every log push wakes
-//! the main loop, which pulls the entries newer than the last one it has
-//! (`Log.since`), so entries arrive in sequence order whatever thread
-//! pushed them and the initial load never duplicates one (G-21).
+//! One window of its own (900×560, `webmux — connection log`), a native
+//! `AdwWindow` with libadwaita's look (deviation 72). Opening it again
+//! presents the existing one; after it is closed a new one can be opened;
+//! it goes away with the last main window. It loads the engine's ring and
+//! then tails it live: every log push wakes the main loop, which pulls the
+//! entries newer than the last one it has (`Log.since`), so entries arrive
+//! in sequence order whatever thread pushed them and the initial load
+//! never duplicates one (G-21).
 //!
-//! Toolbar: Host (`all`, then each host in order of first appearance,
-//! `client (no host)` for app-wide entries), Level (`debug+`, `info+`
-//! default, `warn+`, `error`), the text filter (case-insensitive substring
-//! of the file-format line, applied 80 ms after typing stops), `follow`,
-//! Copy visible (primary), Copy all, Reveal file (the file manager), Clear.
-//! Lines are a read-only text view (selectable across lines), rendered as
-//! logs.html renders them. Status bar: the count, a 2 s copy flash and the
+//! Header bar: Copy visible (primary) and a menu with Copy all, Reveal
+//! file (the file manager) and Clear. Below it a toolbar that wraps in a
+//! narrow window: Host (`all`, then each host in order of first
+//! appearance, `client (no host)` for app-wide entries), Level (`debug+`,
+//! `info+` default, `warn+`, `error`), the text filter (case-insensitive
+//! substring of the file-format line, applied 80 ms after typing stops),
+//! and Follow. Lines are a read-only text view (selectable across lines),
+//! laid out as logs.html lays them out, in libadwaita's colours (the
+//! accent, success, warning and error colours and the dim text of the
+//! current scheme; read back from the style, so they follow the scheme
+//! and the accent colour). Status bar: the count, a 2 s copy flash and the
 //! file path. Keys: Escape closes, Ctrl+F the text filter, Ctrl+Shift+C
 //! copies the visible lines, and the app shortcuts work as in the main
 //! window.
@@ -32,6 +37,7 @@ const gtk = @import("gtk");
 
 const conn = @import("../../../webmux/conn.zig");
 const Log = conn.Log;
+const ext = @import("../ext.zig");
 const iface = @import("../iface.zig");
 const mainloop = @import("../mainloop.zig");
 const shortcuts = @import("../shortcuts.zig");
@@ -39,7 +45,6 @@ const KeyEvent = @import("../key_event.zig").KeyEvent;
 const Application = @import("../application.zig").Application;
 const Window = @import("../window.zig").Window;
 const model = @import("model.zig");
-const settings = @import("settings.zig");
 const url = @import("url.zig");
 const WrapBox = @import("wrap_box.zig").WrapBox;
 
@@ -80,6 +85,11 @@ pub const Row = struct {
     }
 };
 
+/// The style colours the lines are drawn in, each read from a hidden
+/// label carrying that style class (libadwaita defines them in CSS only).
+const Probe = enum { dim, accent, success, warning, @"error" };
+const probe_classes = [_][:0]const u8{ "dim-label", "accent", "success", "warning", "error" };
+
 pub const LogWindow = struct {
     window: *gtk.Window,
     host_dd: *gtk.DropDown,
@@ -90,16 +100,19 @@ pub const LogWindow = struct {
     search: *gtk.SearchEntry,
     follow: *gtk.CheckButton,
     copy_visible: *gtk.Button,
-    copy_all: *gtk.Button,
-    reveal: *gtk.Button,
-    clear: *gtk.Button,
+    /// Copy all, Reveal file, Clear (`log.` actions on the window).
+    menu: *gtk.MenuButton,
+    actions: *gio.SimpleActionGroup,
     scroll: *gtk.ScrolledWindow,
     view: *gtk.TextView,
     buffer: *gtk.TextBuffer,
-    empty: *gtk.Label,
+    empty: *adw.StatusPage,
     count: *gtk.Label,
     flash: *gtk.Label,
     file: *gtk.Label,
+    probes: [probe_classes.len]*gtk.Label,
+    style_ids: [2]c_ulong = .{ 0, 0 },
+    recolour_source: c_uint = 0,
 
     rows: std.ArrayList(*Row) = .empty,
     /// the rows in the text view, in order: buffer line i is shown[i]
@@ -116,7 +129,6 @@ pub const LogWindow = struct {
     /// counts as the user's (an upward wheel or touchpad scroll, scrollbar
     /// drag, or key)
     user_scroll_until: i64 = 0,
-    dark: bool = true,
 
     pub fn filter(self: *const LogWindow) model.Filter {
         const hi = self.host_dd.getSelected();
@@ -150,7 +162,7 @@ pub fn show() void {
         _ = pull(w);
         render(w);
     } else {
-        for ([_]*gtk.Button{ w.copy_visible, w.copy_all, w.reveal, w.clear }) |b| b.as(gtk.Widget).setSensitive(0);
+        setButtonsSensitive(w, false);
         render(w);
     }
     w.window.present();
@@ -176,13 +188,16 @@ pub fn onAppWindowRemoved(app: *gtk.Application) void {
 fn onDestroy(_: *gtk.Window, w: *LogWindow) callconv(.c) void {
     if (instance == w) instance = null;
     if (w.sub_id) |id| if (iface.engine) |e| e.unsubscribeLog(id);
-    iface.settings.unsubscribe(w);
+    const sm = adw.StyleManager.getDefault();
+    for (w.style_ids) |id| if (id != 0) gobject.signalHandlerDisconnect(sm.as(gobject.Object), id);
+    if (w.recolour_source != 0) _ = glib.Source.remove(w.recolour_source);
     if (w.flash_timer != 0) _ = glib.Source.remove(w.flash_timer);
     for (w.rows.items) |r| r.deinit();
     w.rows.deinit(alloc);
     w.shown.deinit(alloc);
     for (w.host_keys.items) |k| if (k) |s| alloc.free(s);
     w.host_keys.deinit(alloc);
+    w.actions.unref();
     alloc.destroy(w);
 }
 
@@ -192,7 +207,7 @@ fn onDestroy(_: *gtk.Window, w: *LogWindow) callconv(.c) void {
 
 fn toolbarLabel(text: [:0]const u8) *gtk.Widget {
     const l = gtk.Label.new(text.ptr);
-    l.as(gtk.Widget).addCssClass("log-toolbar-label");
+    l.as(gtk.Widget).addCssClass("dim-label");
     return l.as(gtk.Widget);
 }
 
@@ -224,30 +239,48 @@ fn labelFactory(comptime chars: c_int) *gtk.ListItemFactory {
     return f.as(gtk.ListItemFactory);
 }
 
-fn toolButton(text: [:0]const u8, tooltip: [:0]const u8, primary: bool) *gtk.Button {
-    const b = gtk.Button.newWithLabel(text.ptr);
-    const bw = b.as(gtk.Widget);
-    bw.addCssClass("log-button");
-    if (primary) bw.addCssClass("primary");
-    bw.setTooltipText(tooltip.ptr);
-    return b;
-}
+const menu_actions = [_]ext.actions.Action(LogWindow){
+    .init("copy-all", actCopyAll, null),
+    .init("reveal", actReveal, null),
+    .init("clear", actClear, null),
+};
 
 fn build() !*LogWindow {
     const app = Application.default();
-    const window = gtk.Window.new();
+    const aw = adw.Window.new();
+    const window = aw.as(gtk.Window);
     window.setApplication(app.as(gtk.Application));
     window.setTitle(title);
     window.setDefaultSize(default_width, default_height);
-    window.as(gtk.Widget).addCssClass("webmux-log-window");
 
-    const root = gtk.Box.new(.vertical, 0);
+    const tv = adw.ToolbarView.new();
+    tv.setTopBarStyle(.raised_border);
+    tv.setBottomBarStyle(.raised_border);
 
-    // --- toolbar: a flex-wrap row (logs.html #toolbar): the filters, a
-    // spacer, the buttons; it wraps onto more lines rather than clipping
-    // a control or widening the window.
-    const bar = WrapBox.new(8, 8);
-    bar.as(gtk.Widget).addCssClass("log-toolbar");
+    // --- header bar: the title, Copy visible, and the other actions in a
+    // menu.
+    const header = adw.HeaderBar.new();
+    const wt = adw.WindowTitle.new("Connection Log", "");
+    header.setTitleWidget(wt.as(gtk.Widget));
+    const copy_visible = gtk.Button.newFromIconName("edit-copy-symbolic");
+    copy_visible.as(gtk.Widget).setTooltipText("Copy the lines currently shown (Ctrl+Shift+C)");
+    const menu_model = gio.Menu.new();
+    defer menu_model.unref();
+    menu_model.append("Copy All Entries", "log.copy-all");
+    menu_model.append("Reveal Log File", "log.reveal");
+    menu_model.append("Clear Log", "log.clear");
+    const menu = gtk.MenuButton.new();
+    menu.setIconName("view-more-symbolic");
+    menu.setMenuModel(menu_model.as(gio.MenuModel));
+    menu.as(gtk.Widget).setTooltipText("More");
+    header.packEnd(menu.as(gtk.Widget));
+    header.packEnd(copy_visible.as(gtk.Widget));
+    tv.addTopBar(header.as(gtk.Widget));
+
+    // --- toolbar: the filters (logs.html #toolbar); it wraps onto more
+    // lines rather than clipping a control or widening the window.
+    const bar = WrapBox.new(6, 6);
+    bar.as(gtk.Widget).addCssClass("toolbar");
 
     const host_strings = [_:null]?[*:0]const u8{"all"};
     const host_list = gtk.StringList.new(@ptrCast(&host_strings));
@@ -260,7 +293,7 @@ fn build() !*LogWindow {
     defer list_factory.as(gobject.Object).unref();
     host_dd.setFactory(button_factory);
     host_dd.setListFactory(list_factory);
-    const host_box = gtk.Box.new(.horizontal, 5);
+    const host_box = gtk.Box.new(.horizontal, 6);
     host_box.append(toolbarLabel("Host"));
     host_box.append(host_dd.as(gtk.Widget));
     bar.append(host_box.as(gtk.Widget));
@@ -270,35 +303,26 @@ fn build() !*LogWindow {
     level_strings[model.level_labels.len] = null;
     const level_dd = gtk.DropDown.newFromStrings(@ptrCast(&level_strings));
     level_dd.setSelected(@backingInt(model.default_level));
-    const level_box = gtk.Box.new(.horizontal, 5);
+    const level_box = gtk.Box.new(.horizontal, 6);
     level_box.append(toolbarLabel("Level"));
     level_box.append(level_dd.as(gtk.Widget));
     bar.append(level_box.as(gtk.Widget));
 
     const search = gtk.SearchEntry.new();
-    search.setPlaceholderText("filter text…");
+    search.setPlaceholderText("Filter text");
     search.setSearchDelay(search_delay_ms);
-    // 200px wide including padding and border, as logs.html's
-    // border-box; its own character width must not ask for more.
+    // 200px wide, as logs.html's; its own character width must not ask
+    // for more.
     search.as(gtk.Widget).setSizeRequest(200, -1);
     search.as(gtk.Editable).setWidthChars(1);
     search.as(gtk.Editable).setMaxWidthChars(1);
-    search.as(gtk.Widget).addCssClass("log-search");
     bar.append(search.as(gtk.Widget));
 
-    const follow = gtk.CheckButton.newWithLabel("follow");
+    const follow = gtk.CheckButton.newWithLabel("Follow");
     follow.setActive(1);
     follow.as(gtk.Widget).setTooltipText("Keep the newest entry in view");
-    follow.as(gtk.Widget).addCssClass("log-follow");
     bar.append(follow.as(gtk.Widget));
-    bar.appendSpacer();
-
-    const copy_visible = toolButton("Copy visible", "Copy the lines currently shown (Ctrl+Shift+C)", true);
-    const copy_all = toolButton("Copy all", "Copy every entry in memory, ignoring the filters", false);
-    const reveal = toolButton("Reveal file", "Show the log file in the file manager", false);
-    const clear = toolButton("Clear", "Empty the in-memory log (the file is kept)", false);
-    for ([_]*gtk.Button{ copy_visible, copy_all, reveal, clear }) |b| bar.append(b.as(gtk.Widget));
-    root.append(bar.as(gtk.Widget));
+    tv.addTopBar(bar.as(gtk.Widget));
 
     // --- lines
     const view = gtk.TextView.new();
@@ -313,44 +337,50 @@ fn build() !*LogWindow {
     view.setPixelsAboveLines(1);
     view.setPixelsBelowLines(2);
     view.setPixelsInsideWrap(1);
-    view.as(gtk.Widget).addCssClass("log-lines");
     view.as(gtk.Widget).setHasTooltip(1);
     const scroll = gtk.ScrolledWindow.new();
     scroll.setChild(view.as(gtk.Widget));
     scroll.setPolicy(.never, .automatic);
     scroll.as(gtk.Widget).setVexpand(1);
-    scroll.as(gtk.Widget).addCssClass("log-scroll");
 
-    const empty = gtk.Label.new(model.empty_no_entries);
-    empty.as(gtk.Widget).addCssClass("log-empty");
-    empty.setWrap(1);
-    empty.as(gtk.Widget).setValign(.start);
+    const empty = adw.StatusPage.new();
+    empty.setTitle(model.empty_no_entries);
+    empty.as(gtk.Widget).addCssClass("compact");
     empty.as(gtk.Widget).setVexpand(1);
 
     const body = gtk.Box.new(.vertical, 0);
-    body.as(gtk.Widget).addCssClass("log-body");
     body.as(gtk.Widget).setVexpand(1);
     body.append(scroll.as(gtk.Widget));
     body.append(empty.as(gtk.Widget));
-    root.append(body.as(gtk.Widget));
+    tv.setContent(body.as(gtk.Widget));
 
     // --- status bar
     const status = gtk.Box.new(.horizontal, 12);
-    status.as(gtk.Widget).addCssClass("log-status");
+    status.as(gtk.Widget).addCssClass("toolbar");
     const count = gtk.Label.new("");
+    count.as(gtk.Widget).addCssClass("dim-label");
     const flash = gtk.Label.new("");
-    flash.as(gtk.Widget).addCssClass("log-flash");
+    flash.as(gtk.Widget).addCssClass("accent");
     const file = gtk.Label.new("");
-    file.as(gtk.Widget).addCssClass("log-file");
+    file.as(gtk.Widget).addCssClass("dim-label");
+    file.as(gtk.Widget).addCssClass("monospace");
     file.setEllipsize(.end);
     file.as(gtk.Widget).setHexpand(1);
     file.setXalign(1);
     status.append(count.as(gtk.Widget));
     status.append(flash.as(gtk.Widget));
     status.append(file.as(gtk.Widget));
-    root.append(status.as(gtk.Widget));
+    // The colour probes: in the tree (so the style applies), never shown.
+    var probes: [probe_classes.len]*gtk.Label = undefined;
+    for (probe_classes, &probes) |class, *p| {
+        p.* = gtk.Label.new("");
+        p.*.as(gtk.Widget).addCssClass(class.ptr);
+        p.*.as(gtk.Widget).setVisible(0);
+        status.append(p.*.as(gtk.Widget));
+    }
+    tv.addBottomBar(status.as(gtk.Widget));
 
-    window.setChild(root.as(gtk.Widget));
+    aw.setContent(tv.as(gtk.Widget));
 
     const w = try alloc.create(LogWindow);
     w.* = .{
@@ -361,9 +391,8 @@ fn build() !*LogWindow {
         .search = search,
         .follow = follow,
         .copy_visible = copy_visible,
-        .copy_all = copy_all,
-        .reveal = reveal,
-        .clear = clear,
+        .menu = menu,
+        .actions = gio.SimpleActionGroup.new(),
         .scroll = scroll,
         .view = view,
         .buffer = view.getBuffer(),
@@ -371,12 +400,16 @@ fn build() !*LogWindow {
         .count = count,
         .flash = flash,
         .file = file,
+        .probes = probes,
     };
     try w.host_keys.append(alloc, null);
+    ext.actions.addToMap(LogWindow, w, w.actions.as(gio.ActionMap), &menu_actions);
+    window.as(gtk.Widget).insertActionGroup("log", w.actions.as(gio.ActionGroup));
     createTags(w);
-    w.dark = model.themeOf(&settings.current()).dark;
     colourTags(w);
-    _ = iface.settings.subscribe(.{ .ctx = w, .changed = onSettings });
+    const sm = adw.StyleManager.getDefault();
+    w.style_ids[0] = gobject.Object.signals.notify.connect(sm, *LogWindow, onStyleChanged, w, .{ .detail = "dark" });
+    w.style_ids[1] = gobject.Object.signals.notify.connect(sm, *LogWindow, onStyleChanged, w, .{ .detail = "accent-color" });
 
     _ = gtk.Widget.signals.destroy.connect(window, *LogWindow, onDestroy, w, .{});
     _ = gobject.Object.signals.notify.connect(host_dd, *LogWindow, onFilterChanged, w, .{ .detail = "selected" });
@@ -384,9 +417,6 @@ fn build() !*LogWindow {
     _ = gtk.SearchEntry.signals.search_changed.connect(search, *LogWindow, onSearch, w, .{});
     _ = gtk.CheckButton.signals.toggled.connect(follow, *LogWindow, onFollowToggled, w, .{});
     _ = gtk.Button.signals.clicked.connect(copy_visible, *LogWindow, onCopyVisible, w, .{});
-    _ = gtk.Button.signals.clicked.connect(copy_all, *LogWindow, onCopyAll, w, .{});
-    _ = gtk.Button.signals.clicked.connect(reveal, *LogWindow, onReveal, w, .{});
-    _ = gtk.Button.signals.clicked.connect(clear, *LogWindow, onClear, w, .{});
     const adj = scroll.getVadjustment();
     _ = gtk.Adjustment.signals.value_changed.connect(adj, *LogWindow, onScrolled, w, .{});
     _ = gtk.Adjustment.signals.changed.connect(adj, *LogWindow, onAdjChanged, w, .{});
@@ -415,8 +445,17 @@ fn build() !*LogWindow {
     return w;
 }
 
+/// Without an engine there is nothing to copy, reveal or clear.
+fn setButtonsSensitive(w: *LogWindow, on: bool) void {
+    w.copy_visible.as(gtk.Widget).setSensitive(@intFromBool(on));
+    for (menu_actions) |a| {
+        const action = w.actions.as(gio.ActionMap).lookupAction(a.name.ptr) orelse continue;
+        gobject.ext.cast(gio.SimpleAction, action).?.setEnabled(@intFromBool(on));
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Tags and theme (logs.html .ln … rules, both schemes)
+// Tags and colours (logs.html .ln … rules, in the style's colours)
 // ---------------------------------------------------------------------------
 
 const tag_names = [_][:0]const u8{ "line", "t", "who", "who-page", "lvl", "lvl-info", "debug", "warn", "error", "data", "hit", "hover" };
@@ -430,9 +469,10 @@ fn createTags(w: *LogWindow) void {
     }
     setProp(w, "lvl", "weight", @as(c_int, 600));
     // A hanging indent: wrapped lines continue under the message, past
-    // the time and level columns ("HH:MM:SS.mmm LEVEL ", 19 cells of 12px
-    // monospace at the usual 0.6em advance). Measuring the font would need
-    // a direct libpango call, which the executable's rpath does not cover.
+    // the time and level columns ("HH:MM:SS.mmm LEVEL ", 19 cells of the
+    // monospace font at the usual 0.6em advance). Measuring the font would
+    // need a direct libpango call, which the executable's rpath does not
+    // cover.
     const indent: c_int = 137;
     // Pango's negative indent: the first line starts at the margin and
     // the wrapped ones `-indent` further in.
@@ -448,59 +488,55 @@ fn setProp(w: *LogWindow, name: [:0]const u8, prop: [:0]const u8, value: anytype
     tagNamed(w, name).as(gobject.Object).set(prop.ptr, value, @as(?*anyopaque, null));
 }
 
-const Palette = struct {
-    muted: [:0]const u8,
-    accent: [:0]const u8,
-    page: [:0]const u8,
-    debug: [:0]const u8,
-    warn: [:0]const u8,
-    @"error": [:0]const u8,
-    hl: [:0]const u8,
-    hover: [:0]const u8,
-};
-
-/// logs.html `:root` / `:root[data-theme="light"]`.
-const dark_palette: Palette = .{
-    .muted = "#8a8aa0",
-    .accent = "#7aa2f7",
-    .page = "#9ece6a",
-    .debug = "#6a6f87",
-    .warn = "#e0af68",
-    .@"error" = "#f7768e",
-    .hl = "rgba(224,175,104,0.18)",
-    .hover = "rgba(255,255,255,0.05)",
-};
-const light_palette: Palette = .{
-    .muted = "#6a6f87",
-    .accent = "#2e7de9",
-    .page = "#4d8a2f",
-    .debug = "#9aa0b8",
-    .warn = "#8c6c3e",
-    .@"error" = "#c8283f",
-    .hl = "rgba(140,108,62,0.18)",
-    .hover = "rgba(0,0,0,0.05)",
-};
-
-fn colourTags(w: *LogWindow) void {
-    const p = if (w.dark) dark_palette else light_palette;
-    setProp(w, "t", "foreground", p.muted.ptr);
-    setProp(w, "who", "foreground", p.accent.ptr);
-    setProp(w, "who-page", "foreground", p.page.ptr);
-    setProp(w, "lvl-info", "foreground", p.muted.ptr);
-    setProp(w, "debug", "foreground", p.debug.ptr);
-    setProp(w, "warn", "foreground", p.warn.ptr);
-    setProp(w, "error", "foreground", p.@"error".ptr);
-    setProp(w, "data", "foreground", p.muted.ptr);
-    setProp(w, "hit", "paragraph-background", p.hl.ptr);
-    setProp(w, "hover", "paragraph-background", p.hover.ptr);
+fn probeColour(w: *LogWindow, which: Probe) gdk.RGBA {
+    var c: gdk.RGBA = undefined;
+    w.probes[@backingInt(which)].as(gtk.Widget).getColor(&c);
+    return c;
 }
 
-fn onSettings(ctx: *anyopaque, s: *const conn.Settings) void {
-    const w: *LogWindow = @ptrCast(@alignCast(ctx));
-    const dark = model.themeOf(s).dark;
-    if (dark == w.dark) return;
-    w.dark = dark;
+fn withAlpha(c: gdk.RGBA, alpha: f32) gdk.RGBA {
+    var out = c;
+    out.f_alpha = alpha;
+    return out;
+}
+
+/// The lines' colours from the current style: the time, level and data
+/// dim; `[conn]` in the accent colour and `page` in the success colour;
+/// warnings and errors in theirs; a text-filter hit on a wash of the
+/// warning colour; the hovered line on a wash of the text colour.
+fn colourTags(w: *LogWindow) void {
+    const dim = probeColour(w, .dim);
+    const text = textColour(w);
+    setProp(w, "t", "foreground-rgba", &dim);
+    setProp(w, "who", "foreground-rgba", &probeColour(w, .accent));
+    setProp(w, "who-page", "foreground-rgba", &probeColour(w, .success));
+    setProp(w, "lvl-info", "foreground-rgba", &dim);
+    setProp(w, "debug", "foreground-rgba", &dim);
+    setProp(w, "warn", "foreground-rgba", &probeColour(w, .warning));
+    setProp(w, "error", "foreground-rgba", &probeColour(w, .@"error"));
+    setProp(w, "data", "foreground-rgba", &dim);
+    setProp(w, "hit", "paragraph-background-rgba", &withAlpha(probeColour(w, .warning), 0.18));
+    setProp(w, "hover", "paragraph-background-rgba", &withAlpha(text, 0.06));
+}
+
+fn textColour(w: *LogWindow) gdk.RGBA {
+    var c: gdk.RGBA = undefined;
+    w.view.as(gtk.Widget).getColor(&c);
+    return c;
+}
+
+/// The scheme or the accent colour changed: recolour once the style has
+/// settled (libadwaita swaps its stylesheet in the same notification).
+fn onStyleChanged(_: *adw.StyleManager, _: *gobject.ParamSpec, w: *LogWindow) callconv(.c) void {
+    if (w.recolour_source != 0) return;
+    w.recolour_source = glib.idleAdd(recolourIdle, w);
+}
+
+fn recolourIdle(ud: ?*anyopaque) callconv(.c) c_int {
+    const w: *LogWindow = @ptrCast(@alignCast(ud.?));
+    w.recolour_source = 0;
     colourTags(w);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -721,10 +757,10 @@ fn updateEmpty(w: *LogWindow) void {
     w.empty.as(gtk.Widget).setVisible(@intFromBool(none));
     if (!none) return;
     if (iface.engine == null) {
-        w.empty.setText(no_engine_text);
+        w.empty.setTitle(no_engine_text);
     } else {
         const t = model.emptyText(w.rows.items.len);
-        w.empty.setText(if (t.ptr == model.empty_no_entries.ptr) model.empty_no_entries else model.empty_no_match);
+        w.empty.setTitle(if (t.ptr == model.empty_no_entries.ptr) model.empty_no_entries else model.empty_no_match);
     }
 }
 
@@ -851,7 +887,7 @@ pub const Button = enum { copy_visible, copy_all, reveal, clear };
 /// What each toolbar button does; the control socket enters here too.
 pub fn press(which: Button) void {
     const w = instance orelse return;
-    if (iface.engine == null) return; // the buttons are insensitive
+    if (iface.engine == null) return; // the buttons and actions are insensitive
     switch (which) {
         .copy_visible => copyRows(w, w.shown.items, true),
         .copy_all => copyRows(w, w.rows.items, false),
@@ -870,13 +906,13 @@ pub fn press(which: Button) void {
 fn onCopyVisible(_: *gtk.Button, _: *LogWindow) callconv(.c) void {
     press(.copy_visible);
 }
-fn onCopyAll(_: *gtk.Button, _: *LogWindow) callconv(.c) void {
+fn actCopyAll(_: *gio.SimpleAction, _: ?*glib.Variant, _: *LogWindow) callconv(.c) void {
     press(.copy_all);
 }
-fn onReveal(_: *gtk.Button, _: *LogWindow) callconv(.c) void {
+fn actReveal(_: *gio.SimpleAction, _: ?*glib.Variant, _: *LogWindow) callconv(.c) void {
     press(.reveal);
 }
-fn onClear(_: *gtk.Button, _: *LogWindow) callconv(.c) void {
+fn actClear(_: *gio.SimpleAction, _: ?*glib.Variant, _: *LogWindow) callconv(.c) void {
     press(.clear);
 }
 

@@ -44,7 +44,6 @@ const build_config = @import("../../build_config.zig");
 const build_options = @import("build_options");
 const font = @import("../../font/main.zig");
 const input = @import("../../input.zig");
-const internal_os = @import("../../os/main.zig");
 const global = @import("../../global.zig");
 const renderer = @import("../../renderer.zig");
 const terminal = @import("../../terminal/main.zig");
@@ -765,14 +764,6 @@ pub const TerminalPane = extern struct {
         if (dir > 0) _ = self.snapToBottomIfNear();
     }
 
-    fn kittyKeyboardActive(self: *Self) bool {
-        const surface = self.core() orelse return false;
-        surface.renderer_state.mutex.lockUncancelable(global.io());
-        defer surface.renderer_state.mutex.unlock(global.io());
-        const flags = surface.renderer_state.terminal.screens.active.kitty_keyboard.current();
-        return @as(u5, @bitCast(flags)) != 0;
-    }
-
     /// Typing snaps the viewport to the bottom (T-17); the pane's own
     /// paste keys bypass the encoder, so do it here for them.
     fn scrollToBottomOnInput(self: *Self) void {
@@ -1452,13 +1443,6 @@ pub const TerminalPane = extern struct {
         }
         surface.renderer_thread.wakeup.notify() catch {};
         return true;
-    }
-
-    fn scrollOffset(self: *Self) ?usize {
-        const surface = self.core() orelse return null;
-        surface.renderer_state.mutex.lockUncancelable(global.io());
-        defer surface.renderer_state.mutex.unlock(global.io());
-        return surface.renderer_state.terminal.screens.active.pages.scrollbar().offset;
     }
 
     /// T-30: after a downward viewport move (wheel, Shift+PageDown,

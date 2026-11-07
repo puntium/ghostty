@@ -59,11 +59,6 @@ pub fn isMainThread() bool {
     return glib.MainContext.isOwner(glib.MainContext.default()) != 0;
 }
 
-/// Debug check for functions that must only run on the main thread.
-pub fn assertMainThread() void {
-    std.debug.assert(isMainThread());
-}
-
 test "post from another thread runs on the owning thread, in order" {
     const testing = std.testing;
 

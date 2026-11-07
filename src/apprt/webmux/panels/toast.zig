@@ -1,22 +1,20 @@
 //! Status messages: `iface.services.status` (PARITY M-01, M-02).
 //!
-//! electron/ui/app.js `setStatus`: one toast at a time, bottom-right of the
-//! window, 18px from both edges; a new message replaces the text and
-//! restarts the 3000 ms hide timer; it rises 10px and fades in over 0.18 s
-//! (CSS transition on the `show` class, panels.css) and never takes the
-//! pointer.
+//! electron/ui/app.js `setStatus`: one message at a time; a new message
+//! replaces the old one and restarts the 3000 ms hide timer. Shown as a
+//! libadwaita toast (`AdwToast` in an `AdwToastOverlay`, deviation 70):
+//! libadwaita's look and place (bottom centre), its close button, and its
+//! rule that the timer pauses while the pointer is over the toast.
 //!
-//! The toast lives in a `gtk.Overlay` on top of a window's content. A
-//! window gets one of two ways:
+//! A window gets its overlay one of two ways:
 //!
-//!   - `attach(window, overlay)`: the window already has an overlay of its
-//!     own above everything (the chrome's choice), and the toast is added
-//!     to it;
+//!   - `attach(window, overlay)`: the window already has a toast overlay
+//!     of its own above everything, and the toasts go there;
 //!   - `adoptWindow(window)`: the toast module wraps the window's content
 //!     in an overlay of its own and keeps it wrapped when the content is
 //!     replaced (`notify::content`; wrapping happens synchronously inside
-//!     `setContent`, before the new content is allocated). Dev mode uses
-//!     this.
+//!     `setContent`, before the new content is allocated). The main
+//!     window uses this.
 //!
 //! A message goes to the active `Window` (else the first host). With no
 //! host at all it is only logged.
@@ -39,13 +37,13 @@ const Host = struct {
     /// Borrowed; the host is freed when the window is destroyed.
     window: *gtk.Window,
     /// Strong reference (ours).
-    overlay: *gtk.Overlay,
-    /// Owned by the overlay.
-    label: *gtk.Label,
+    overlay: *adw.ToastOverlay,
+    /// The toast on show (our reference), null when none.
+    toast: ?*adw.Toast = null,
+    /// Its `dismissed` handler.
+    dismissed_id: c_ulong = 0,
     /// The window's content is wrapped by us (adoptWindow).
     adopted: bool,
-    /// Hide timer source, 0 when none.
-    timer: c_uint = 0,
     /// notify::content handler on the window (adopted hosts).
     notify_id: c_ulong = 0,
     text: ?[:0]u8 = null,
@@ -57,31 +55,12 @@ const Host = struct {
 
 var hosts: std.ArrayList(*Host) = .empty;
 
-/// Messages shown since start, and the last one (for the control socket).
+/// Messages shown since start (for the control socket).
 pub var total: u64 = 0;
 
-fn newHost(window: *gtk.Window, overlay: *gtk.Overlay, adopted: bool) *Host {
-    const label = gtk.Label.new("");
-    const w = label.as(gtk.Widget);
-    w.addCssClass("webmux-toast");
-    w.setHalign(.end);
-    w.setValign(.end);
-    w.setCanTarget(0);
-    w.setCanFocus(0);
-    label.setWrap(1);
-    label.setWrapMode(.word_char);
-    // min(640px, 100vw − 36px), padding included (border-box): GTK sizes
-    // max-width-chars at 10px a character of 15px semibold (measured), so
-    // 60 keeps the label within 600px plus 40px of padding; the overlay
-    // never gives it more than the window.
-    label.setMaxWidthChars(60);
-    label.setXalign(0);
-    overlay.addOverlay(w);
-    // An overlay child does not change the overlay's size.
-    overlay.setMeasureOverlay(w, 0);
-
+fn newHost(window: *gtk.Window, overlay: *adw.ToastOverlay, adopted: bool) *Host {
     const host = alloc.create(Host) catch @panic("OOM");
-    host.* = .{ .window = window, .overlay = overlay, .label = label, .adopted = adopted };
+    host.* = .{ .window = window, .overlay = overlay, .adopted = adopted };
     hosts.append(alloc, host) catch @panic("OOM");
     _ = gtk.Widget.signals.destroy.connect(window, *Host, onWindowDestroy, host, .{});
     return host;
@@ -92,19 +71,19 @@ fn findHost(window: *gtk.Window) ?*Host {
     return null;
 }
 
-/// Add the toast to an overlay the window already has.
-pub fn attach(window: *gtk.Window, overlay: *gtk.Overlay) void {
+/// Use a toast overlay the window already has.
+pub fn attach(window: *gtk.Window, overlay: *adw.ToastOverlay) void {
     if (findHost(window) != null) return;
     _ = overlay.as(gobject.Object).ref();
     _ = newHost(window, overlay, false);
 }
 
-/// Wrap the window's content (now and whenever it is replaced) in an
-/// overlay holding the toast.
+/// Wrap the window's content (now and whenever it is replaced) in a
+/// toast overlay.
 pub fn adoptWindow(window: *adw.ApplicationWindow) void {
     const win = window.as(gtk.Window);
     if (findHost(win) != null) return;
-    const overlay = gtk.Overlay.new();
+    const overlay = adw.ToastOverlay.new();
     _ = overlay.as(gobject.Object).refSink();
     const host = newHost(win, overlay, true);
     wrapContent(host);
@@ -133,7 +112,7 @@ fn onWindowDestroy(_: *gtk.Window, host: *Host) callconv(.c) void {
         break;
     };
     if (host.notify_id != 0) gobject.signalHandlerDisconnect(host.window.as(gobject.Object), host.notify_id);
-    if (host.timer != 0) _ = glib.Source.remove(host.timer);
+    dropToast(host);
     if (host.text) |t| alloc.free(t);
     if (host.owner) |o| alloc.free(o);
     host.overlay.as(gobject.Object).unref();
@@ -191,7 +170,7 @@ pub fn setFront(conn_name: ?[]const u8) void {
     front = if (conn_name) |n| alloc.dupe(u8, n) catch null else null;
     const host = currentHost() orelse return;
     if (host.owner) |o| {
-        if (!isFront(o)) hideHost(host);
+        if (!isFront(o)) dropToast(host);
     }
     const n = conn_name orelse return;
     for (pending.items) |m| {
@@ -236,6 +215,9 @@ fn remember(conn_name: []const u8, text: []const u8, until: i64) void {
     };
 }
 
+/// Show `text` for `ms`, replacing what the host shows. `AdwToast`'s
+/// timeout is in whole seconds, so what is left of a kept message is
+/// rounded up.
 fn display(owner: ?[]const u8, text: []const u8, ms: u32) void {
     const host = currentHost() orelse return;
     const z = alloc.dupeSentinel(u8, text, 0) catch return;
@@ -244,6 +226,7 @@ fn display(owner: ?[]const u8, text: []const u8, ms: u32) void {
     if (host.owner) |o| alloc.free(o);
     host.owner = if (owner) |o| alloc.dupe(u8, o) catch null else null;
     host.count += 1;
+    dropToast(host);
     // Shown as it is: Pango must not add hyphens where it wraps (paths,
     // file names); through markup, as a Pango attribute list would need a
     // direct libpango call.
@@ -251,16 +234,37 @@ fn display(owner: ?[]const u8, text: []const u8, ms: u32) void {
     defer glib.free(esc);
     const markup = std.fmt.allocPrintSentinel(alloc, "<span insert_hyphens=\"false\">{s}</span>", .{std.mem.span(esc)}, 0) catch null;
     defer if (markup) |m| alloc.free(m);
-    if (markup) |m| host.label.setMarkup(m.ptr) else host.label.setText(z.ptr);
-    host.label.as(gtk.Widget).addCssClass("show");
-    if (host.timer != 0) _ = glib.Source.remove(host.timer);
-    host.timer = glib.timeoutAdd(ms, onHide, host);
+    const toast = adw.Toast.new(if (markup) |m| m.ptr else z.ptr);
+    if (markup != null) toast.setUseMarkup(1);
+    toast.setTimeout((ms + 999) / 1000);
+    // Ahead of anything libadwaita still has queued (it shows at once).
+    toast.setPriority(.high);
+    _ = toast.as(gobject.Object).ref();
+    host.toast = toast;
+    host.dismissed_id = adw.Toast.signals.dismissed.connect(toast, *Host, onDismissed, host, .{});
+    host.overlay.addToast(toast);
 }
 
-fn hideHost(host: *Host) void {
-    if (host.timer != 0) _ = glib.Source.remove(host.timer);
-    host.timer = 0;
-    host.label.as(gtk.Widget).removeCssClass("show");
+/// Dismiss the host's toast, if any, and forget it.
+fn dropToast(host: *Host) void {
+    const toast = host.toast orelse return;
+    forgetToast(host);
+    toast.dismiss();
+    toast.as(gobject.Object).unref();
+}
+
+fn forgetToast(host: *Host) void {
+    const toast = host.toast orelse return;
+    if (host.dismissed_id != 0) gobject.signalHandlerDisconnect(toast.as(gobject.Object), host.dismissed_id);
+    host.dismissed_id = 0;
+    host.toast = null;
+}
+
+/// The timer ran out, or the user closed it.
+fn onDismissed(toast: *adw.Toast, host: *Host) callconv(.c) void {
+    if (host.toast != toast) return;
+    forgetToast(host);
+    toast.as(gobject.Object).unref();
 }
 
 const Posted = struct {
@@ -272,13 +276,6 @@ const Posted = struct {
         showFrom(self.conn, self.text);
     }
 };
-
-fn onHide(ud: ?*anyopaque) callconv(.c) c_int {
-    const host: *Host = @ptrCast(@alignCast(ud.?));
-    host.timer = 0;
-    host.label.as(gtk.Widget).removeCssClass("show");
-    return 0; // G_SOURCE_REMOVE
-}
 
 /// For the control socket: what the toast of the active window shows.
 pub const State = struct {
@@ -297,7 +294,7 @@ pub fn state() State {
     const host = currentHost() orelse return .{ .hosts = 0, .visible = false, .text = null, .adopted = false, .shown_total = total };
     return .{
         .hosts = hosts.items.len,
-        .visible = host.label.as(gtk.Widget).hasCssClass("show") != 0,
+        .visible = host.toast != null,
         .text = if (host.text) |t| t else null,
         .adopted = host.adopted,
         .shown_total = total,

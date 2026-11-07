@@ -261,14 +261,6 @@ if mode == 'region':  # distinct colours and mean brightness of a region
         for x in range(x0, x1, 2):
             c = px(x, y); cols.add(c); tot += sum(c); n += 1
     print(len(cols), tot // (3 * n))
-elif mode == 'toast':  # the accent box near the bottom-right: width, right gap, bottom gap
-    w, h, px = load(sys.argv[2]); acc = tuple(int(sys.argv[3][i:i+2], 16) for i in (0, 2, 4))
-    xs = []; ys = []
-    for y in range(h - 300, h - 12):
-        for x in range(w // 3, w - 12):
-            c = px(x, y)
-            if all(abs(c[k] - acc[k]) < 8 for k in range(3)): xs.append(x); ys.append(y)
-    print(max(xs) - min(xs) + 1, w - 1 - max(xs), h - 1 - max(ys))
 PY
 pngq() { python3 -I "$dir/png.py" "$@"; }
 winrect() { # winrect main|log -> "X Y W H" of that window on the output
@@ -361,15 +353,14 @@ expect "E-13: 150.4 + Return commits 150" "$(ctl settings | json 'v["applied"]["
 eventually "Escape closes the panel" false get settings-dump open
 expect "E-13: Escape drops an uncommitted edit" "$(ctl settings | json 'v["applied"]["min_cols"]')" 100
 
-# M-01: the toast is at most 640px wide, 18px from the edges.
+# M-01: a long message is one libadwaita toast (deviation 70), inside the
+# window.
 ctl -q status text="$(python3 -c 'print("a long status message that keeps going " * 12)')"
 sleep 0.5
+expect "M-01: long message shown" "$(get status-dump visible)" true
 grab "$dir/r-toast.png" $mx $my $mw $mh
-read -r tw tr tb <<<"$(pngq toast "$dir/r-toast.png" 7aa2f7)"
-(( tw <= 640 && tw >= 560 )) || fail "M-01: toast width $tw"
-expect "M-01 toast gaps" "$tr $tb" "18 18"
-echo "smoke-panels: ok  M-01 toast width $tw"
 sleep 3.2
+expect "M-01: gone after 3 s" "$(get status-dump visible)" false
 
 # D8: a background host's message waits for its host to come to the front.
 ctl -q status-front name=alpha
@@ -397,7 +388,7 @@ bad = [i for i in b if i["x"] < 0 or i["x"] + i["w"] > W]
 over = [(a["name"], c["name"]) for i, a in enumerate(b) for c in b[i+1:] if a["w"] and c["w"] and a["x"] < c["x"] + c["w"] and c["x"] < a["x"] + a["w"] and a["y"] < c["y"] + c["h"] and c["y"] < a["y"] + a["h"]]
 s = [i for i in b if i["name"] == "entry"][0]
 print("ok" if not bad and not over and s["w"] == 200 else "bad %s %s search %d" % (bad, over, s["w"]))
-lines = len(set(i["y"] for i in b if i["name"] == "button"))
+ys = sorted(i["y"] + i["h"] / 2 for i in b); lines = 1 + sum(1 for a, c in zip(ys, ys[1:]) if c - a > 12)
 print(lines)'
 }
 expect "G-22: one line at 900px with host all" "$(toolbar_ok | tr '\n' ' ')" "ok 1 "

@@ -24,7 +24,7 @@ fn cellAt(surface: *Surface, x: f64, y: f64) ?links.Cell {
 }
 
 /// True while the program has the kitty keyboard protocol enabled on
-/// the active screen (`pane.zig` `kittyKeyboardActive`): the shell then
+/// the active screen (what `pane.zig` `encodeKey` checks): the shell then
 /// leaves every key to Ghostty's encoder instead of applying the xterm.js
 /// fixups (PARITY T-13).
 export fn ghostty_surface_webmux_kitty_keyboard(surface: *Surface) bool {

@@ -253,10 +253,6 @@ pub const PaneFrame = extern struct {
         w.setCanFocus(0);
     }
 
-    pub fn isFocused(self: *Self) bool {
-        return self.private().focused;
-    }
-
     /// Focus ring and fade. `k` is the fade strength for an unfocused pane
     /// (settings › unfocused fade / 100).
     pub fn setFocused(self: *Self, focused: bool, k: f64, instant: bool) void {

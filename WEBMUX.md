@@ -198,7 +198,7 @@ src/apprt/webmux/
   files/                      the file-browser pane (iface.factories.files): Miller columns,
                               previews, uploads/downloads, watch streams
   panels/                     settings (owner of iface.settings and the colour scheme),
-                              connection log window, status toast, URL service; its own smoke.sh
+                              connection log window, status toasts, URL service; its own smoke.sh
   dev.zig                     dev mode: one connection view on WEBMUX_GTK_DEV_SOCKET
   render_surface.zig          WebmuxRenderSurface: shows the renderer's DMABUF/CPU frames (copied, plus
                               opaque import, the fade and its own background; see Performance)
@@ -694,7 +694,7 @@ const Up = struct {
 mainloop.post(Up{ .pane = pane.ref() }, Up.run);
 ```
 
-`mainloop.isMainThread()` / `assertMainThread()` for checks. The core's
+`mainloop.isMainThread()` for checks. The core's
 own threads already go through the core's mailbox and `App.wakeup`.
 
 ### Logging

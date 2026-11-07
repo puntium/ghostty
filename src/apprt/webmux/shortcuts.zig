@@ -29,11 +29,10 @@
 //! ignored).
 //!
 //! Modals (K-18, deviation 31): pane chords never run while focus is in a
-//! text field or a dialog, or while any modal is up in the window (a mapped
-//! widget with the CSS class `modal_class`); they are swallowed so the key
-//! never reaches the field or the pane underneath. App shortcuts run
-//! everywhere. The Linux chord modifier is Ctrl+Shift (electron/main.js
-//! `MOD`).
+//! text field or a dialog (every modal of the shell is an `AdwDialog`,
+//! which takes the focus); they are swallowed so the key never reaches the
+//! field or the pane underneath. App shortcuts run everywhere. The Linux
+//! chord modifier is Ctrl+Shift (electron/main.js `MOD`).
 
 const std = @import("std");
 const Application = @import("application.zig").Application;
@@ -57,11 +56,6 @@ pub const Entry = struct {
     /// Physical position (default) or the layout's key (see the header).
     by: By = .code,
 };
-
-/// The CSS class that marks a modal inside the window (an in-pane
-/// confirmation, an overlay sheet): while a widget carrying it is mapped,
-/// pane chords do not run. Any area may use it on the modal's root widget.
-pub const modal_class = "wm-modal";
 
 pub const table = [_]Entry{
     // --- App shortcuts (PARITY K-20…K-26, main.js APP_SHORTCUTS) ---------
@@ -231,14 +225,8 @@ fn activateApp(action: [:0]const u8) bool {
 pub fn dispatch(widget: *gtk.Widget, chord: Chord) bool {
     const action = lookup(chord) orelse return false;
     if (std.mem.startsWith(u8, action, "pane.")) {
-        const why: ?[]const u8 = if (inTextField(widget))
-            "in a text field"
-        else if (modalUp(widget))
-            "under a modal"
-        else
-            null;
-        if (why) |w| {
-            log.debug("shortcut {s} swallowed {s}", .{ action, w });
+        if (inTextField(widget)) {
+            log.debug("shortcut {s} swallowed in a text field or dialog", .{action});
             last_action = action;
             return true;
         }
@@ -258,22 +246,6 @@ fn inTextField(widget: *gtk.Widget) bool {
         if (gobject.ext.isA(x, gtk.Text) or gobject.ext.isA(x, gtk.TextView)) return true;
         if (gobject.ext.isA(x, adw.Dialog)) return true;
     }
-    return false;
-}
-
-/// A modal is up in `widget`'s window: a mapped widget carrying
-/// `modal_class`. Hidden hosts' views are unmapped, so their modals do not
-/// count (each Electron host page blocks only its own chords).
-pub fn modalUp(widget: *gtk.Widget) bool {
-    const root = widget.getRoot() orelse return false;
-    return hasModal(root.as(gtk.Widget));
-}
-
-fn hasModal(w: *gtk.Widget) bool {
-    if (w.getMapped() == 0) return false;
-    if (w.hasCssClass(modal_class) != 0) return true;
-    var c = w.getFirstChild();
-    while (c) |x| : (c = x.getNextSibling()) if (hasModal(x)) return true;
     return false;
 }
 

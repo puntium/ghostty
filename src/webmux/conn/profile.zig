@@ -610,14 +610,6 @@ pub const Store = struct {
     }
 };
 
-fn jsonStr(o: std.json.ObjectMap, key: []const u8) []const u8 {
-    const v = o.get(key) orelse return "";
-    return switch (v) {
-        .string => |s| s,
-        else => "",
-    };
-}
-
 
 /// Deviation 39: a port is a whole number from 1 to 65535 written in
 /// decimal (0 or absent = ssh's default). From JSON: an integer, or a

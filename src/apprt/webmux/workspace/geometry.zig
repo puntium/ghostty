@@ -67,11 +67,6 @@ pub const Geometry = struct {
         return .{ .x = c.x, .y = pad, .w = c.width, .h = @max(0, self.viewport_h - 2 * pad) };
     }
 
-    pub fn paneBox(self: *const Geometry, col: usize, row: usize) ?Box {
-        for (self.panes) |p| if (p.col == col and p.row == row) return p.box;
-        return null;
-    }
-
     /// The rounded scroll width (what a browser reports as scrollWidth).
     pub fn extent(self: *const Geometry) f64 {
         return @round(self.strip.scroll_width);

@@ -11,7 +11,7 @@
 //!   preview   text, rendered markdown, images, zip trees, stat-only.
 //!   live      one watch stream for the cursor's directory and one for the
 //!             directory under the cursor; focus re-lists everything shown.
-//!   mutate    rename (inline entry), delete (confirmation over the pane),
+//!   mutate    rename (inline entry), delete (an alert dialog),
 //!             upload (drop, paste), download (save dialog).
 //!
 //! Everything here runs on the main thread. Host calls go through
@@ -225,10 +225,9 @@ const Rename = struct {
 };
 
 const Confirm = struct {
-    backdrop: *gtk.Box,
-    dialog: *gtk.Box,
-    cancel: *gtk.Button,
-    delete: *gtk.Button,
+    dialog: *adw.AlertDialog,
+    /// Its `response` handler.
+    response_id: c_ulong,
     text: [:0]u8,
     name: []u8,
     dir: []u8,
@@ -267,7 +266,6 @@ pub const Browser = extern struct {
         opened: bool = false,
         open_failed: ?[]u8 = null,
 
-        overlay: *gtk.Overlay = undefined,
         scroller: *gtk.ScrolledWindow = undefined,
         strip: *gtk.Box = undefined,
         cols: std.ArrayList(*Col) = .empty,
@@ -397,9 +395,10 @@ pub const Browser = extern struct {
         return self.private().rename;
     }
 
-    pub fn confirmWidgets(self: *Self) ?struct { backdrop: *gtk.Widget, dialog: *gtk.Widget, cancel: *gtk.Widget, delete: *gtk.Widget } {
+    /// The open delete confirmation (an `AdwAlertDialog`), if any.
+    pub fn confirmDialog(self: *Self) ?*gtk.Widget {
         const c = self.private().confirm orelse return null;
-        return .{ .backdrop = c.backdrop.as(gtk.Widget), .dialog = c.dialog.as(gtk.Widget), .cancel = c.cancel.as(gtk.Widget), .delete = c.delete.as(gtk.Widget) };
+        return c.dialog.as(gtk.Widget);
     }
 
     pub fn confirmText(self: *Self) ?[]const u8 {
@@ -1713,13 +1712,6 @@ pub const Browser = extern struct {
         self.fillPreviewBody(col);
     }
 
-    pub fn setMdSource(self: *Self, src: bool) void {
-        self.private().md_source = src;
-        if (self.previewCol()) |col| {
-            if (col.pv.toggle[0] != null) self.applyMdView(col);
-        }
-    }
-
     fn onDownloadClicked(_: *gtk.Button, col: *Col) callconv(.c) void {
         const self = col.browser;
         if (col.pv.path) |p| self.download(p, .dialog);
@@ -2358,25 +2350,10 @@ pub const Browser = extern struct {
         self.rerender();
     }
 
-    /// Focus left the pane: an open delete confirmation is dismissed (it
-    /// must never be left behind in an unfocused pane).
-    fn onFocusLeave(_: *gtk.EventControllerFocus, self: *Self) callconv(.c) void {
-        if (self.private().confirm != null) {
-            // Deferred: focus is still moving.
-            _ = glib.idleAdd(confirmBlurIdle, self.ref());
-        }
-    }
-
-    fn confirmBlurIdle(data: ?*anyopaque) callconv(.c) c_int {
-        const self: *Self = @ptrCast(@alignCast(data.?));
-        defer self.unref();
-        if (self.private().confirm != null and !self.containsFocus()) self.finishConfirmNoFocus();
-        return 0;
-    }
-
-    /// The container hides or shows the pane (Pane.setShown).
+    /// The container hides or shows the pane (Pane.setShown): a delete
+    /// confirmation never stays up for a hidden pane.
     pub fn setShown(self: *Self, shown: bool) void {
-        if (!shown and self.private().confirm != null) self.finishConfirmNoFocus();
+        if (!shown) self.finishConfirm(false);
     }
 
     fn onFocusEnter(_: *gtk.EventControllerFocus, self: *Self) callconv(.c) void {
@@ -2410,7 +2387,7 @@ pub const Browser = extern struct {
 
     fn onUnmap(_: *gtk.Widget, self: *Self) callconv(.c) void {
         self.disconnectWindow();
-        if (self.private().confirm != null) self.finishConfirmNoFocus();
+        self.finishConfirm(false);
     }
 
     fn disconnectWindow(self: *Self) void {
@@ -2433,19 +2410,10 @@ pub const Browser = extern struct {
     pub fn handleKey(self: *Self, keyval: c_uint, state: gdk.ModifierType) bool {
         const priv = self.private();
         if (priv.rename != null) return false; // typed keys belong to the entry
-        if (priv.confirm) |c| {
-            switch (keyval) {
-                gdk.KEY_Escape => self.finishConfirm(false),
-                // Focus stays inside the confirmation (D5): Tab and the
-                // arrows move between its two buttons.
-                gdk.KEY_Tab, gdk.KEY_ISO_Left_Tab, gdk.KEY_KP_Tab, gdk.KEY_Left, gdk.KEY_Right => {
-                    const on_delete = c.delete.as(gtk.Widget).hasFocus() != 0;
-                    _ = (if (on_delete) c.cancel else c.delete).as(gtk.Widget).grabFocus();
-                },
-                gdk.KEY_Return, gdk.KEY_KP_Enter, gdk.KEY_space => return false, // the focused button
-                // Nothing else reaches the columns under the modal.
-                else => {},
-            }
+        if (priv.confirm != null) {
+            // Real keys go to the dialog, which has the focus; this is the
+            // control socket. Nothing reaches the columns under it.
+            if (keyval == gdk.KEY_Escape) self.finishConfirm(false);
             return true;
         }
         const ctrl = state.control_mask;
@@ -2804,41 +2772,21 @@ pub const Browser = extern struct {
             if (!std.mem.eql(u8, x.name, name)) rest.append(alloc, dupe(x.name)) catch {};
         }
 
-        const backdrop = gtk.Box.new(.vertical, 0);
-        backdrop.as(gtk.Widget).addCssClass("files-modal-overlay");
-        // Pane chords do not run while this is up (K-18, shortcuts.zig).
-        backdrop.as(gtk.Widget).addCssClass("wm-modal");
-        backdrop.as(gtk.Widget).setHexpand(1);
-        backdrop.as(gtk.Widget).setVexpand(1);
-        const dialog = gtk.Box.new(.vertical, 0);
-        dialog.as(gtk.Widget).addCssClass("files-confirm");
-        dialog.as(gtk.Widget).setHalign(.center);
-        dialog.as(gtk.Widget).setValign(.center);
-        dialog.as(gtk.Widget).setVexpand(1);
-        const label = gtk.Label.new(null);
-        md_view.setPlainText(label, text.ptr);
-        label.as(gtk.Widget).addCssClass("files-confirm-text");
-        label.setWrap(1);
-        label.setWrapMode(.word_char);
-        label.setMaxWidthChars(48);
-        label.setXalign(0);
-        dialog.append(label.as(gtk.Widget));
-        const actions = gtk.Box.new(.horizontal, 0);
-        actions.as(gtk.Widget).setHalign(.end);
-        const cancel = gtk.Button.newWithLabel("Cancel");
-        const del = gtk.Button.newWithLabel("Delete");
-        del.as(gtk.Widget).addCssClass("danger");
-        actions.append(cancel.as(gtk.Widget));
-        actions.append(del.as(gtk.Widget));
-        dialog.append(actions.as(gtk.Widget));
-        backdrop.append(dialog.as(gtk.Widget));
+        // A native alert over the window (deviation 71); pane chords do not
+        // run while a dialog has the focus (K-18, shortcuts.zig). Delete is
+        // the default response, so it has the initial focus (F-52).
+        const win = self.as(gtk.Widget).getRoot() orelse return;
+        const dialog = adw.AlertDialog.new(text.ptr, null);
+        dialog.addResponse("cancel", "Cancel");
+        dialog.addResponse("delete", "Delete");
+        dialog.setResponseAppearance("delete", .destructive);
+        dialog.setDefaultResponse("delete");
+        dialog.setCloseResponse("cancel");
 
         const c = alloc.create(Confirm) catch return;
         c.* = .{
-            .backdrop = backdrop,
             .dialog = dialog,
-            .cancel = cancel,
-            .delete = del,
+            .response_id = 0,
             .text = text,
             .name = dupe(name),
             .dir = dupe(priv.dir),
@@ -2846,47 +2794,49 @@ pub const Browser = extern struct {
             .index = i,
         };
         priv.confirm = c;
-        _ = gtk.Button.signals.clicked.connect(cancel, *Self, onConfirmCancel, self, .{});
-        _ = gtk.Button.signals.clicked.connect(del, *Self, onConfirmDelete, self, .{});
-        const gc = gtk.GestureClick.new();
-        _ = gtk.GestureClick.signals.released.connect(gc, *Self, onBackdropClick, self, .{});
-        backdrop.as(gtk.Widget).addController(gc.as(gtk.EventController));
-        priv.overlay.addOverlay(backdrop.as(gtk.Widget));
-        _ = del.as(gtk.Widget).grabFocus(); // Delete has initial focus
+        c.response_id = adw.AlertDialog.signals.response.connect(dialog, *Self, onConfirmResponse, self, .{});
+        dialog.as(adw.Dialog).present(win.as(gtk.Widget));
+        // The scrolled window around the message area (in the tree once
+        // presented) is not a focus stop, as GTK makes it one when no child
+        // takes focus: Tab moves between the two buttons only (D5).
+        if (findScrolledWindow(dialog.as(gtk.Widget))) |sw| sw.setCanFocus(0);
     }
 
-    fn onConfirmCancel(_: *gtk.Button, self: *Self) callconv(.c) void {
-        self.finishConfirm(false);
+    fn confirmRefocusIdle(data: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(data.?));
+        defer self.unref();
+        const w = self.as(gtk.Widget);
+        const root = w.getRoot() orelse return 0;
+        if (w.getMapped() != 0 and root.getFocus() == null) _ = w.grabFocus();
+        return 0;
     }
 
-    fn onConfirmDelete(_: *gtk.Button, self: *Self) callconv(.c) void {
-        self.finishConfirm(true);
+    fn findScrolledWindow(w: *gtk.Widget) ?*gtk.Widget {
+        if (gobject.ext.isA(w, gtk.ScrolledWindow)) return w;
+        var c = w.getFirstChild();
+        while (c) |x| : (c = x.getNextSibling()) if (findScrolledWindow(x)) |f| return f;
+        return null;
     }
 
-    fn onBackdropClick(_: *gtk.GestureClick, _: c_int, x: f64, y: f64, self: *Self) callconv(.c) void {
-        const c = self.private().confirm orelse return;
-        const picked = c.backdrop.as(gtk.Widget).pick(x, y, .{}) orelse return;
-        if (picked == c.backdrop.as(gtk.Widget)) self.finishConfirm(false);
-    }
-
-    /// Answer the confirmation (buttons, Escape, backdrop, control socket).
+    /// Answer the confirmation from code (the control socket, the pane
+    /// being hidden): closing the dialog answers with its close response.
+    /// Nothing happens when none is open.
     pub fn finishConfirm(self: *Self, ok: bool) void {
-        self.finishConfirmImpl(ok, true);
+        const c = self.private().confirm orelse return;
+        c.dialog.setCloseResponse(if (ok) "delete" else "cancel");
+        _ = c.dialog.as(adw.Dialog).close();
     }
 
-    /// Cancel without taking focus (focus went elsewhere, or the pane is
-    /// being hidden).
-    fn finishConfirmNoFocus(self: *Self) void {
-        self.finishConfirmImpl(false, false);
-    }
-
-    fn finishConfirmImpl(self: *Self, ok: bool, take_focus: bool) void {
+    /// Every way of closing the dialog ends here, once (a button, Escape,
+    /// `finishConfirm`). libadwaita puts the focus back where it was when
+    /// the dialog opened; if that widget is gone (a row button of a
+    /// re-rendered listing) the pane takes it (F-52).
+    fn onConfirmResponse(_: *adw.AlertDialog, response: [*:0]const u8, self: *Self) callconv(.c) void {
         const priv = self.private();
         const c = priv.confirm orelse return;
         priv.confirm = null;
-        // Removing the focused button would move focus out of the pane.
-        if (take_focus) _ = self.as(gtk.Widget).grabFocus();
-        priv.overlay.removeOverlay(c.backdrop.as(gtk.Widget));
+        const ok = std.mem.eql(u8, std.mem.span(response), "delete");
+        _ = glib.idleAdd(confirmRefocusIdle, self.ref());
         defer {
             alloc.free(c.text);
             alloc.free(c.name);
@@ -3456,7 +3406,6 @@ pub const Browser = extern struct {
         widget.setFocusable(1);
         widget.setOverflow(.hidden);
 
-        priv.overlay = gtk.Overlay.new();
         priv.scroller = gtk.ScrolledWindow.new();
         priv.scroller.setPolicy(.automatic, .never);
         // Scrollbars take their own space, as the Electron client's do;
@@ -3479,8 +3428,7 @@ pub const Browser = extern struct {
         priv.scroller.setChild(priv.strip.as(gtk.Widget));
         naturalScroll(priv.scroller);
         scrolling.noScrollToFocus(priv.scroller);
-        priv.overlay.setChild(priv.scroller.as(gtk.Widget));
-        priv.overlay.as(gtk.Widget).setParent(widget);
+        priv.scroller.as(gtk.Widget).setParent(widget);
 
         const ec = gtk.EventControllerKey.new();
         _ = gtk.EventControllerKey.signals.key_pressed.connect(ec, *Self, onKeyPressed, self, .{});
@@ -3488,7 +3436,6 @@ pub const Browser = extern struct {
 
         const fc = gtk.EventControllerFocus.new();
         _ = gtk.EventControllerFocus.signals.enter.connect(fc, *Self, onFocusEnter, self, .{});
-        _ = gtk.EventControllerFocus.signals.leave.connect(fc, *Self, onFocusLeave, self, .{});
         widget.addController(fc.as(gtk.EventController));
 
         const sc = gtk.EventControllerScroll.new(.{ .vertical = true, .horizontal = true });
@@ -3573,6 +3520,8 @@ pub const Browser = extern struct {
         }
         if (priv.confirm) |c| {
             priv.confirm = null;
+            gobject.signalHandlerDisconnect(c.dialog.as(gobject.Object), c.response_id);
+            c.dialog.as(adw.Dialog).forceClose();
             alloc.free(c.text);
             alloc.free(c.name);
             alloc.free(c.dir);
@@ -3588,7 +3537,7 @@ pub const Browser = extern struct {
         priv.cols.clearRetainingCapacity();
         for (priv.leaving.items) |c| c.destroy();
         priv.leaving.clearRetainingCapacity();
-        priv.overlay.as(gtk.Widget).unparent();
+        priv.scroller.as(gtk.Widget).unparent();
         gobject.Object.virtual_methods.dispose.call(Class.parent, self.as(Parent));
     }
 

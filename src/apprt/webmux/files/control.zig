@@ -38,7 +38,7 @@ pub fn register() void {
         .{ .name = "files-focus", .help = "{window=false}: focus the browser from outside (F-61), or simulate the window regaining focus", .handler = &focus },
         .{ .name = "files-scroll", .help = "{dx}: a wheel gesture on the strip (cancels the horizontal easing) scrolling by dx", .handler = &scroll },
         .{ .name = "files-wait", .help = "{timeout_ms=5000, pane}: answer once the browser is idle (no render, request or animation pending)", .handler = &wait },
-        .{ .name = "files-locate", .help = "{what: row:<name> | act-rename | act-delete | download | rendered | source | link:<href> | preview-body | confirm-cancel | confirm-delete | backdrop}: centre of that thing in window coordinates (for webmux-dev/realpointer)", .handler = &locate },
+        .{ .name = "files-locate", .help = "{what: row:<name> | act-rename | act-delete | download | rendered | source | link:<href> | preview-body | confirm-cancel | confirm-delete}: centre of that thing in window coordinates (for webmux-dev/realpointer)", .handler = &locate },
         .{ .name = "files-motion", .help = "{reduce:true|false}: set GTK's gtk-enable-animations off/on (reduced motion)", .handler = &motion },
         .{ .name = "files-fit-title", .help = "{text, width}: the title fitted to a label of that width (F-15)", .handler = &fitTitle },
     };
@@ -556,6 +556,12 @@ fn isActButton(tip: []const u8, w: *gtk.Widget) bool {
     return std.mem.eql(u8, std.mem.span(t), tip);
 }
 
+fn isButtonLabelled(label: []const u8, w: *gtk.Widget) bool {
+    const b = gobject.ext.cast(gtk.Button, w) orelse return false;
+    const l = b.getLabel() orelse return false;
+    return std.mem.eql(u8, std.mem.span(l), label);
+}
+
 fn labelWithLink(href: []const u8, w: *gtk.Widget) bool {
     const l = gobject.ext.cast(gtk.Label, w) orelse return false;
     if (l.getUseMarkup() == 0) return false;
@@ -618,17 +624,16 @@ fn locate(req: *Request) void {
         // centre is returned with its bounds; the caller scans it.
         return centreIn(req, w);
     }
-    const cw = b.confirmWidgets() orelse return req.fail("unknown target {s} (or no confirmation open)", .{what});
-    if (std.mem.eql(u8, what, "confirm-cancel")) return centreIn(req, cw.cancel);
-    if (std.mem.eql(u8, what, "confirm-delete")) return centreIn(req, cw.delete);
-    if (std.mem.eql(u8, what, "backdrop")) {
-        // A point of the backdrop outside the dialog: its top-left area.
-        const root = cw.backdrop.getRoot() orelse return req.fail("not in a window", .{});
-        var bb: graphene.Rect = undefined;
-        if (cw.backdrop.computeBounds(root.as(gtk.Widget), &bb) == 0) return req.fail("not laid out", .{});
-        return req.ok(.{ .x = @as(i64, @intFromFloat(bb.f_origin.f_x + 20)), .y = @as(i64, @intFromFloat(bb.f_origin.f_y + 20)), .w = bb.f_size.f_width, .h = bb.f_size.f_height, .visible = true });
-    }
-    req.fail("unknown target {s}", .{what});
+    const cd = b.confirmDialog() orelse return req.fail("unknown target {s} (or no confirmation open)", .{what});
+    // The alert's buttons, by label (libadwaita exposes nothing else).
+    const label: []const u8 = if (std.mem.eql(u8, what, "confirm-cancel"))
+        "Cancel"
+    else if (std.mem.eql(u8, what, "confirm-delete"))
+        "Delete"
+    else
+        return req.fail("unknown target {s}", .{what});
+    const w = findWidget(cd, label, isButtonLabelled) orelse return req.fail("no {s} button in the confirmation", .{label});
+    centreIn(req, w);
 }
 
 fn motion(req: *Request) void {

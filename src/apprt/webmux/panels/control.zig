@@ -86,7 +86,6 @@ fn settingsResult(req: *Request) void {
         .persisted = settings.persisted,
         .app_scheme = @tagName(Application.default().getScheme()),
         .adw_dark = Application.default().as(@import("adw").Application).getStyleManager().getDark() != 0,
-        .css_dark = @import("style.zig").dark,
     });
 }
 
@@ -195,7 +194,7 @@ fn logDump(req: *Request) void {
         .count = std.mem.span(w.count.getText()),
         .flash = std.mem.span(w.flash.getText()),
         .file = std.mem.span(w.file.getText()),
-        .empty = if (empty_visible) std.mem.span(w.empty.getText()) else null,
+        .empty = if (empty_visible) std.mem.span(w.empty.getTitle()) else null,
         .scroll = .{ .value = adj.getValue(), .upper = adj.getUpper(), .page = adj.getPageSize() },
         .hover = w.hover_line,
         .buttons_sensitive = w.copy_visible.as(gtk.Widget).getSensitive() != 0,

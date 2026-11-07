@@ -112,7 +112,6 @@ for scheme in light dark; do
   ctl -q settings-set theme="$scheme"
   want=$([[ $scheme == light ]] && echo false || echo true)
   until_ 25 eq "$want" get settings adw_dark || fail "$scheme: libadwaita"
-  [[ "$(get settings css_dark)" == "$want" ]] || fail "$scheme: panels CSS"
   [[ "$(get settings app_scheme)" == "$scheme" ]] || fail "$scheme: terminal colours"
   tree="$(get panels-tree tree window=main depth:=1)"
   if [[ $scheme == light ]]; then [[ "$tree" == *wm-light* ]] || fail "light: chrome class"; else [[ "$tree" != *wm-light* ]] || fail "dark: chrome class"; fi

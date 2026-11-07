@@ -178,13 +178,6 @@ pub fn isInterrupted(self: *const Conn) bool {
     return self.interrupted.load(.acquire);
 }
 
-/// Half-close the write side (the peer reads EOF).
-pub fn shutdownWrite(self: *Conn) void {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    if (!self.closed) _ = sys.shutdown(self.fd, sys.SHUT.WR);
-}
-
 fn wait(self: *Conn, events: i16, deadline: Deadline) Error!void {
     while (true) {
         if (self.isInterrupted()) return error.Interrupted;
@@ -342,9 +335,13 @@ test "connect, write, read, interrupt (loopback unix socket)" {
         fn run(srv: *std.Io.net.Server, io_: std.Io) void {
             const stream = srv.accept(io_) catch return;
             defer stream.close(io_);
+            // Through the Reader interface: `Stream.read` itself does not
+            // compile on zig 0.17.0 (a std bug in its destructuring).
+            var rbuf: [64]u8 = undefined;
+            var r = stream.reader(io_, &rbuf);
             var b: [64]u8 = undefined;
             var iov = [_][]u8{&b};
-            const n = stream.read(io_, &iov) catch return;
+            const n = r.interface.readVec(&iov) catch return;
             var wbuf: [64]u8 = undefined;
             var w = stream.writer(io_, &wbuf);
             w.interface.writeAll(b[0..n]) catch return;
