@@ -11,12 +11,17 @@
 //! stops the server and deletes the directory, so no daemon outlives a test.
 //!
 //! The binary is $WEBMUX_HOST_BIN, else `host/dist/webmux-host-linux-x64`
+//! (on macOS: `webmux-host-darwin-<arch>`, built by mac/scripts/dev-host.sh)
 //! found by walking up from the current directory. If neither exists,
 //! `start` returns error.SkipZigTest.
 const TestHost = @This();
 
 const std = @import("std");
-const linux = std.os.linux;
+const builtin = @import("builtin");
+/// Raw syscalls on Linux, libc elsewhere (Darwin for the GhosttyKit build),
+/// as in Conn.zig: a Linux syscall number is an invalid syscall (SIGSYS)
+/// on Darwin.
+const sys = if (builtin.os.tag == .linux) std.os.linux else std.c;
 const Allocator = std.mem.Allocator;
 const http = @import("http.zig");
 const api = @import("api.zig");
@@ -31,6 +36,25 @@ env: std.process.Environ.Map,
 server: ?std.process.Child = null,
 
 pub fn start(alloc: Allocator, io: std.Io, environ: std.process.Environ) !*TestHost {
+    const self = try alloc.create(TestHost);
+    self.* = prepare(alloc, io, environ) catch |err| {
+        alloc.destroy(self);
+        return err;
+    };
+    // From here `self` owns bin, dir, socket_path, name and env, and
+    // `deinit` frees them (and `self`) exactly once. No errdefer at this
+    // scope: a host that fails to start (e.g. a Linux binary on macOS)
+    // used to free `env` twice.
+    self.startServer() catch |err| {
+        self.deinit();
+        return err;
+    };
+    return self;
+}
+
+/// Everything but starting the server: the directory tree, the environment
+/// and the field values. On error, whatever was made is freed.
+fn prepare(alloc: Allocator, io: std.Io, environ: std.process.Environ) !TestHost {
     const bin = try findBinary(alloc, io, environ) orelse return error.SkipZigTest;
     errdefer alloc.free(bin);
 
@@ -72,8 +96,7 @@ pub fn start(alloc: Allocator, io: std.Io, environ: std.process.Environ) !*TestH
     _ = env.swapRemove("TMUX");
     _ = env.swapRemove("TMUX_PANE");
 
-    const self = try alloc.create(TestHost);
-    self.* = .{
+    return .{
         .alloc = alloc,
         .io = io,
         .bin = bin,
@@ -82,9 +105,6 @@ pub fn start(alloc: Allocator, io: std.Io, environ: std.process.Environ) !*TestH
         .name = name,
         .env = env,
     };
-    errdefer self.deinit();
-    try self.startServer();
-    return self;
 }
 
 /// Start (or restart) the HTTP server and wait until `GET /` answers. The
@@ -115,7 +135,7 @@ pub fn startServer(self: *TestHost) !void {
 /// sockets drop; sessions keep running in the pty host).
 pub fn stopServer(self: *TestHost) void {
     if (self.server) |*child| {
-        if (child.id) |pid| _ = linux.kill(pid, linux.SIG.TERM);
+        if (child.id) |pid| _ = sys.kill(pid, sys.SIG.TERM);
         _ = child.wait(self.io) catch {};
         self.server = null;
     }
@@ -159,11 +179,19 @@ pub fn client(self: *TestHost) !http.Client {
 fn mkdir(alloc: Allocator, path: []const u8) !void {
     const z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(z);
-    switch (linux.errno(linux.mkdir(z, 0o700))) {
+    switch (sys.errno(sys.mkdir(z, 0o700))) {
         .SUCCESS => {},
         else => return error.MkdirFailed,
     }
 }
+
+/// The host binary for this machine under host/dist: the Linux x64 payload
+/// binary on Linux, the native Darwin one on macOS (dev only, built by
+/// mac/scripts/dev-host.sh; a Linux ELF cannot be executed there).
+const host_bin_name = if (builtin.os.tag.isDarwin())
+    "webmux-host-darwin-" ++ (if (builtin.cpu.arch == .aarch64) "arm64" else "x64")
+else
+    "webmux-host-linux-x64";
 
 fn findBinary(alloc: Allocator, io: std.Io, environ: std.process.Environ) !?[]u8 {
     var env = try environ.createMap(alloc);
@@ -173,7 +201,7 @@ fn findBinary(alloc: Allocator, io: std.Io, environ: std.process.Environ) !?[]u8
     defer alloc.free(cwd);
     var dir: []const u8 = cwd;
     while (true) {
-        const cand = try std.fs.path.join(alloc, &.{ dir, "host", "dist", "webmux-host-linux-x64" });
+        const cand = try std.fs.path.join(alloc, &.{ dir, "host", "dist", host_bin_name });
         if (std.Io.Dir.cwd().access(io, cand, .{})) |_| {
             return cand;
         } else |_| alloc.free(cand);

@@ -3,9 +3,12 @@
 //! read or write that is blocked on another thread return promptly with
 //! `error.Interrupted`.
 //!
-//! Linux only (raw syscalls through `std.os.linux`, so it works with or
-//! without libc). The socket is non-blocking; every wait is a `poll` bounded
-//! by the caller's deadline.
+//! On Linux this goes through raw syscalls (`std.os.linux`, so it works
+//! with or without libc); everywhere else (macOS for the GhosttyKit build)
+//! through libc (`std.c`). The socket is non-blocking; every wait is a
+//! `poll` bounded by the caller's deadline. Darwin has no `SOCK_CLOEXEC`
+//! or `MSG_NOSIGNAL`, so there the close-on-exec flag is set with fcntl and
+//! SIGPIPE is suppressed per socket with `SO_NOSIGPIPE`.
 //!
 //! Threading: one thread reads, any number of threads may write if they
 //! serialize among themselves (the WebSocket layer does), and any thread may
@@ -14,8 +17,12 @@
 const Conn = @This();
 
 const std = @import("std");
-const linux = std.os.linux;
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+
+const is_linux = builtin.os.tag == .linux;
+const sys = if (is_linux) std.os.linux else std.c;
+const E = sys.E;
 
 pub const read_buffer_size = 64 * 1024;
 
@@ -28,7 +35,8 @@ pub const ConnectError = error{
     /// Nothing is listening on the path (or its backlog is full).
     ConnectionRefused,
     AccessDenied,
-    /// Unix socket paths are limited to 107 bytes plus the terminator.
+    /// Unix socket paths are limited to 107 bytes plus the terminator
+    /// (103 on Darwin).
     NameTooLong,
     SystemResources,
     OutOfMemory,
@@ -51,7 +59,7 @@ pub const Error = error{
 
 io: std.Io,
 alloc: Allocator,
-fd: linux.fd_t,
+fd: std.posix.fd_t,
 
 /// Guards `closed` against a concurrent `interrupt`, so `interrupt` never
 /// touches an fd number that has been closed (and possibly reused).
@@ -63,10 +71,21 @@ rbuf: []u8,
 rstart: usize = 0,
 rend: usize = 0,
 
+/// The result of a system call: its errno (SUCCESS when it worked) and its
+/// return value as a signed integer. Linux syscalls return a usize that
+/// encodes the error; libc returns -1 and sets errno. Both go through here.
+const Rc = struct { err: E, val: isize };
+
+fn check(r: anytype) Rc {
+    const err = sys.errno(r);
+    const val: isize = if (is_linux) @bitCast(r) else @intCast(r);
+    return .{ .err = err, .val = val };
+}
+
 /// Monotonic clock in nanoseconds.
 pub fn now() i64 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    var ts: sys.timespec = undefined;
+    _ = sys.clock_gettime(.MONOTONIC, &ts);
     return @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 
@@ -77,22 +96,35 @@ pub fn deadlineIn(ms: ?u32) Deadline {
 }
 
 pub fn connect(alloc: Allocator, io: std.Io, path: []const u8) ConnectError!Conn {
-    var addr: linux.sockaddr.un = .{ .path = @splat(0) };
+    var addr: sys.sockaddr.un = .{ .path = @splat(0) };
     if (path.len >= addr.path.len) return error.NameTooLong;
     @memcpy(addr.path[0..path.len], path);
 
-    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-    switch (linux.errno(rc)) {
+    const sr = check(if (is_linux)
+        sys.socket(sys.AF.UNIX, sys.SOCK.STREAM | sys.SOCK.CLOEXEC, 0)
+    else
+        sys.socket(sys.AF.UNIX, sys.SOCK.STREAM, 0));
+    switch (sr.err) {
         .SUCCESS => {},
         .MFILE, .NFILE, .NOBUFS, .NOMEM => return error.SystemResources,
         else => return error.Unexpected,
     }
-    const fd: linux.fd_t = @intCast(rc);
-    errdefer _ = linux.close(fd);
+    const fd: std.posix.fd_t = @intCast(sr.val);
+    errdefer _ = sys.close(fd);
+
+    if (!is_linux) {
+        // No SOCK_CLOEXEC and no MSG_NOSIGNAL on Darwin: set the flag on
+        // the descriptor and suppress SIGPIPE on this socket instead.
+        if (check(sys.fcntl(fd, sys.F.SETFD, @as(c_int, sys.FD_CLOEXEC))).err != .SUCCESS)
+            return error.Unexpected;
+        const one: c_int = 1;
+        if (check(sys.setsockopt(fd, sys.SOL.SOCKET, sys.SO.NOSIGPIPE, &one, @sizeOf(c_int))).err != .SUCCESS)
+            return error.Unexpected;
+    }
 
     while (true) {
-        const crc = linux.connect(fd, &addr, @sizeOf(linux.sockaddr.un));
-        switch (linux.errno(crc)) {
+        const cr = check(sys.connect(fd, @ptrCast(&addr), @sizeOf(sys.sockaddr.un)));
+        switch (cr.err) {
             .SUCCESS => break,
             .INTR => continue,
             .NOENT, .NOTDIR => return error.FileNotFound,
@@ -104,11 +136,15 @@ pub fn connect(alloc: Allocator, io: std.Io, path: []const u8) ConnectError!Conn
     }
 
     // Non-blocking from here on: every wait goes through poll().
-    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
-    if (linux.errno(flags) != .SUCCESS) return error.Unexpected;
-    const nonblock: usize = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
-    if (linux.errno(linux.fcntl(fd, linux.F.SETFL, flags | nonblock)) != .SUCCESS)
-        return error.Unexpected;
+    const fr = check(sys.fcntl(fd, sys.F.GETFL, @as(c_int, 0)));
+    if (fr.err != .SUCCESS) return error.Unexpected;
+    const nonblock: u32 = @bitCast(sys.O{ .NONBLOCK = true });
+    const flags: u32 = @intCast(fr.val);
+    const set = if (is_linux)
+        sys.fcntl(fd, sys.F.SETFL, @as(usize, flags | nonblock))
+    else
+        sys.fcntl(fd, sys.F.SETFL, @as(c_int, @intCast(flags | nonblock)));
+    if (check(set).err != .SUCCESS) return error.Unexpected;
 
     const rbuf = try alloc.alloc(u8, read_buffer_size);
     return .{ .io = io, .alloc = alloc, .fd = fd, .rbuf = rbuf };
@@ -121,7 +157,7 @@ pub fn close(self: *Conn) void {
     self.mutex.lockUncancelable(self.io);
     if (!self.closed) {
         self.closed = true;
-        _ = linux.close(self.fd);
+        _ = sys.close(self.fd);
     }
     self.mutex.unlock(self.io);
     self.alloc.free(self.rbuf);
@@ -135,7 +171,7 @@ pub fn interrupt(self: *Conn) void {
     self.interrupted.store(true, .release);
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
-    if (!self.closed) _ = linux.shutdown(self.fd, linux.SHUT.RDWR);
+    if (!self.closed) _ = sys.shutdown(self.fd, sys.SHUT.RDWR);
 }
 
 pub fn isInterrupted(self: *const Conn) bool {
@@ -146,7 +182,7 @@ pub fn isInterrupted(self: *const Conn) bool {
 pub fn shutdownWrite(self: *Conn) void {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
-    if (!self.closed) _ = linux.shutdown(self.fd, linux.SHUT.WR);
+    if (!self.closed) _ = sys.shutdown(self.fd, sys.SHUT.WR);
 }
 
 fn wait(self: *Conn, events: i16, deadline: Deadline) Error!void {
@@ -158,14 +194,14 @@ fn wait(self: *Conn, events: i16, deadline: Deadline) Error!void {
             if (left <= 0) return error.Timeout;
             timeout_ms = @intCast(@min(std.math.maxInt(i32), @divFloor(left + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
         }
-        var pfd = [_]linux.pollfd{.{ .fd = self.fd, .events = events, .revents = 0 }};
-        const rc = linux.poll(&pfd, 1, timeout_ms);
-        switch (linux.errno(rc)) {
+        var pfd = [_]sys.pollfd{.{ .fd = self.fd, .events = events, .revents = 0 }};
+        const pr = check(sys.poll(&pfd, 1, timeout_ms));
+        switch (pr.err) {
             .SUCCESS => {},
             .INTR => continue,
             else => return error.Unexpected,
         }
-        if (rc == 0) continue; // re-check the deadline
+        if (pr.val == 0) continue; // re-check the deadline
         if (self.isInterrupted()) return error.Interrupted;
         return; // ready, or HUP/ERR: the following syscall reports it
     }
@@ -174,12 +210,12 @@ fn wait(self: *Conn, events: i16, deadline: Deadline) Error!void {
 /// Read straight from the socket (bypassing the buffer). 0 means EOF.
 fn rawRead(self: *Conn, buf: []u8, deadline: Deadline) Error!usize {
     while (true) {
-        try self.wait(linux.POLL.IN, deadline);
-        const rc = linux.read(self.fd, buf.ptr, buf.len);
-        switch (linux.errno(rc)) {
+        try self.wait(sys.POLL.IN, deadline);
+        const rr = check(sys.read(self.fd, buf.ptr, buf.len));
+        switch (rr.err) {
             .SUCCESS => {
-                if (rc == 0 and self.isInterrupted()) return error.Interrupted;
-                return rc;
+                if (rr.val == 0 and self.isInterrupted()) return error.Interrupted;
+                return @intCast(rr.val);
             },
             .INTR, .AGAIN => continue,
             .CONNRESET => return if (self.isInterrupted()) error.Interrupted else error.ConnectionReset,
@@ -195,11 +231,14 @@ pub fn writeAll(self: *Conn, bytes: []const u8, deadline: Deadline) Error!void {
     while (off < bytes.len) {
         if (self.isInterrupted()) return error.Interrupted;
         const rest = bytes[off..];
-        const rc = linux.sendto(self.fd, rest.ptr, rest.len, linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT, null, 0);
-        switch (linux.errno(rc)) {
-            .SUCCESS => off += rc,
+        const sr = check(if (is_linux)
+            sys.sendto(self.fd, rest.ptr, rest.len, sys.MSG.NOSIGNAL | sys.MSG.DONTWAIT, null, 0)
+        else
+            sys.send(self.fd, rest.ptr, rest.len, sys.MSG.DONTWAIT));
+        switch (sr.err) {
+            .SUCCESS => off += @intCast(sr.val),
             .INTR => {},
-            .AGAIN => try self.wait(linux.POLL.OUT, deadline),
+            .AGAIN => try self.wait(sys.POLL.OUT, deadline),
             .PIPE => return if (self.isInterrupted()) error.Interrupted else error.BrokenPipe,
             .CONNRESET => return if (self.isInterrupted()) error.Interrupted else error.ConnectionReset,
             else => return error.Unexpected,
@@ -283,4 +322,77 @@ pub fn readLine(self: *Conn, max: usize, deadline: Deadline) Error!?[]const u8 {
         // fill() may have compacted the buffer: rescan from where we were.
         scanned = before;
     }
+}
+
+test "connect, write, read, interrupt (loopback unix socket)" {
+    // A tiny echo peer on a listening unix socket, through std.Io.net, so
+    // the test runs on Linux and Darwin alike.
+    const testing = std.testing;
+    const io = testing.io;
+    var buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "/tmp/wm-conn-{x}.sock", .{testing.random_seed});
+    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+
+    const addr = try std.Io.net.UnixAddress.init(path);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+
+    const Peer = struct {
+        fn run(srv: *std.Io.net.Server, io_: std.Io) void {
+            const stream = srv.accept(io_) catch return;
+            defer stream.close(io_);
+            var b: [64]u8 = undefined;
+            var iov = [_][]u8{&b};
+            const n = stream.read(io_, &iov) catch return;
+            var wbuf: [64]u8 = undefined;
+            var w = stream.writer(io_, &wbuf);
+            w.interface.writeAll(b[0..n]) catch return;
+            w.interface.flush() catch return;
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Peer.run, .{ &server, io });
+
+    var c = try Conn.connect(testing.allocator, io, path);
+    defer c.close();
+    try c.writeAll("hello\n", deadlineIn(2000));
+    const line = (try c.readLine(64, deadlineIn(2000))) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("hello", line);
+    t.join();
+
+    // The peer has closed: a read returns EOF (0), and after interrupt()
+    // every operation fails with Interrupted.
+    var out: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try c.readSome(&out, deadlineIn(2000)));
+    c.interrupt();
+    try testing.expectError(error.Interrupted, c.readSome(&out, deadlineIn(2000)));
+    try testing.expectError(error.Interrupted, c.writeAll("x", deadlineIn(2000)));
+}
+
+test "deadline: a read with nothing to read times out" {
+    const testing = std.testing;
+    const io = testing.io;
+    var buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "/tmp/wm-conn-t-{x}.sock", .{testing.random_seed});
+    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    const addr = try std.Io.net.UnixAddress.init(path);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+
+    var c = try Conn.connect(testing.allocator, io, path);
+    defer c.close();
+    var out: [8]u8 = undefined;
+    const t0 = now();
+    try testing.expectError(error.Timeout, c.readSome(&out, deadlineIn(50)));
+    try testing.expect(now() - t0 >= 40 * std.time.ns_per_ms);
+}
+
+test "connect errors" {
+    const testing = std.testing;
+    try testing.expectError(error.FileNotFound, Conn.connect(testing.allocator, testing.io, "/tmp/wm-conn-does-not-exist.sock"));
+    var long: [205]u8 = undefined;
+    @memset(&long, 'x');
+    @memcpy(long[0..5], "/tmp/");
+    try testing.expectError(error.NameTooLong, Conn.connect(testing.allocator, testing.io, &long));
 }

@@ -16,6 +16,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -458,6 +459,99 @@ pub const Surface = struct {
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
 
+    /// webmux: the embedder's event callback and its userdata, from the
+    /// options. Null for a stock local-pty surface. The backend calls the
+    /// trampoline (`webmuxEvent`) on its reader thread until the core
+    /// surface's IO thread stops in `deinit`; this struct is heap-allocated
+    /// by `App.newSurface`, so its address is a stable sink userdata.
+    webmux_userdata: ?*anyopaque = null,
+    webmux_event_cb: ?WebmuxEventCb = null,
+
+    /// webmux: the option strings, borrowed from the caller and only valid
+    /// while `init` runs (the core calls `termioBackend` from inside
+    /// `core_surface.init`, which copies them). Cleared afterwards.
+    webmux_init: struct {
+        socket_path: ?[*:0]const u8 = null,
+        session_id: ?[*:0]const u8 = null,
+    } = .{},
+
+    /// webmux: links are looked up and highlighted under the pointer while
+    /// the program has mouse reporting on, as xterm.js does (see
+    /// `mouseLinksActive` in the core). The core never opens such a link
+    /// itself when the click is reported to the program; the embedder
+    /// opens it (it receives the URL through the `mouse_over_link` action).
+    pub const links_while_mouse_reporting = true;
+
+    /// C type: ghostty_webmux_event_cb
+    pub const WebmuxEventCb = *const fn (?*anyopaque, *const WebmuxEvent) callconv(.c) void;
+
+    /// C type: ghostty_webmux_event_tag_e
+    pub const WebmuxEventTag = enum(c_int) {
+        link_up,
+        link_down,
+        snapshot,
+        title,
+        session_title,
+        exit,
+        session_error,
+        paste_result,
+        open_url,
+        socket,
+    };
+
+    /// C type: ghostty_webmux_socket_kind_e
+    pub const WebmuxSocketKind = enum(c_int) {
+        connecting,
+        reconnecting,
+        open,
+        reopened,
+        snapshot,
+        closed,
+        dropped,
+        connect_failed,
+    };
+
+    /// C type: ghostty_webmux_frame_e
+    pub const WebmuxFrameKind = enum(c_int) {
+        paste_image,
+        clipboard_sync,
+    };
+
+    /// C type: ghostty_webmux_event_s. The flattened form of
+    /// termio.Webmux.Event; which fields are meaningful depends on `tag`
+    /// (documented per tag in include/ghostty.h). `text`/`aux` point into
+    /// the backend's buffers and are valid only during the callback.
+    pub const WebmuxEvent = extern struct {
+        tag: WebmuxEventTag,
+        cols: u16 = 0,
+        rows: u16 = 0,
+        remote_cols: u16 = 0,
+        remote_rows: u16 = 0,
+        bytes: usize = 0,
+        pid: i64 = -1,
+        code: i64 = 0,
+        socket_kind: WebmuxSocketKind = .connecting,
+        attempt: u32 = 0,
+        ms: i64 = 0,
+        clean: bool = false,
+        retry_in_ms: u32 = 0,
+        text: ?[*]const u8 = null,
+        text_len: usize = 0,
+        aux: ?[*]const u8 = null,
+        aux_len: usize = 0,
+
+        fn setText(self: *WebmuxEvent, v: []const u8) void {
+            self.text = v.ptr;
+            self.text_len = v.len;
+        }
+
+        fn setAux(self: *WebmuxEvent, v: ?[]const u8) void {
+            const s = v orelse return;
+            self.aux = s.ptr;
+            self.aux_len = s.len;
+        }
+    };
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -499,6 +593,16 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// webmux: attach this surface to a webmux session (socket path =
+        /// the host's HTTP unix socket) instead of a local pty. Null keeps
+        /// stock behaviour. Appended last so the stock fields' offsets do
+        /// not move. The strings only need to live until ghostty_surface_new
+        /// returns.
+        webmux_socket_path: ?[*:0]const u8 = null,
+        webmux_session_id: ?[*:0]const u8 = null,
+        webmux_userdata: ?*anyopaque = null,
+        webmux_event_cb: ?WebmuxEventCb = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -513,7 +617,15 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .webmux_userdata = opts.webmux_userdata,
+            .webmux_event_cb = opts.webmux_event_cb,
+            .webmux_init = .{
+                .socket_path = opts.webmux_socket_path,
+                .session_id = opts.webmux_session_id,
+            },
         };
+        // The option strings are borrowed: forget them once init is over.
+        defer self.webmux_init = .{};
 
         // Add ourselves to the list of surfaces on the app.
         try app.core_app.addSurface(self);
@@ -629,6 +741,98 @@ pub const Surface = struct {
             font_size.points = opts.font_size;
             try self.core_surface.setFontSize(font_size);
         }
+    }
+
+    /// The termio backend seam (src/termio/Webmux.zig): called by the core
+    /// from inside `core_surface.init`. A surface created with
+    /// `webmux_socket_path` attaches to that webmux session; any other
+    /// surface gets the stock local pty (termio.Exec).
+    pub fn termioBackend(self: *Surface) !?termio.Webmux.Config {
+        const path = self.webmux_init.socket_path orelse return null;
+        const session = self.webmux_init.session_id orelse {
+            log.err("webmux_socket_path set without webmux_session_id", .{});
+            return error.WebmuxSessionIdRequired;
+        };
+        return .{
+            .socket_path = std.mem.sliceTo(path, 0),
+            .session_id = std.mem.sliceTo(session, 0),
+            .events = .{ .userdata = self, .callback = webmuxEvent },
+        };
+    }
+
+    /// termio.Webmux.EventSink callback: flatten the event into the C
+    /// struct and hand it to the embedder. Runs on the backend's reader
+    /// thread; the embedder must copy the strings and not block.
+    fn webmuxEvent(ud: ?*anyopaque, ev: *const termio.Webmux.Event) void {
+        const self: *Surface = @ptrCast(@alignCast(ud orelse return));
+        const cb = self.webmux_event_cb orelse return;
+        var c: WebmuxEvent = switch (ev.*) {
+            .link_up => .{ .tag = .link_up },
+            .link_down => .{ .tag = .link_down },
+            .snapshot_applied => |v| .{
+                .tag = .snapshot,
+                .cols = v.cols,
+                .rows = v.rows,
+                .remote_cols = v.remote_cols,
+                .remote_rows = v.remote_rows,
+                .bytes = v.bytes,
+                .pid = v.pid orelse -1,
+                .ms = v.ms,
+            },
+            .title => |title| t: {
+                var e: WebmuxEvent = .{ .tag = .title };
+                e.setText(title);
+                break :t e;
+            },
+            .session_title => |v| t: {
+                var e: WebmuxEvent = .{ .tag = .session_title };
+                e.setText(v.title);
+                e.setAux(v.session);
+                break :t e;
+            },
+            .exit => |v| .{ .tag = .exit, .code = v.code },
+            .session_error => |v| t: {
+                var e: WebmuxEvent = .{ .tag = .session_error };
+                e.setText(v.message);
+                break :t e;
+            },
+            .paste_result => |v| t: {
+                var e: WebmuxEvent = .{ .tag = .paste_result };
+                e.setText(v.mode);
+                e.setAux(v.path);
+                break :t e;
+            },
+            .open_url => |v| t: {
+                var e: WebmuxEvent = .{ .tag = .open_url };
+                e.setText(v.url);
+                e.setAux(v.id);
+                break :t e;
+            },
+            .socket => |v| t: {
+                var e: WebmuxEvent = .{
+                    .tag = .socket,
+                    .socket_kind = switch (v.kind) {
+                        .connecting => .connecting,
+                        .reconnecting => .reconnecting,
+                        .open => .open,
+                        .reopened => .reopened,
+                        .snapshot => .snapshot,
+                        .closed => .closed,
+                        .dropped => .dropped,
+                        .connect_failed => .connect_failed,
+                    },
+                    .attempt = v.attempt,
+                    .ms = v.ms,
+                    .code = v.code,
+                    .clean = v.clean,
+                    .retry_in_ms = v.retry_in_ms,
+                    .bytes = v.bytes,
+                };
+                e.setText(v.reason);
+                break :t e;
+            },
+        };
+        cb(self.webmux_userdata, &c);
     }
 
     pub fn deinit(self: *Surface) void {
@@ -1868,6 +2072,33 @@ pub const CAPI = struct {
     /// Returns the app associated with a surface.
     export fn ghostty_surface_app(surface: *Surface) *App {
         return surface.app;
+    }
+
+    /// webmux: true if the surface was created with a webmux session
+    /// (its termio backend is the network backend, not a local pty).
+    export fn ghostty_surface_webmux_attached(surface: *Surface) bool {
+        return surface.core_surface.io.backend == .webmux;
+    }
+
+    /// webmux: queue a side-channel frame (paste-image or clipboard-sync)
+    /// on the surface's webmux backend. `data` is base64. Thread-safe,
+    /// never blocks on the socket; copies its input. Returns false when
+    /// the surface is not a webmux surface or no socket is open (the frame
+    /// is dropped, as the Electron client does).
+    export fn ghostty_surface_webmux_send(
+        surface: *Surface,
+        kind: Surface.WebmuxFrameKind,
+        mime: [*:0]const u8,
+        data: [*:0]const u8,
+    ) bool {
+        if (surface.core_surface.io.backend != .webmux) return false;
+        const webmux = &surface.core_surface.io.backend.webmux;
+        const mime_s = std.mem.sliceTo(mime, 0);
+        const data_s = std.mem.sliceTo(data, 0);
+        return switch (kind) {
+            .paste_image => webmux.send(.{ .paste_image = .{ .mime = mime_s, .data = data_s } }),
+            .clipboard_sync => webmux.send(.{ .clipboard_sync = .{ .mime = mime_s, .data = data_s } }),
+        };
     }
 
     /// Returns the config to use for surfaces that inherit from this one.

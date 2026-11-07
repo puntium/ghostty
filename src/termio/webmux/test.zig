@@ -506,7 +506,8 @@ test "webmux: titles, invalid UTF-8 input, session exit" {
     try t.expectEqualStrings("my-title", s.lastEvent(.session_title).?.text);
 
     // A byte that is not UTF-8 arrives as U+FFFD.
-    c.input("echo X\xffY | od -An -tx1\r");
+    // tr squeezes BSD od's column padding (macOS) to GNU od's single spaces.
+    c.input("echo X\xffY | od -An -tx1 | tr -s ' '\r");
     try s.waitText("58 ef bf bd 59", 5000);
 
     c.input("exit 3\r");

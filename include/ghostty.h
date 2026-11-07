@@ -521,6 +521,48 @@ typedef enum {
   GHOSTTY_SURFACE_CONTEXT_SPLIT = 2,
 } ghostty_surface_context_e;
 
+// webmux: events from a surface's webmux termio backend (src/termio/Webmux.zig,
+// mirrors termio/webmux/Client.zig `Event`). Delivered through
+// ghostty_webmux_event_cb on the backend's reader thread; strings are valid
+// only during the callback (copy them and hop to the main queue).
+typedef enum {
+  GHOSTTY_WEBMUX_EVENT_LINK_UP,
+  GHOSTTY_WEBMUX_EVENT_LINK_DOWN,
+  GHOSTTY_WEBMUX_EVENT_SNAPSHOT,        // cols, rows, remote_cols, remote_rows, bytes, pid
+  GHOSTTY_WEBMUX_EVENT_TITLE,           // text = title (may be empty)
+  GHOSTTY_WEBMUX_EVENT_SESSION_TITLE,   // aux = session id, text = title
+  GHOSTTY_WEBMUX_EVENT_EXIT,            // code
+  GHOSTTY_WEBMUX_EVENT_SESSION_ERROR,   // text = message
+  GHOSTTY_WEBMUX_EVENT_PASTE_RESULT,    // text = mode ("claude"|"path"), aux = path or NULL
+  GHOSTTY_WEBMUX_EVENT_OPEN_URL,        // text = url, aux = id
+  GHOSTTY_WEBMUX_EVENT_SOCKET,          // socket lifecycle for the connection log: socket_kind, attempt, ms, code, text = reason, clean, retry_in_ms, bytes
+} ghostty_webmux_event_tag_e;
+
+typedef enum {
+  GHOSTTY_WEBMUX_SOCKET_CONNECTING, GHOSTTY_WEBMUX_SOCKET_RECONNECTING, GHOSTTY_WEBMUX_SOCKET_OPEN,
+  GHOSTTY_WEBMUX_SOCKET_REOPENED, GHOSTTY_WEBMUX_SOCKET_SNAPSHOT, GHOSTTY_WEBMUX_SOCKET_CLOSED,
+  GHOSTTY_WEBMUX_SOCKET_DROPPED, GHOSTTY_WEBMUX_SOCKET_CONNECT_FAILED,
+} ghostty_webmux_socket_kind_e;
+
+typedef struct {
+  ghostty_webmux_event_tag_e tag;
+  uint16_t cols, rows, remote_cols, remote_rows;
+  size_t bytes;
+  int64_t pid;        // -1 when unknown
+  int64_t code;       // exit code, or WebSocket close code for SOCKET
+  ghostty_webmux_socket_kind_e socket_kind;
+  uint32_t attempt;
+  int64_t ms;
+  bool clean;
+  uint32_t retry_in_ms;
+  const char* GHOSTTY_NULLABLE text; size_t text_len;   // valid only during the callback; NULL when absent
+  const char* GHOSTTY_NULLABLE aux;  size_t aux_len;
+} ghostty_webmux_event_s;
+
+typedef void (*ghostty_webmux_event_cb)(void* GHOSTTY_NULLABLE userdata, const ghostty_webmux_event_s* event);
+
+typedef enum { GHOSTTY_WEBMUX_FRAME_PASTE_IMAGE, GHOSTTY_WEBMUX_FRAME_CLIPBOARD_SYNC } ghostty_webmux_frame_e;
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -534,6 +576,12 @@ typedef struct {
   const char* GHOSTTY_NULLABLE initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+  // webmux: attach the surface to a webmux session instead of a local pty.
+  // Appended at the end so the stock fields keep their offsets.
+  const char* GHOSTTY_NULLABLE webmux_socket_path;   // host HTTP unix socket; NULL = stock local pty
+  const char* GHOSTTY_NULLABLE webmux_session_id;
+  void* GHOSTTY_NULLABLE webmux_userdata;
+  ghostty_webmux_event_cb GHOSTTY_NULLABLE webmux_event_cb;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1207,6 +1255,10 @@ GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
 GHOSTTY_API void* GHOSTTY_NULLABLE ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
+// webmux: queue a side-channel frame on the surface's webmux backend. mime e.g. "image/png", data base64.
+// Returns false if the surface is not a webmux surface or no socket is open (the frame is dropped).
+GHOSTTY_API bool ghostty_surface_webmux_send(ghostty_surface_t, ghostty_webmux_frame_e, const char* mime, const char* data);
+GHOSTTY_API bool ghostty_surface_webmux_attached(ghostty_surface_t);  // true if the surface was created with a webmux session
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);

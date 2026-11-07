@@ -87,6 +87,8 @@ Every change to a pre-existing Ghostty file. Keep this list complete.
 | `src/Surface.zig` `init` | one `@hasDecl(apprt.runtime.Surface, "termioBackend")` call; `io_exec` → `io_backend`, which is `Webmux.init` when the apprt returned a config and the unchanged `Exec.init` otherwise (+17/−5) | the backend seam: an apprt that does not declare `termioBackend` gets stock behaviour |
 | `src/Surface.zig` `childExitedAbnormally` | `.webmux => &.{"webmux"}` switch arm | exhaustiveness only; never reached |
 | `.gitignore` | `zig-out-release/` | the release build's output directory (`make linux-client` in the webmux repo) |
+| `src/apprt/embedded.zig` | `Surface.Options` gains four trailing fields (`webmux_socket_path`, `webmux_session_id`, `webmux_userdata`, `webmux_event_cb`); `Surface` declares `termioBackend()` (a `termio.Webmux.Config` when the socket path is set, else null), `links_while_mouse_reporting = true`, the C mirror types of the event (`WebmuxEvent`, `WebmuxEventTag`, `WebmuxSocketKind`, `WebmuxFrameKind`, `WebmuxEventCb`) and the trampoline that flattens `termio.Webmux.Event` into the C struct; `CAPI` exports `ghostty_surface_webmux_send` and `ghostty_surface_webmux_attached` (+231) | the same seam as the GTK shell, for the native macOS client built on GhosttyKit (see § macOS: GhosttyKit) |
+| `include/ghostty.h` | `ghostty_webmux_event_tag_e`, `ghostty_webmux_socket_kind_e`, `ghostty_webmux_event_s`, `ghostty_webmux_event_cb`, `ghostty_webmux_frame_e`; the four fields appended to `ghostty_surface_config_s`; `ghostty_surface_webmux_send`, `ghostty_surface_webmux_attached` in the Published API (+52) | the C side of the embedded seam; the stock fields keep their offsets |
 
 Not edited: `flake.nix` (tools come from the pinned nixpkgs via
 `--inputs-from .`), `SharedDeps.zig`, `GhosttyI18n.zig`.
@@ -94,6 +96,63 @@ Not edited: `flake.nix` (tools come from the pinned nixpkgs via
 The network backend is documented at the top of `src/termio/Webmux.zig`
 (config, events, `send`, behaviour); its protocol core and tests are in
 `src/termio/webmux/`, the client library in `src/webmux/net/`.
+
+## macOS: GhosttyKit
+
+The native macOS client (`mac/` in the webmux repo, docs/macos-client.md
+there) does not use the GTK shell or `src/webmux/`. It links
+`GhosttyKit.xcframework`, Ghostty's own embedding library
+(`src/apprt/embedded.zig`, `include/ghostty.h`), built from this fork so the
+webmux termio backend (`src/termio/Webmux.zig`, always compiled in) is in
+the library. The seam is the pair of upstream edits listed above:
+
+- `ghostty_surface_config_s` ends with `webmux_socket_path` (the host's
+  HTTP unix socket; `NULL` = stock local pty), `webmux_session_id`,
+  `webmux_userdata` and `webmux_event_cb`. The strings are borrowed and only
+  need to live until `ghostty_surface_new` returns (the core copies them in
+  `termioBackend`). A surface created without them is stock Ghostty.
+- `ghostty_webmux_event_cb(userdata, const ghostty_webmux_event_s*)` is the
+  flattened `termio.Webmux.Event`: `tag` picks the variant; `text`/`aux`
+  carry the strings (`text` = title / message / mode / url / reason, `aux` =
+  session id / path / url id; `NULL` when absent, `text_len`/`aux_len` are
+  byte lengths), `cols`…`pid` the snapshot, `code` the exit code or the
+  WebSocket close code, `socket_kind`/`attempt`/`ms`/`clean`/`retry_in_ms`/
+  `bytes` the socket-log event. It runs on the backend's reader thread and
+  the strings are valid only during the call: copy and hop to the main
+  queue, never block (closing the surface joins that thread).
+- `ghostty_surface_webmux_send(surface, GHOSTTY_WEBMUX_FRAME_PASTE_IMAGE |
+  GHOSTTY_WEBMUX_FRAME_CLIPBOARD_SYNC, mime, base64)` queues a side-channel
+  frame; false when the surface is not a webmux surface or no socket is
+  open (dropped). `ghostty_surface_webmux_attached(surface)` tells the two
+  kinds of surface apart.
+- The embedded `Surface` declares `links_while_mouse_reporting = true`, as
+  the GTK shell does; the Mac shell opens the link itself on a click that
+  is reported to the program (the core only reports it through the
+  `mouse_over_link` action).
+
+Build (Homebrew zig 0.17.x, Xcode with the Metal toolchain, no nix):
+
+    zig build -Demit-xcframework=true -Demit-macos-app=false \
+      -Dxcframework-target=native -Doptimize=ReleaseFast -Dsentry=false -Di18n=false
+
+Output `macos/GhosttyKit.xcframework` (arm64 only, `libghostty-internal.a`
+plus `Headers/ghostty.h`); `mac/scripts/build-ghosttykit.sh` in the webmux
+repo (`make mac-ghosttykit`) runs this and copies it to
+`mac/GhosttyKit.xcframework`. About two minutes from cold on an M-series Mac.
+`src/webmux/net/Conn.zig` (ours, not an upstream edit) goes through libc on
+non-Linux targets so the backend builds on Darwin: no `SOCK_CLOEXEC` or
+`MSG_NOSIGNAL` there, so `FD_CLOEXEC` via fcntl and `SO_NOSIGPIPE` instead;
+Linux keeps the raw syscalls. Its tests (`zig test src/webmux/net/Conn.zig`)
+run on both. The same shim is in `src/webmux/net/testhost.zig`, which on
+macOS also looks for `host/dist/webmux-host-darwin-<arch>` (the dev-only
+native host from `mac/scripts/dev-host.sh`) instead of the Linux payload
+binary, so the live tests run there too:
+
+    zig build test -Dtest-filter=webmux -Dsentry=false -Di18n=false
+
+(no nix, no `-Dwebmux`: the GTK shell is not built on macOS). All webmux
+tests, live ones included, pass on this Mac; `WEBMUX_HOST_BIN=…` overrides
+the lookup as on Linux.
 
 ## Directory map
 
