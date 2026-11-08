@@ -51,6 +51,7 @@ const anim = @import("anim.zig");
 const Box = anim.Box;
 const Flight = anim.Flight;
 const geometry = @import("geometry.zig");
+const minimap_mod = @import("minimap.zig");
 const Geometry = geometry.Geometry;
 const store = @import("store.zig");
 const sessions = @import("sessions.zig");
@@ -328,6 +329,8 @@ pub const Workspace = extern struct {
         .setFront = vtSetFront,
         .grabFocus = vtGrabFocus,
         .reload = vtReload,
+        .minimap = vtMinimap,
+        .focusPane = vtFocusPane,
     };
 
     fn fromCtx(ctx: *anyopaque) *Self {
@@ -342,6 +345,37 @@ pub const Workspace = extern struct {
     }
     fn vtReload(ctx: *anyopaque) void {
         fromCtx(ctx).reload();
+    }
+    fn vtMinimap(ctx: *anyopaque, gpa: Allocator, height: f64, max_width: f64) Allocator.Error!iface.Minimap {
+        return fromCtx(ctx).minimap(gpa, height, max_width);
+    }
+    fn vtFocusPane(ctx: *anyopaque, id: []const u8) void {
+        const self = fromCtx(ctx);
+        if (self.itemById(id) == null) return;
+        self.setFocus(id, true);
+    }
+
+    /// iface: the pane map for the host pill (deviation 73). A workspace
+    /// that was never allocated (its host has not been in front) is mapped
+    /// at the last known or a typical window size; the map is not to scale
+    /// anyway.
+    pub fn minimap(self: *Self, gpa: Allocator, height: f64, max_width: f64) Allocator.Error!iface.Minimap {
+        const priv = self.private();
+        if (!priv.loaded or priv.model.columns.items.len == 0) return .empty;
+        if (priv.geom) |*g| return minimap_mod.compute(gpa, priv.model.columns.items, priv.model.focusedId(), g, priv.scroll, height, max_width);
+        const s = geometry.settingsOf(priv.settings.min_cols, priv.settings.max_cols);
+        const vw: f64 = if (priv.vw > 0) @floatFromInt(priv.vw) else 1400;
+        const vh: f64 = if (priv.vh > 0) @floatFromInt(priv.vh) else 900;
+        var g = try geometry.compute(alloc, priv.model.columns.items, vw, vh, priv.cell_px, s);
+        defer g.deinit(alloc);
+        return minimap_mod.compute(gpa, priv.model.columns.items, priv.model.focusedId(), &g, 0, height, max_width);
+    }
+
+    /// The minimap would look different: tell the chrome (coalesced by it).
+    fn noteViewport(self: *Self) void {
+        const priv = self.private();
+        if (priv.disposed) return;
+        priv.host.viewportChanged();
     }
 
     pub fn setFront(self: *Self, front: bool) void {
@@ -753,6 +787,8 @@ pub const Workspace = extern struct {
         return @as(f64, @floatFromInt(@min(self.private().settings.unfocused_fade, 100))) / 100;
     }
 
+    /// Ring and fade follow the model's focus. Every focus change passes
+    /// here (clicks, commands, loads), so the minimap is told here too.
     fn updateFocusClasses(self: *Self) void {
         const priv = self.private();
         const f = priv.model.focusedId();
@@ -762,6 +798,7 @@ pub const Workspace = extern struct {
             const is = f != null and std.mem.eql(u8, f.?, it.id);
             it.frame.setFocused(is, k, instant);
         }
+        self.noteViewport();
     }
 
     // Called by PaneFrame's gestures (and the control socket, which enters
@@ -1195,7 +1232,7 @@ pub const Workspace = extern struct {
             var v = gobject.ext.Value.new(gtk.ReducedMotion);
             defer v.unset();
             obj.getProperty("gtk-interface-reduced-motion", &v);
-            if (v.getEnum() == @intFromEnum(gtk.ReducedMotion.reduce)) return true;
+            if (v.getEnum() == @backingInt(gtk.ReducedMotion.reduce)) return true;
         }
         return false;
     }
@@ -1219,6 +1256,7 @@ pub const Workspace = extern struct {
             priv.scroll = step.pos;
             if (step.done) self.endChaseIn(true);
             w.queueAllocate();
+            self.noteViewport();
         }
         if (priv.anim == null and priv.chase == null) {
             priv.tick_id = 0;
@@ -1287,6 +1325,7 @@ pub const Workspace = extern struct {
             priv.dividers.items[i].box = slot.box.snapped();
         }
         self.as(gtk.Widget).queueAllocate();
+        self.noteViewport();
     }
 
     fn maxScroll(self: *Self) f64 {
@@ -1297,7 +1336,11 @@ pub const Workspace = extern struct {
 
     fn clampScrollNow(self: *Self) void {
         const priv = self.private();
-        priv.scroll = @max(0, @min(priv.scroll, self.maxScroll()));
+        const clamped = @max(0, @min(priv.scroll, self.maxScroll()));
+        if (clamped != priv.scroll) {
+            priv.scroll = clamped;
+            self.noteViewport();
+        }
     }
 
     /// app.js scrollStripTo.
@@ -1309,6 +1352,7 @@ pub const Workspace = extern struct {
             self.endChase();
             priv.scroll = target;
             self.as(gtk.Widget).queueAllocate();
+            self.noteViewport();
             return;
         }
         if (priv.chase) |*c| {
@@ -1382,6 +1426,7 @@ pub const Workspace = extern struct {
         self.endChase();
         priv.scroll = @max(0, @min(priv.scroll + dx, self.maxScroll()));
         self.as(gtk.Widget).queueAllocate();
+        self.noteViewport();
     }
 
     /// Scroll handling shared by the capture- and bubble-phase controllers
@@ -1524,6 +1569,7 @@ pub const Workspace = extern struct {
         const d = priv.sb_drag orelse return;
         priv.scroll = @max(0, @min(d.start_scroll + off_x * d.per_px, self.maxScroll()));
         self.as(gtk.Widget).queueAllocate();
+        self.noteViewport();
     }
 
     // =====================================================================
@@ -2181,4 +2227,3 @@ pub fn collect(widget: *gtk.Widget, buf: []*Workspace, n: *usize) void {
     var child = widget.getFirstChild();
     while (child) |c| : (child = c.getNextSibling()) collect(c, buf, n);
 }
-

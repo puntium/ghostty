@@ -289,11 +289,16 @@ fn workspaceHost(id: u64) iface.WorkspaceHost {
     return .{ .ctx = idCtx(id), .vtable = &ws_vtable };
 }
 
-const ws_vtable: iface.WorkspaceHost.VTable = .{ .summaryChanged = wsSummary };
+const ws_vtable: iface.WorkspaceHost.VTable = .{ .summaryChanged = wsSummary, .viewportChanged = wsViewport };
 
 fn wsSummary(ctx: *anyopaque, panes: usize, offline: bool) void {
     const e = hub.findId(ctxId(ctx)) orelse return;
     hub.summaryChanged(e, panes, offline);
+}
+
+fn wsViewport(ctx: *anyopaque) void {
+    const e = hub.findId(ctxId(ctx)) orelse return;
+    hub.viewportChanged(e);
 }
 
 // ---------------------------------------------------------------------------

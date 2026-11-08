@@ -205,10 +205,60 @@ pub const WorkspaceHost = struct {
         /// any link is down" (one socket reopening clears it even if
         /// another is still retrying).
         summaryChanged: *const fn (ctx: *anyopaque, panes: usize, offline: bool) void,
+        /// The workspace's minimap (`Workspace.minimap`) would look
+        /// different: its layout, geometry, scroll or focus changed. Called
+        /// once per frame while the strip scrolls; the chrome redraws the
+        /// host's pill.
+        viewportChanged: *const fn (ctx: *anyopaque) void,
     };
 
     pub fn summaryChanged(self: WorkspaceHost, panes: usize, offline: bool) void {
         self.vtable.summaryChanged(self.ctx, panes, offline);
+    }
+    pub fn viewportChanged(self: WorkspaceHost) void {
+        self.vtable.viewportChanged(self.ctx);
+    }
+};
+
+/// A workspace's panes as a small block diagram, for its host's pill in
+/// the header (deviation 73): one box per pane, columns and stacks roughly
+/// to proportion, the focused pane marked, and, while the strip scrolls,
+/// the on-screen part outlined. Coordinates are in pixels, y down, from
+/// the map's top-left; the workspace computes it, the chrome draws it.
+pub const Minimap = struct {
+    pub const Rect = struct { x: f64, y: f64, w: f64, h: f64 };
+    pub const Cell = struct {
+        /// The pane id (owned by the map).
+        id: []u8,
+        rect: Rect,
+        focused: bool,
+    };
+
+    cells: []Cell,
+    /// The on-screen part of the strip; null when every column fits.
+    viewport: ?Rect,
+    width: f64,
+    height: f64,
+
+    pub const empty: Minimap = .{ .cells = &.{}, .viewport = null, .width = 0, .height = 0 };
+
+    pub fn deinit(self: *Minimap, gpa: Allocator) void {
+        for (self.cells) |c| gpa.free(c.id);
+        gpa.free(self.cells);
+        self.* = undefined;
+    }
+
+    pub fn isEmpty(self: *const Minimap) bool {
+        return self.cells.len == 0;
+    }
+
+    /// The pane under a point (with a 1 px halo around each box), or null.
+    pub fn paneAt(self: *const Minimap, x: f64, y: f64) ?[]const u8 {
+        for (self.cells) |c| {
+            const r = c.rect;
+            if (x >= r.x - 1 and x <= r.x + r.w + 1 and y >= r.y - 1 and y <= r.y + r.h + 1) return c.id;
+        }
+        return null;
     }
 };
 
@@ -227,6 +277,15 @@ pub const Workspace = struct {
         /// tunnel came back after the server was replaced: re-read the
         /// session list and reconcile.
         reload: *const fn (ctx: *anyopaque) void,
+        /// The pane map for the host's pill, `height` px tall and at most
+        /// `max_width` wide, from the current layout, geometry, scroll and
+        /// focus. A workspace that has never been laid out (its host has
+        /// not been in front yet) is mapped at a typical window size.
+        /// Empty while the layout has no panes. Caller frees with `gpa`.
+        minimap: *const fn (ctx: *anyopaque, gpa: Allocator, height: f64, max_width: f64) Allocator.Error!Minimap,
+        /// Focus a pane by id, as a click on its title bar would (ring,
+        /// fade, reveal, keyboard focus). Unknown ids are ignored.
+        focusPane: *const fn (ctx: *anyopaque, id: []const u8) void,
     };
 
     pub fn setFront(self: Workspace, front: bool) void {
@@ -237,6 +296,12 @@ pub const Workspace = struct {
     }
     pub fn reload(self: Workspace) void {
         self.vtable.reload(self.ctx);
+    }
+    pub fn minimap(self: Workspace, gpa: Allocator, height: f64, max_width: f64) Allocator.Error!Minimap {
+        return self.vtable.minimap(self.ctx, gpa, height, max_width);
+    }
+    pub fn focusPane(self: Workspace, id: []const u8) void {
+        self.vtable.focusPane(self.ctx, id);
     }
 };
 

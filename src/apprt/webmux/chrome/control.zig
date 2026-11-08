@@ -8,7 +8,7 @@
 //!          action = new | edit | cancel | set | submit | connect |
 //!                   disconnect | restart | delete | confirm | refuse |
 //!                   escape | log
-//!   pill   {action: click|close|drag, name, slot | x}
+//!   pill   {action: click|pane|close|drag, name, pane | slot | x}
 //!          (drag-begin, drag-over {x}, drag-cancel: the steps of a drag)
 //!   header {button: new-terminal|new-files|settings|connections}
 //!   show   {name?}              userShow (no name: the Connections page)
@@ -38,7 +38,7 @@ const sleep = @import("sleep.zig");
 pub fn register() void {
     control.register(.{ .name = "conns", .help = "chrome state: title, front view, connections, pills, header, page, keyring", .handler = &conns });
     control.register(.{ .name = "page", .help = "{action:new|edit|cancel|set|submit|connect|disconnect|restart|delete|confirm|refuse|escape|log, name, field, value}: drive the Connections page (restart and delete ask; confirm and refuse answer)", .handler = &pageCmd });
-    control.register(.{ .name = "pill", .help = "{action:click|close|drag, name, slot|x}: a header pill", .handler = &pillCmd });
+    control.register(.{ .name = "pill", .help = "{action:click|pane|close|drag, name, pane|slot|x}: a header pill (pane: a click on that pane in its minimap)", .handler = &pillCmd });
     control.register(.{ .name = "header", .help = "{button:new-terminal|new-files|settings|connections}: a header button", .handler = &headerCmd });
     control.register(.{ .name = "show", .help = "{name?}: show a host (as a pill click) or, without a name, the Connections page", .handler = &showCmd });
     control.register(.{ .name = "connect", .help = "{name}: engine connect (no reveal)", .handler = &connectCmd });
@@ -71,12 +71,26 @@ const EntryDump = struct {
 
 const PillDump = struct {
     name: []const u8,
-    dot: []const u8,
+    /// The state class (W-12): unknown, connecting, connected, degraded,
+    /// retry, failed. Colours the pill (deviation 73).
+    state: []const u8,
     active: bool,
     dragging: bool,
     drop: ?[]const u8,
     tooltip: []const u8,
     mid_x: ?f64,
+    minimap: MinimapDump,
+};
+
+/// The pill's minimap: pane ids in map order, the focused one, whether
+/// the viewport outline shows, and the map's size (0×0 while hidden).
+const MinimapDump = struct {
+    shown: bool,
+    panes: []const []const u8,
+    focused: ?[]const u8,
+    viewport: bool,
+    w: f64,
+    h: f64,
 };
 
 const CardDump = struct {
@@ -133,9 +147,24 @@ fn connsInner(req: *Request) !void {
         for (h.pills.items) |p| {
             const w = p.root.as(gtk.Widget);
             const tip = w.getTooltipText();
+            const m = p.map.map();
+            var ids: std.ArrayList([]const u8) = .empty;
+            var focused: ?[]const u8 = null;
+            for (m.cells) |c| {
+                try ids.append(a, try a.dupe(u8, c.id));
+                if (c.focused) focused = ids.items[ids.items.len - 1];
+            }
             try pills.append(a, .{
                 .name = labelText(a, p.label),
-                .dot = p.dot_class,
+                .state = p.state_class,
+                .minimap = .{
+                    .shown = p.map.as(gtk.Widget).getVisible() != 0,
+                    .panes = ids.items,
+                    .focused = focused,
+                    .viewport = m.viewport != null,
+                    .w = m.width,
+                    .h = m.height,
+                },
                 .active = w.hasCssClass("active") != 0,
                 .dragging = w.hasCssClass("dragging") != 0,
                 .drop = if (w.hasCssClass("drop-before") != 0) "before" else if (w.hasCssClass("drop-after") != 0) "after" else null,
@@ -292,6 +321,10 @@ fn pillCmd(req: *Request) void {
     const eq = std.mem.eql;
     if (eq(u8, action, "click")) {
         h.clickPill(e.id);
+    } else if (eq(u8, action, "pane")) {
+        // A click on a pane in the pill's minimap.
+        const pane = req.string("pane") orelse return req.fail("pane required", .{});
+        h.clickPillPane(e.id, pane);
     } else if (eq(u8, action, "close")) {
         h.clickPillX(e.id);
     } else if (eq(u8, action, "drag-begin")) {
@@ -523,6 +556,26 @@ fn boundsCmd(req: *Request) void {
             const e = hub_mod.findId(p.entry_id) orelse continue;
             addBox(a, &out, win, p.root.as(gtk.Widget), std.fmt.allocPrint(a, "pill.{s}", .{e.name}) catch continue);
             addBox(a, &out, win, p.x.as(gtk.Widget), std.fmt.allocPrint(a, "pill.{s}.x", .{e.name}) catch continue);
+            // The minimap and each of its pane cells (`pill.<name>.map.<i>`,
+            // in map order), for a real click on a pane.
+            const mw = p.map.as(gtk.Widget);
+            if (mw.getVisible() != 0) {
+                addBox(a, &out, win, mw, std.fmt.allocPrint(a, "pill.{s}.map", .{e.name}) catch continue);
+                const before = out.items.len;
+                if (before > 0 and std.mem.endsWith(u8, out.items[before - 1].name, ".map")) {
+                    const mb = out.items[before - 1];
+                    for (p.map.map().cells, 0..) |c, i| {
+                        out.append(a, .{
+                            .name = std.fmt.allocPrint(a, "pill.{s}.map.{d}", .{ e.name, i }) catch continue,
+                            .x = mb.x + c.rect.x,
+                            .y = mb.y + c.rect.y,
+                            .w = c.rect.w,
+                            .h = c.rect.h,
+                            .visible = true,
+                        }) catch continue;
+                    }
+                }
+            }
         }
     }
     if (hub.page) |p| {

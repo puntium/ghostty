@@ -876,6 +876,13 @@ pub fn summaryChanged(e: *Entry, panes: usize, offline: bool) void {
     changed();
 }
 
+/// The view's workspace would map differently (WorkspaceHost): its pill's
+/// minimap is refreshed before the next frame.
+pub fn viewportChanged(e: *Entry) void {
+    if (hub.shut_down) return;
+    if (hub.header) |h| h.mapChanged(e.id);
+}
+
 /// Something visible changed: header, page, title.
 pub fn changed() void {
     if (hub.shut_down) return;

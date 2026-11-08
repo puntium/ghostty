@@ -89,7 +89,25 @@ ctl -q key key=ctrl+shift+o
 ctl -q key key=ctrl+1
 [[ "$(ws 0 'v["pane_count"]')" == 2 ]] || fail "a's workspace torn down by a page visit"
 until_ 25 eq "webmux — 2 hosts · 3 panes" get conns title || fail "title $(get conns title)"
-ok "two hosts: own workspaces and layout files; setFront both ways; focus follows; page visits keep the workspace"
+# Deviation 73: each pill maps its host's panes; a click on a pane in a's
+# map (while b is in front) brings a to the front with that pane focused.
+pillmap() { ctl conns | py "$1"; } # a Python expression over conns' result
+until_ 25 eq 2 pillmap 'len(v["header"]["pills"][0]["minimap"]["panes"])' || fail "a's pill maps $(get conns header.pills.0.minimap.panes) panes, not 2"
+[[ "$(get conns header.pills.1.minimap.shown)" == true ]] || fail "b's pill has no minimap"
+other="$(pillmap '(lambda m: [p for p in m["panes"] if p != m["focused"]][0])(v["header"]["pills"][0]["minimap"])')"
+ctl -q key key=ctrl+2
+ctl -q pill action=pane name=a pane="$other"
+[[ "$(get conns front)" == a ]] || fail "minimap click did not show a"
+[[ "$(ws 0 'v["focused"]')" == "$other" ]] || fail "minimap click did not focus the pane"
+[[ "$(ws 0 'v["has_keyboard_focus_in"]')" == "$other" ]] || fail "keyboard focus not in the clicked pane"
+[[ "$(get conns header.pills.0.minimap.focused)" == "$other" ]] || fail "a's map did not follow the focus"
+# A keyboard focus move rebuilds nothing (L-22) but the map must still follow.
+ctl -q menu action=activate label="Focus Right"
+moved="$(ws 0 'v["focused"]')"
+if [[ "$moved" == "$other" ]]; then ctl -q menu action=activate label="Focus Left"; moved="$(ws 0 'v["focused"]')"; fi
+[[ "$moved" != "$other" ]] || fail "a keyboard focus move did not move"
+until_ 25 eq "$moved" get conns header.pills.0.minimap.focused || fail "a's map did not follow a keyboard focus move"
+ok "two hosts: own workspaces and layout files; setFront both ways; focus follows; page visits keep the workspace; pill minimaps (dev. 73)"
 
 # --- 3. settings, zoom, scheme ------------------------------------------------------
 before="$(ws 0 'round(v["col_max"])')"
@@ -196,7 +214,7 @@ until_ 150 eq connected state 0 || fail "retry never healed"
 [[ "$(get conns front)" == a && "$(ws 0 'v["pane_count"]')" == "$n" ]] || fail "view or panes changed on a tunnel blip"
 pkill -f "$dir/remote/me_a/.webmux/.*webmux-host serve" || fail "no server"
 until_ 50 eq degraded state 0 || fail "no degraded state (workspace offline)"
-[[ "$(get conns header.pills.0.dot)" == degraded ]] || fail "pill not degraded"
+[[ "$(get conns header.pills.0.state)" == degraded ]] || fail "pill not degraded"
 until_ 150 eq retry state 0 || fail "dead server not given up"
 until_ 200 eq connected state 0 || fail "server restart never healed"
 until_ 100 eq False ws 0 'v["offline"]' || fail "workspace stayed offline"

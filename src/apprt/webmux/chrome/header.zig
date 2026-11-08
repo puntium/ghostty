@@ -2,17 +2,23 @@
 //! 66). An `AdwHeaderBar`, so it is the window's title bar: dragging its
 //! empty parts moves the window, and it carries the window controls. New
 //! terminal and new file browser on the left, one pill per connection in
-//! the centre (status dot, name, ✕; click to show, drag to reorder; the
-//! word "webmux" when there are none), settings, connections and the menu
-//! button (ruling N-16) on the right, all standard flat icon buttons.
-//! Nothing on it takes keyboard focus: a click completes and the content
-//! view keeps the keys (W-05).
+//! the centre (deviation 73: coloured by status, the name in small type
+//! above a minimap of the host's panes, a ✕ in the corner on hover; click
+//! to show, click a pane in the map to show with that pane focused, drag
+//! to reorder; the word "webmux" when there are none), settings,
+//! connections and the menu button (ruling N-16) on the right, all
+//! standard flat icon buttons. Nothing on it takes keyboard focus: a click
+//! completes and the content view keeps the keys (W-05).
 //!
 //! Pills are kept per entry and updated in place, so a status push during
-//! a drag never destroys the widget under the pointer.
+//! a drag never destroys the widget under the pointer. The minimaps are
+//! refreshed from an idle (`mapChanged` marks a pill), so a workspace that
+//! scrolls every frame costs one map per frame, computed before the frame
+//! is drawn.
 const std = @import("std");
 const adw = @import("adw");
 const gdk = @import("gdk");
+const glib = @import("glib");
 const gobject = @import("gobject");
 const graphene = @import("graphene");
 const gtk = @import("gtk");
@@ -20,18 +26,27 @@ const gtk = @import("gtk");
 const iface = @import("../iface.zig");
 const hub = @import("hub.zig");
 const menu = @import("menu.zig");
+const Minimap = @import("minimap.zig").Minimap;
 
 const log = std.log.scoped(.webmux_chrome);
 const alloc = std.heap.c_allocator;
 
+/// The minimap's height and width cap (px), as the macOS client's pill.
+pub const map_height: f64 = 18;
+pub const map_max_width: f64 = 140;
+
 pub const Pill = struct {
     entry_id: u64,
-    root: *gtk.Box,
-    dot: *gtk.Widget,
+    /// The pill: the name above the minimap, with the ✕ overlaid in the
+    /// top-right corner so the name stays centred.
+    root: *gtk.Overlay,
     label: *gtk.Label,
     x: *gtk.Button,
-    /// The state class currently on the dot.
-    dot_class: [:0]const u8 = "unknown",
+    map: *Minimap,
+    /// The state class currently on the pill (W-12 colours).
+    state_class: [:0]const u8 = "unknown",
+    /// The map is stale (`Header.mapChanged`).
+    map_dirty: bool = false,
     drag_started: bool = false,
     drag_start_x: f64 = 0,
 };
@@ -51,6 +66,8 @@ pub const Header = struct {
     /// Pill being dragged (by entry id), and the slot it would land in.
     drag_id: ?u64 = null,
     drop_slot: ?usize = null,
+    /// The idle that refreshes dirty minimaps.
+    map_source: c_uint = 0,
     alive: bool = true,
 
     pub fn widget(h: *Header) *gtk.Widget {
@@ -142,6 +159,7 @@ pub const Header = struct {
 
     pub fn destroyed(h: *Header) void {
         h.alive = false;
+        if (h.map_source != 0) _ = glib.Source.remove(h.map_source);
         for (h.pills.items) |p| alloc.destroy(p);
         h.pills.deinit(alloc);
         alloc.destroy(h);
@@ -239,26 +257,35 @@ pub const Header = struct {
 
     fn newPill(h: *Header, e: *hub.Entry) ?*Pill {
         const p = alloc.create(Pill) catch return null;
-        const root = gtk.Box.new(.horizontal, 7);
+        const root = gtk.Overlay.new();
         const rw = root.as(gtk.Widget);
         rw.addCssClass("wm-pill");
+        rw.addCssClass("unknown");
         rw.setValign(.center);
-        const dot = gtk.Box.new(.horizontal, 0);
-        dot.as(gtk.Widget).addCssClass("wm-dot");
-        dot.as(gtk.Widget).setValign(.center);
+        // Name above map, centred; a pill without a map is just the name.
+        const body = gtk.Box.new(.vertical, 2);
+        body.as(gtk.Widget).addCssClass("wm-pill-body");
+        body.as(gtk.Widget).setValign(.center);
         const label = gtk.Label.new(null);
+        label.as(gtk.Widget).addCssClass("wm-pill-name");
+        label.as(gtk.Widget).setHalign(.center);
         // A long name never widens the header (N3); the tooltip has it.
         label.setEllipsize(.end);
         label.setMaxWidthChars(28);
+        const map = Minimap.new();
+        map.as(gtk.Widget).setVisible(0);
+        body.append(label.as(gtk.Widget));
+        body.append(map.as(gtk.Widget));
+        root.setChild(body.as(gtk.Widget));
         const x = gtk.Button.newWithLabel("✕");
         x.as(gtk.Widget).addCssClass("wm-x");
         x.as(gtk.Widget).setTooltipText("Disconnect");
         x.as(gtk.Widget).setFocusOnClick(0);
         x.as(gtk.Widget).setFocusable(0);
-        root.append(dot.as(gtk.Widget));
-        root.append(label.as(gtk.Widget));
-        root.append(x.as(gtk.Widget));
-        p.* = .{ .entry_id = e.id, .root = root, .dot = dot.as(gtk.Widget), .label = label, .x = x };
+        x.as(gtk.Widget).setHalign(.end);
+        x.as(gtk.Widget).setValign(.start);
+        root.addOverlay(x.as(gtk.Widget));
+        p.* = .{ .entry_id = e.id, .root = root, .label = label, .x = x, .map = map };
 
         _ = gtk.Button.signals.clicked.connect(x, *Pill, onPillX, p, .{});
         const click = gtk.GestureClick.new();
@@ -281,7 +308,7 @@ pub const Header = struct {
         return p;
     }
 
-    fn updatePill(_: *Header, p: *Pill, e: *hub.Entry, n: usize) void {
+    fn updatePill(h: *Header, p: *Pill, e: *hub.Entry, n: usize) void {
         var nb: [4096]u8 = undefined;
         const name = std.fmt.bufPrintSentinel(&nb, "{s}", .{e.name}, 0) catch "?";
         p.label.setText(name.ptr);
@@ -290,15 +317,59 @@ pub const Header = struct {
         const chars: c_int = @intCast(@min(std.unicode.utf8CountCodepoints(e.name) catch e.name.len, 28));
         p.label.setWidthChars(chars);
         const rw = p.root.as(gtk.Widget);
-        setClass(rw, "active", hub.hub.active == e);
+        const active = hub.hub.active == e;
+        setClass(rw, "active", active);
+        p.map.setEmphasized(active);
         const cls: [:0]const u8 = dotClass(e);
-        if (!std.mem.eql(u8, cls, p.dot_class)) {
-            p.dot.removeCssClass(p.dot_class.ptr);
-            p.dot.addCssClass(cls.ptr);
-            p.dot_class = cls;
+        if (!std.mem.eql(u8, cls, p.state_class)) {
+            rw.removeCssClass(p.state_class.ptr);
+            rw.addCssClass(cls.ptr);
+            p.state_class = cls;
         }
         var tb: [4608]u8 = undefined;
         rw.setTooltipText(pillTooltip(e, n, &tb).ptr);
+        h.refreshMap(p, e);
+    }
+
+    // -- minimaps (deviation 73) -----------------------------------------
+
+    /// The entry's workspace changed how it would map: refresh its pill's
+    /// map before the next frame.
+    pub fn mapChanged(h: *Header, id: u64) void {
+        if (!h.alive) return;
+        const p = h.pillFor(id) orelse return;
+        p.map_dirty = true;
+        if (h.map_source == 0) h.map_source = glib.idleAddFull(glib.PRIORITY_HIGH_IDLE, refreshMaps, h, null);
+    }
+
+    fn refreshMaps(ud: ?*anyopaque) callconv(.c) c_int {
+        const h: *Header = @ptrCast(@alignCast(ud orelse return 0));
+        h.map_source = 0;
+        if (!h.alive) return 0;
+        for (h.pills.items) |p| if (p.map_dirty) {
+            p.map_dirty = false;
+            if (hub.findId(p.entry_id)) |e| h.refreshMap(p, e);
+        };
+        return 0;
+    }
+
+    /// Ask the workspace for its map and show it (hidden while empty).
+    fn refreshMap(_: *Header, p: *Pill, e: *hub.Entry) void {
+        p.map_dirty = false;
+        const map: iface.Minimap = if (e.view.workspace) |ws| ws.minimap(alloc, map_height, map_max_width) catch .empty else .empty;
+        p.map.set(map);
+        p.map.as(gtk.Widget).setVisible(@intFromBool(!p.map.map().isEmpty()));
+    }
+
+    /// The pane of pill `p`'s minimap under (`x`, `y`) in the pill's
+    /// coordinates, if the point is on the map.
+    pub fn paneAtPoint(_: *Header, p: *Pill, x: f64, y: f64) ?[]const u8 {
+        const mw = p.map.as(gtk.Widget);
+        if (mw.getVisible() == 0) return null;
+        const in: graphene.Point = .{ .f_x = @floatCast(x), .f_y = @floatCast(y) };
+        var out: graphene.Point = undefined;
+        if (p.root.as(gtk.Widget).computePoint(mw, &in, &out) == 0) return null;
+        return p.map.paneAt(out.f_x, out.f_y);
     }
 
     // -- pills: click, ✕, drag (W-15, W-16) ------------------------------
@@ -307,6 +378,14 @@ pub const Header = struct {
     pub fn clickPill(_: *Header, id: u64) void {
         const e = hub.findId(id) orelse return;
         hub.userShow(e);
+    }
+
+    /// A click on a pane in a pill's minimap: show the host with that pane
+    /// focused.
+    pub fn clickPillPane(_: *Header, id: u64, pane: []const u8) void {
+        const e = hub.findId(id) orelse return;
+        hub.userShow(e);
+        if (e.view.workspace) |ws| ws.focusPane(pane);
     }
 
     pub fn clickPillX(_: *Header, id: u64) void {
@@ -410,9 +489,17 @@ pub const Header = struct {
         h.clickPillX(p.entry_id);
     }
 
-    fn onPillReleased(_: *gtk.GestureClick, _: c_int, _: f64, _: f64, p: *Pill) callconv(.c) void {
+    fn onPillReleased(_: *gtk.GestureClick, _: c_int, x: f64, y: f64, p: *Pill) callconv(.c) void {
         const h = hub.hub.header orelse return;
         if (h.drag_id != null) return;
+        if (h.paneAtPoint(p, x, y)) |pane| {
+            // Copied: the click handler may rebuild the map.
+            var buf: [256]u8 = undefined;
+            const n = @min(pane.len, buf.len);
+            @memcpy(buf[0..n], pane[0..n]);
+            h.clickPillPane(p.entry_id, buf[0..n]);
+            return;
+        }
         h.clickPill(p.entry_id);
     }
 

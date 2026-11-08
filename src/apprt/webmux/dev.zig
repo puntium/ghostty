@@ -200,11 +200,14 @@ fn paneIgnored(_: *anyopaque, _: []const u8) void {}
 
 const workspace_host: iface.WorkspaceHost = .{ .ctx = &host_ctx, .vtable = &.{
     .summaryChanged = workspaceSummary,
+    .viewportChanged = workspaceViewport,
 } };
 
 fn workspaceSummary(_: *anyopaque, panes: usize, offline: bool) void {
     log.info("dev: workspace panes={d} offline={}", .{ panes, offline });
 }
+
+fn workspaceViewport(_: *anyopaque) void {}
 
 comptime {
     _ = adw;

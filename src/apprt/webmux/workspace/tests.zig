@@ -3,5 +3,6 @@
 test {
     _ = @import("anim.zig");
     _ = @import("geometry.zig");
+    _ = @import("minimap.zig");
     _ = @import("store.zig");
 }
