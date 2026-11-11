@@ -3472,6 +3472,18 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
     try self.queueRender();
 }
 
+/// webmux-gtk: pause (true) or resume (false) rendering while the surface
+/// stays visible to the windowing system, e.g. scrolled out of view inside
+/// its window. Unlike occlusion the renderer keeps its GPU resources, so
+/// resuming costs one frame and no allocation, and the program in the
+/// terminal is told nothing (no mode 2033 report). Call it on a change.
+pub fn renderPausedCallback(self: *Surface, paused: bool) void {
+    _ = self.renderer_thread.mailbox.push(global.io(), .{
+        .paused = paused,
+    }, .{ .forever = {} });
+    self.renderer_thread.wakeup.notify() catch {};
+}
+
 pub fn focusCallback(self: *Surface, focused: bool) !void {
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();

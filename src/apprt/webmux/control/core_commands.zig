@@ -63,6 +63,9 @@ const PaneDump = struct {
     exit_code: ?i64,
     /// Rendering (mapped, shown, window not suspended).
     visible: bool,
+    /// False while the pane is scrolled out of its strip's viewport: the
+    /// renderer is paused and keeps its buffers.
+    in_view: bool,
     /// The core's scrollbar: total rows, viewport offset, viewport rows.
     scrollbar: struct { total: usize, offset: usize, len: usize },
     title: ?[]const u8,
@@ -103,6 +106,7 @@ fn paneDump(req: *Request, pane: *TerminalPane, focused: bool) !PaneDump {
         .last_replay = if (pane.remoteState()) |st| (if (st.last_replay) |r| .{ .bytes = r.bytes, .ms = r.ms } else null) else null,
         .exit_code = if (pane.remoteState()) |st| st.exit_code else null,
         .visible = pane.isVisible(),
+        .in_view = pane.inView(),
         .scrollbar = blk: {
             const sb = pane.getScrollbar();
             break :blk .{ .total = sb.total, .offset = sb.offset, .len = sb.len };

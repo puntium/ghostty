@@ -98,6 +98,11 @@ flags: packed struct {
     /// This is true when the view is focused. This defaults to true
     /// and it is up to the apprt to set the correct value.
     focused: bool = true,
+
+    /// webmux-gtk: true while the apprt has paused rendering (the
+    /// `paused` message). Like not visible, except that the renderer
+    /// keeps its GPU resources.
+    paused: bool = false,
 } = .{},
 
 pub const DerivedConfig = struct {
@@ -331,6 +336,15 @@ fn drainMailbox(self: *Thread) !void {
                 // check the visible state themselves to control their behavior.
             },
 
+            .paused => |v| paused: {
+                if (self.flags.paused == v) break :paused;
+                self.flags.paused = v;
+
+                // Back in view: catch up with the terminal and draw, as
+                // for becoming visible. The swap chain is still there.
+                if (!v) _ = renderCallback(self, undefined, undefined, {});
+            },
+
             .focus => |v| focus: {
                 // If our state didn't change we do nothing.
                 if (self.flags.focused == v) break :focus;
@@ -463,6 +477,9 @@ fn drawFrame(self: *Thread, now: bool) void {
     // If we're invisible, we do not draw.
     if (!self.flags.visible) return;
 
+    // webmux-gtk: nor while paused.
+    if (self.flags.paused) return;
+
     // If the renderer is managing a vsync on its own, we only draw
     // when we're forced to via `now`.
     if (!now and self.renderer.hasVsync()) return;
@@ -569,6 +586,9 @@ fn renderCallback(
     // Kitty graphics animations pause with us and resume on visibility.
     if (!t.flags.visible) return .disarm;
 
+    // webmux-gtk: the same while paused; the `paused` message catches up.
+    if (t.flags.paused) return .disarm;
+
     // Update our frame data
     t.renderer.updateFrame(
         t.state,
@@ -629,6 +649,7 @@ fn animationTimerCallback(
     // Animations pause entirely while we're invisible; the .visible
     // mailbox message re-arms us when we can be seen again.
     if (!t.flags.visible) return .disarm;
+    if (t.flags.paused) return .disarm;
 
     switch (t.animation_wake) {
         // Frame data must be updated (a Kitty animation frame is

@@ -22,6 +22,13 @@ pub const Message = union(enum) {
     /// and still have focus.
     visible: bool,
 
+    /// webmux-gtk: stop (true) or resume (false) updating and drawing
+    /// frames without releasing anything, unlike `visible`: the surface is
+    /// on screen as far as the windowing system knows, but the apprt has
+    /// it scrolled out of view and will show it again at any moment.
+    /// Only sent on a change.
+    paused: bool,
+
     /// Reset the cursor blink by immediately showing the cursor then
     /// restarting the timer.
     reset_cursor_blink,

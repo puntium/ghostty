@@ -72,6 +72,7 @@ const vtable: iface.Pane.VTable = .{
     .cellWidthPx = cellWidthPx,
     .fade = fade,
     .holdResize = holdResize,
+    .setInView = setInView,
 };
 
 fn fromCtx(ctx: *anyopaque) *Adapter {
@@ -117,6 +118,10 @@ fn fade(ctx: *anyopaque, scale: f32, add: [3]f32) ?iface.Pane.Rect {
 
 fn holdResize(ctx: *anyopaque, hold: bool) void {
     fromCtx(ctx).pane.holdResize(hold);
+}
+
+fn setInView(ctx: *anyopaque, in_view: bool) void {
+    fromCtx(ctx).pane.setInView(in_view);
 }
 
 fn onTitle(_: *TerminalPane, _: *gobject.ParamSpec, self: *Adapter) callconv(.c) void {

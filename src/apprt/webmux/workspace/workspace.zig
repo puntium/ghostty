@@ -1156,6 +1156,34 @@ pub const Workspace = extern struct {
         }
     }
 
+    /// How far outside the viewport a pane still counts as in view (CSS
+    /// px): a pan by hand has no target to look ahead to, and a pane that
+    /// resumes needs a frame or two to be current.
+    const in_view_margin = 240;
+
+    /// Tell every pane whether it is on screen (`iface.Pane.setInView`):
+    /// a pane scrolled out of the viewport stops drawing, so its output
+    /// costs the GPU and the main thread nothing while nobody can see it.
+    /// In view is the viewport as scrolled now, widened by a margin, and
+    /// the viewport a running chase will end on. While a layout animation
+    /// runs nothing is paused (a pane may be drawn away from its final
+    /// box); the allocation that follows the move's end sorts it out.
+    fn updateInView(self: *Self) void {
+        const priv = self.private();
+        if (priv.vw <= 0) return;
+        const vw: f64 = @floatFromInt(priv.vw);
+        const target = if (priv.chase) |c| c.target else priv.scroll;
+        for (priv.items.items) |it| {
+            const p = it.pane orelse continue;
+            const x0 = it.box.x - in_view_margin;
+            const x1 = it.box.x + it.box.w + in_view_margin;
+            const in_view = (x1 > priv.scroll and x0 < priv.scroll + vw) or
+                (x1 > target and x0 < target + vw);
+            if (!in_view and priv.anim != null) continue;
+            p.setInView(in_view);
+        }
+    }
+
     /// A pane renders while its host is in front and it is not on its way
     /// in.
     fn applyShown(self: *Self, it: *Item) void {
@@ -1363,6 +1391,8 @@ pub const Workspace = extern struct {
         perf.attach(self.as(gtk.Widget));
         priv.chase = .{ .target = target, .pos = priv.scroll, .perf_span = perf.spanBegin(.scroll, "chase") };
         self.ensureTick();
+        // What the chase is heading for starts drawing before it shows.
+        self.updateInView();
     }
 
     /// The chase is over (arrived, or the hand took over).
@@ -1785,6 +1815,8 @@ pub const Workspace = extern struct {
         for (priv.dividers.items) |d| allocBox(d.widget, d.box, sx);
         for (priv.ghosts.items) |g| allocBox(g.widget, g.flight.ghostBox(), sx);
         for (priv.leaving.items) |l| allocBox(l.item.frame.as(gtk.Widget), l.item.box, sx);
+        // Every change of the scroll or the boxes passes here.
+        self.updateInView();
         const m = priv.message.as(gtk.Widget);
         if (m.getVisible() != 0) {
             var mn: c_int = 0;

@@ -36,6 +36,7 @@ const vtable: iface.Pane.VTable = .{
     .cellWidthPx = cellWidthPx,
     .fade = fade,
     .holdResize = holdResize,
+    .setInView = setInView,
 };
 
 fn browser(ctx: *anyopaque) *Browser {
@@ -63,6 +64,8 @@ fn fade(_: *anyopaque, _: f32, _: [3]f32) ?iface.Pane.Rect {
 }
 
 fn holdResize(_: *anyopaque, _: bool) void {}
+
+fn setInView(_: *anyopaque, _: bool) void {}
 
 fn cellWidthPx(_: *anyopaque) ?u32 {
     return null;

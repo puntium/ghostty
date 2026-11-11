@@ -256,6 +256,9 @@ pub const TerminalPane = extern struct {
         remote: ?*remote.State = null,
         /// False while the container hides the pane (`setShown`).
         shown: bool = true,
+        /// False while the container has the pane scrolled out of view
+        /// (`setInView`): the renderer is paused.
+        in_view: bool = true,
 
         /// The http(s) OSC 8 hyperlink under the pointer (owned).
         link_osc8: ?[:0]u8 = null,
@@ -340,6 +343,24 @@ pub const TerminalPane = extern struct {
     pub fn setShown(self: *Self, shown: bool) void {
         self.private().shown = shown;
         self.updateOcclusion();
+    }
+
+    /// The container has the pane on screen (true) or scrolled out of
+    /// view (false). Out of view the renderer stops drawing but keeps its
+    /// buffers (unlike `setShown(false)`, which releases them), so the
+    /// pane is current again one frame after it comes back, with nothing
+    /// to allocate while the strip is moving.
+    pub fn setInView(self: *Self, in_view: bool) void {
+        const priv = self.private();
+        if (priv.in_view == in_view) return;
+        priv.in_view = in_view;
+        if (priv.core_surface) |surface| surface.renderPausedCallback(!in_view);
+    }
+
+    /// Whether the renderer is paused because the pane is out of view,
+    /// for `dump`.
+    pub fn inView(self: *Self) bool {
+        return self.private().in_view;
     }
 
     //---------------------------------------------------------------
@@ -1551,6 +1572,14 @@ pub const TerminalPane = extern struct {
             if (changed) surface.sizeCallback(new_size) catch |err| {
                 log.warn("error in size callback err={}", .{err});
             };
+            // A pane that is out of view takes its new size now all the
+            // same (one frame, then paused again): its buffers are
+            // allocated here, where the container expects that work, and
+            // not when it scrolls back in.
+            if (changed and !priv.in_view) {
+                surface.renderPausedCallback(false);
+                surface.renderPausedCallback(true);
+            }
         } else {
             self.initSurface() catch |err| {
                 log.warn("surface failed to initialize err={}", .{err});
@@ -1601,6 +1630,8 @@ pub const TerminalPane = extern struct {
         // A pane told to stay hidden before its surface existed (the
         // container is still moving it into place) starts that way.
         if (!priv.shown) self.updateOcclusion();
+        // Likewise one that starts out of view.
+        if (!priv.in_view) surface.renderPausedCallback(true);
     }
 
     //---------------------------------------------------------------

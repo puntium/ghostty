@@ -86,6 +86,7 @@ Every change to a pre-existing Ghostty file. Keep this list complete.
 | `src/termio.zig` | `pub const Webmux = @import("termio/Webmux.zig");` (one line) | exports the backend |
 | `src/Surface.zig` `init` | one `@hasDecl(apprt.runtime.Surface, "termioBackend")` call; `io_exec` → `io_backend`, which is `Webmux.init` when the apprt returned a config and the unchanged `Exec.init` otherwise (+17/−5) | the backend seam: an apprt that does not declare `termioBackend` gets stock behaviour |
 | `src/Surface.zig` `childExitedAbnormally` | `.webmux => &.{"webmux"}` switch arm | exhaustiveness only; never reached |
+| `src/Surface.zig` `renderPausedCallback`, `src/renderer/message.zig` `paused`, `src/renderer/Thread.zig` `flags.paused` | a renderer message that stops (and resumes) frame updates and draws without releasing the swap chain; the thread checks it next to each `flags.visible` check (+35) | a pane scrolled out of the strip's viewport stops drawing but keeps its buffers (§ Performance); never sent by an apprt that does not call it |
 | `.gitignore` | `zig-out-release/` | the release build's output directory (`make linux-client` in the webmux repo) |
 | `src/apprt/embedded.zig` | `Surface.Options` gains four trailing fields (`webmux_socket_path`, `webmux_session_id`, `webmux_userdata`, `webmux_event_cb`); `Surface` declares `termioBackend()` (a `termio.Webmux.Config` when the socket path is set, else null), `links_while_mouse_reporting = true`, the C mirror types of the event (`WebmuxEvent`, `WebmuxEventTag`, `WebmuxSocketKind`, `WebmuxFrameKind`, `WebmuxEventCb`) and the trampoline that flattens `termio.Webmux.Event` into the C struct; `CAPI` exports `ghostty_surface_webmux_send` and `ghostty_surface_webmux_attached` (+231) | the same seam as the GTK shell, for the native macOS client built on GhosttyKit (see § macOS: GhosttyKit) |
 | `include/ghostty.h` | `ghostty_webmux_event_tag_e`, `ghostty_webmux_socket_kind_e`, `ghostty_webmux_event_s`, `ghostty_webmux_event_cb`, `ghostty_webmux_frame_e`; the four fields appended to `ghostty_surface_config_s`; `ghostty_surface_webmux_send`, `ghostty_surface_webmux_attached`, `ghostty_surface_webmux_kitty_keyboard`, `ghostty_surface_webmux_osc8_at`, `ghostty_surface_webmux_alt_click`, `ghostty_config_load_string`, `ghostty_config_webmux_links` in the Published API (+61) | the C side of the embedded seam; the stock fields keep their offsets |
@@ -352,7 +353,7 @@ connection: `{"cmd":"dump","id":1}` → `{"id":1,"ok":true,"result":…}` or
 | Command | Arguments | Result |
 | --- | --- | --- |
 | `help` | | name + help of every registered command |
-| `dump` | `text` (bool, default true) | window size/title/scale/GSK renderer, scheme, `focused_pane`, `last_shortcut`, and per pane (every `TerminalPane` in the window's widget tree): `session_id`, `link` (`connecting`\|`up`\|`down`), `snapshots` (1 + one per reconnect), `last_replay` (`bytes`, wall `ms` of the last snapshot replay), `exit_code` (all null for a local pane), title, pwd, `size_px`, `grid` (what the shell told the core), `terminal` (cols/rows/cursor as the io thread applied them), `cell_px`, `content_scale`, `renderer_health`, `frames`, `text` (visible screen) |
+| `dump` | `text` (bool, default true) | window size/title/scale/GSK renderer, scheme, `focused_pane`, `last_shortcut`, and per pane (every `TerminalPane` in the window's widget tree): `session_id`, `link` (`connecting`\|`up`\|`down`), `snapshots` (1 + one per reconnect), `last_replay` (`bytes`, wall `ms` of the last snapshot replay), `exit_code` (all null for a local pane), title, pwd, `size_px`, `grid` (what the shell told the core), `terminal` (cols/rows/cursor as the io thread applied them), `cell_px`, `content_scale`, `renderer_health`, `frames`, `in_view` (false: scrolled out of view, renderer paused), `text` (visible screen) |
 | `screenshot` | `path`, `scale` (default: surface scale) | path, width, height (waits up to 3 s for the window's next paint if a redraw is pending) |
 | `text` | `text` | types it key by key (press+release per character; `\n` → Return, `\t` → Tab) through the same path as `key` |
 | `key` | `key` ("ctrl+shift+w", "Return", "alt+Left", "a"), `action` tap\|press\|release | `consumed`, `shortcut` |
@@ -411,6 +412,15 @@ change and only translates and clips after that):
    and takes the new one after the move's last frame is out, a new one
    attaches at once but renders only when it has arrived, and a closed
    one is torn down after that frame too.
+
+A terminal scrolled out of the strip's viewport does not draw at all
+(`workspace.zig` `updateInView` → `TerminalPane.setInView` → the core's
+`renderPausedCallback`): its output is still parsed, but costs no render
+pass, no texture and no main-thread frame. Unlike a hidden pane
+(`setShown(false)`, occlusion) it keeps its swap chain, so coming back is
+one frame and no allocation; a pane within 240 px of the viewport, or
+inside the one a chase is heading for, is already drawing. `dump` →
+`panes[i].in_view`.
 
 Animation time is the frame clock's (`workspace.zig` `Clock`), so equal
 frames make equal steps; a frame that comes late does not make the motion

@@ -125,6 +125,11 @@ pub const Pane = struct {
         /// ends and takes the new one then, once, so that work does not
         /// compete with the animation's frames.
         holdResize: *const fn (ctx: *anyopaque, hold: bool) void,
+        /// The pane is inside (or near) the part of the container that
+        /// is on screen (`true`), or scrolled out of it (`false`). A pane
+        /// that is out of view may stop drawing, but must be able to draw
+        /// again at once: it keeps whatever it draws with.
+        setInView: *const fn (ctx: *anyopaque, in_view: bool) void,
     };
 
     pub fn grabFocus(self: Pane) void {
@@ -147,6 +152,9 @@ pub const Pane = struct {
     }
     pub fn holdResize(self: Pane, hold: bool) void {
         self.vtable.holdResize(self.ctx, hold);
+    }
+    pub fn setInView(self: Pane, in_view: bool) void {
+        self.vtable.setInView(self.ctx, in_view);
     }
 };
 
